@@ -1012,7 +1012,9 @@ const gateAtom = atom({ plugin: 'ide-mod', key: 'gate' } as const, null as GateR
 const gateOnAtom = atom({ plugin: 'ide-mod', key: 'isGateOn' } as const, true)
 const gateOpenAtom = atom({ plugin: 'ide-mod', key: 'isGateOpen' } as const, false)
 
-const HWP = /\.(hwp|hwpx)$/i
+// 쪽 단위 문서: HWP·HWPX는 rhwp, PDF는 pdf.js 엔진으로 연다
+const HWP = /\.(hwp|hwpx|pdf)$/i
+const isPdf = (path: string) => /\.pdf$/i.test(path)
 const PROSE = /\.(md|markdown|txt)$/i
 const MAX_REQUESTS = 300
 const STORE_PREFIX = 'requests:'
@@ -1232,18 +1234,24 @@ function loadHwp($: EngineInterface, key: string, args: string[], into: Map<stri
 
 async function runRhwp($: EngineInterface, args: string[]): Promise<Record<string, unknown>> {
   const dir = $.plugin.root.replace(/\/\.claude-plugin\/?$/, '')
-  const ran = await $.process.run(['node', `${dir}/bin/rhwp-view.mjs`, ...args], { timeoutMs: 60_000 }).catch(error => ({ exitCode: 127, stdout: '', stderr: String(error) }))
+  // args[1]은 문서 경로다: PDF면 pdf.js 엔진, 아니면 rhwp 엔진
+  const script = isPdf(args[1] ?? '') ? 'pdf-view.mjs' : 'rhwp-view.mjs'
+  const ran = await $.process.run(['node', `${dir}/bin/${script}`, ...args], { timeoutMs: 60_000 }).catch(error => ({ exitCode: 127, stdout: '', stderr: String(error) }))
   try {
     const out = ran.stdout
     return JSON.parse(out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1)) as Record<string, unknown>
   } catch {
     const why = ran.stderr.trim()
-    return { error: /ENOENT|not found|spawn/i.test(why) || ran.exitCode === 127 ? 'rhwp 엔진을 돌리려면 Node.js가 필요해요 (node 명령을 찾지 못함)' : oneLine(why, 200) || `rhwp 출력을 읽지 못했어요 (exit ${ran.exitCode}, ${ran.stdout.length}자, ${dir}/bin/rhwp-view.mjs)` }
+    return { error: /ENOENT|not found|spawn/i.test(why) || ran.exitCode === 127 ? '문서 엔진을 돌리려면 Node.js가 필요해요 (node 명령을 찾지 못함)' : oneLine(why, 200) || `문서 엔진 출력을 읽지 못했어요 (exit ${ran.exitCode}, ${ran.stdout.length}자, ${dir}/bin/${script})` }
   }
 }
 
-/** 지금 쪽을 그림(PNG)으로 만들어 macOS 미리보기로 연다: 그래픽이 없는 터미널에서 원본 그대로 보기 */
+/** 원본 모양 그대로 보기: PDF는 파일을 그대로, HWP는 지금 쪽 그림을 macOS 미리보기로 연다 */
 async function openHwpPreview($: EngineInterface, path: string, page: number) {
+  if (isPdf(path)) {
+    await $.process.run(['open', path], { timeoutMs: 10_000 }).catch(() => undefined)
+    return
+  }
   const shot = (await runRhwp($, ['page', path, String(page)])) as HwpPage
   if (shot.error !== undefined || shot.pngPath === undefined) {
     $.ui.toast(`미리보기를 만들지 못했어요: ${shot.error ?? 'PNG 변환 도구 없음'}`)
@@ -1269,7 +1277,7 @@ async function drawHwp(
   const data = hwpTextCache.get(textKey)
   if (data === undefined) {
     loadHwp($, textKey, ['text', path], hwpTextCache as Map<string, Record<string, unknown>>)
-    return { info: baseName(path), body: <Text dimColor>rhwp 엔진으로 읽는 중…</Text> }
+    return { info: baseName(path), body: <Text dimColor>{isPdf(path) ? 'pdf.js' : 'rhwp'} 엔진으로 읽는 중…</Text> }
   }
   if (data.error !== undefined) return { info: baseName(path), body: <Text color="error">{data.error} (r로 다시 시도)</Text> }
   const residues = data.residues ?? []

@@ -16,9 +16,10 @@ const FILES: Record<string, string> = {
   '/work/doc.hwpx': 'PK-가짜-hwpx',
   '/work/draft.md': SLOP,
   '/work/pic.png': 'PNG',
+  '/work/notice.pdf': '%PDF-1.7',
 }
 const DIRS: Record<string, string[]> = {
-  '/work': ['src', 'link', 'README.md', 'doc.hwpx', 'draft.md', 'pic.png', '.DS_Store'],
+  '/work': ['src', 'link', 'README.md', 'doc.hwpx', 'notice.pdf', 'draft.md', 'pic.png', '.DS_Store'],
   '/work/src': ['app.ts', 'long.ts'],
 }
 // /work/link → /work/src 를 가리키는 심볼릭 링크
@@ -31,10 +32,10 @@ const real = (p: string) => {
   return abs
 }
 
-type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; saved?: unknown }
+type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown }
 
 function fakeWorld(on: On): World {
-  const world: World = { opened: 0, statuses: [], rhwpCalls: [] }
+  const world: World = { opened: 0, statuses: [], rhwpCalls: [], scripts: [] }
   on('session.cwd', () => ({ value: ROOT }))
   on('env.get', () => ({ value: '/home/me' }))
   on('fs.stat', ($, e) => {
@@ -77,6 +78,7 @@ function fakeWorld(on: On): World {
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('process.run', ($, e) => {
     world.rhwpCalls.push(e.argv.slice(2).join(' '))
+    world.scripts.push(String(e.argv[1]).split('/').pop() ?? '')
     const page = Number(e.argv[4])
     const grid: { t: string; b?: number; l?: number; r?: number }[][] = Array.from({ length: 30 }, (_, i) => [{ t: `${page + 1}쪽 ${i + 1}줄` }])
     grid[0] = [{ t: '연구 계획서', b: 1 }]
@@ -362,6 +364,32 @@ describe('HWP 뷰어 (rhwp)', () => {
     await clock.advance(5)
     expect(await desk.find({ type: 'Svg' })).toBeDefined()
     await desk.unmount()
+  })
+})
+
+describe('PDF 뷰어 (pdf.js)', () => {
+  test('PDF는 pdf.js 엔진으로 문서 보기를 그린다', async ($, on) => {
+    const world = fakeWorld(on)
+    const clock = mock.clock(on)
+    await $.command.run(typed('open', '/work/notice.pdf'))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('pdf.js 엔진으로 읽는 중')
+    await clock.advance(5)
+    await clock.advance(5)
+    expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('1/2쪽')
+    expect(world.scripts.every(s => s === 'pdf-view.mjs')).toBe(true)
+    expect(world.rhwpCalls[0]).toBe('text /work/notice.pdf')
+    await ui.unmount()
+  })
+
+  test('HWP는 rhwp 엔진으로 연다', async ($, on) => {
+    const world = fakeWorld(on)
+    const clock = mock.clock(on)
+    await $.command.run(typed('open', '/work/doc.hwpx'))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    await clock.advance(5)
+    expect(world.scripts[0]).toBe('rhwp-view.mjs')
+    await ui.unmount()
   })
 })
 

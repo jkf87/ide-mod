@@ -1,6 +1,6 @@
 # ide-mod
 
-Claude Code 안에 IDE 창을 띄우는 모드(function-hooks 플러그인)예요. 창 위쪽에는 **에이전트 보드**가, 아래쪽에는 **파일 트리와 탭 에디터**가 있어요. 탭에서 **HWP·HWPX 문서**를 [rhwp](https://github.com/edwardkim/rhwp) 엔진으로 열어 보고, 왼쪽 칸을 **이번 세션의 요청 기록**으로 바꿔 볼 수 있어요. 입력창 위에는 **강의 자막**과 **한국어 문체 게이트**가 떠요.
+Claude Code 안에 IDE 창을 띄우는 모드(function-hooks 플러그인)예요. 창 위쪽에는 **에이전트 보드**가, 아래쪽에는 **파일 트리와 탭 에디터**가 있어요. 탭에서 **HWP·HWPX·PDF 문서**를 쪽 모양 그대로 열어 보고, 왼쪽 칸을 **이번 세션의 요청 기록**으로 바꿔 볼 수 있어요. 입력창 위에는 **강의 자막**과 **한국어 문체 게이트**가 떠요.
 
 ```
 에이전트 ● opus 5.5 1M · xhigh · 서브 1개 작업 중 / 1개 끝남   a: 보드 접기  h: 끝난 것 숨기기  s: 요약 끄기(haiku)  x: 끝난 것 지우기
@@ -62,9 +62,10 @@ Claude Code 터미널 세션에서 아래 한 줄을 입력하세요.
 - 폭이 70칸보다 좁으면 트리와 파일을 번갈아 보여줘요. 파일을 고르면 파일 화면으로 넘어가고, `t`를 누르면 트리로 돌아와요.
 - 단축키: `t` 트리 접기, `q` 파일 트리/요청 기록, `u` 상위 폴더, `r` 새로고침, `m` 렌더/원문, `v` HWP 문서/그림 보기, `o` HWP 미리보기로 열기, `b`·`n` HWP 앞뒤 쪽, `p` 입력창에 `@경로` 넣기, `c` 경로 복사, `w` 탭 닫기
 
-### HWP·HWPX 뷰어 (rhwp 엔진)
+### HWP·HWPX·PDF 뷰어 (rhwp·pdf.js 엔진)
 
-- 트리에서 `.hwp`·`.hwpx`를 누르면 탭으로 열려요. 엔진은 [rhwp](https://github.com/edwardkim/rhwp)(Rust→WASM, MIT)이고 `vendor/rhwp`에 들어 있어요.
+- 트리에서 `.hwp`·`.hwpx`·`.pdf`를 누르면 탭으로 열려요. HWP 엔진은 [rhwp](https://github.com/edwardkim/rhwp)(Rust→WASM, MIT, `vendor/rhwp`), PDF 엔진은 [pdf.js](https://github.com/mozilla/pdf.js)(Apache-2.0, `vendor/pdfjs`)예요. 둘 다 같은 문서 보기 렌더러(`bin/grid.mjs`)를 써요.
+- PDF는 pdf.js가 꺼낸 글자 좌표와 선(획·얇은 막대)으로 문서 보기를 만들고, 그림 보기는 poppler의 `pdftoppm`으로 만들어요(`brew install poppler`). `o`는 PDF 원본을 미리보기로 바로 열어요.
 - **문서 보기**(기본): rhwp가 그린 쪽을 창 너비에 맞춘 글자 격자로 다시 그려요. 가운데 정렬 제목, 번호 상자, 표 테두리(┌┬┐├┼┤└┴┘), 굵은 글씨, 글자색, 가운뎃점을 쪽 모양 그대로 보여주고, 칸을 넘는 글은 `…`로 줄여요. 그래픽이 없는 터미널(macOS 터미널 등)에서도 HWP 모양으로 보여요. 쪽 끝까지 내리면 다음 쪽으로 넘어가요.
 - **그림 보기**(`v`): rhwp가 그린 실제 쪽 그림이에요. 터미널은 PNG(kitty·Ghostty 같은 그래픽 터미널), 데스크톱 앱은 SVG로 그려요.
 - **미리보기로 열기**(`o`): 지금 쪽을 그림으로 만들어 macOS 미리보기로 열어요. 한컴에서 보는 모양 그대로 확인할 때 써요.
@@ -109,4 +110,4 @@ claude --plugin-dir .        # 이 폴더를 그대로 로드해서 써 보기
 
 ## License
 
-MIT. 함께 들어 있는 rhwp(`vendor/rhwp`)는 Edward Kim의 MIT 라이선스예요.
+MIT. 함께 들어 있는 rhwp(`vendor/rhwp`)는 Edward Kim의 MIT 라이선스, pdf.js(`vendor/pdfjs`)는 Mozilla의 Apache-2.0 라이선스예요.
