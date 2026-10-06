@@ -100,6 +100,8 @@ declare module 'claude-code' {
       /** 오른쪽에 펼친 요청 번호; 0이면 가장 최근 */
       selectedRequest: number
       requestOffset: number
+      /** 오른쪽: all 이번 세션 요청 전부를 이어서, one 고른 요청 하나 */
+      requestView: 'all' | 'one'
 
       // ── HWP 뷰어 ──
       /** doc: 쪽을 글자 격자로(기본), image: rhwp가 그린 쪽 그림 */

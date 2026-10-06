@@ -734,9 +734,11 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
   const selectedN = await read($, selectedRequestAtom)
   const hwpView = await read($, hwpViewAtom)
   const isRequests = leftMode === 'requests'
-  // 요청 기록 모드에서는 오른쪽에 고른 요청(없으면 가장 최근)을 펼친다
+  // 요청 기록 모드: 기본은 이번 세션 요청 전부를 오른쪽에 이어서 보여 주고, 왼쪽에서 고르면 그 요청 하나만 펼친다
+  const requestView = await read($, requestViewAtom)
+  const isAllRequests = isRequests && requestView === 'all' && requests.length > 0
   const selected = requests.find(r => r.n === selectedN) ?? requests[requests.length - 1]
-  const rightKey = isRequests ? (selected === undefined ? '' : `request:${selected.n}`) : active
+  const rightKey = isRequests ? (isAllRequests ? 'requests:all' : selected === undefined ? '' : `request:${selected.n}`) : active
   const isHwp = !isRequests && HWP.test(active)
 
   const isWide = width >= SPLIT_MIN_COLUMNS
@@ -804,10 +806,14 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
       {isHwp && (
         <Button key="hwp-next" plain hotkey="n" label="뒤쪽 ▶" onPress={() => void update($, hwpPagesAtom, all => ({ ...all, [active]: (all[active] ?? 0) + 1 }))} />
       )}
-      {isRequests && selected !== undefined && (
+      {isRequests && requests.length > 0 && (
+        <Button key="request-all" plain hotkey="l" label={isAllRequests ? '하나만 보기' : '모두 보기'} onPress={() => void update($, requestViewAtom, v => (v === 'all' ? 'one' : 'all'))} />
+      )}
+      {isRequests && !isAllRequests && selected !== undefined && (
         <Button key="request-again" plain hotkey="p" label="입력창에 다시 넣기" onPress={() => void $.prompt.fill({ text: selected.text, mode: 'insert' })} />
       )}
-      {isRequests && selected !== undefined && <Button key="request-copy" plain hotkey="c" label="복사" onPress={() => void $.ui.copy({ text: selected.text, surface: e.surface })} />}
+      {isRequests && !isAllRequests && selected !== undefined && <Button key="request-copy" plain hotkey="c" label="복사" onPress={() => void $.ui.copy({ text: selected.text, surface: e.surface })} />}
+      {isAllRequests && <Button key="request-copy-all" plain hotkey="c" label="전부 복사" onPress={() => void $.ui.copy({ text: requestsAsText(requests), surface: e.surface })} />}
       {!isRequests && active !== '' && isMarkdown && (
         <Button key="mode" plain hotkey="m" label={mode === 'rendered' ? '원문' : '렌더'} onPress={() => void update($, modeAtom, m => (m === 'rendered' ? 'code' : 'rendered'))} />
       )}
@@ -830,7 +836,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
         <Text bold wrap="truncate-end">요청 기록 {requests.length}개{requests.length > treeView ? ` · ${requestOffset + 1}-${requestOffset + shown.length}` : ''}</Text>
         {shown.length === 0 && <Text dimColor>아직 보낸 요청이 없어요. 이 세션에서 보내는 요청이 여기 쌓여요.</Text>}
         {shown.map(r => {
-          const isOn = r.n === selected?.n
+          const isOn = !isAllRequests && r.n === selected?.n
           return (
             <Box key={`req-row:${r.n}`} flexDirection="row" height={1} overflow="hidden" backgroundColor={isOn ? 'promptBorder' : undefined}>
               <Button
@@ -841,6 +847,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
                 onPress={() =>
                   void (async () => {
                     await update($, selectedRequestAtom, () => r.n)
+                    await update($, requestViewAtom, () => 'one')
                     if (!(layout.showTree && layout.showFile)) await update($, treeHiddenAtom, () => true)
                   })()
                 }
@@ -913,7 +920,30 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
 
     if (isRequests) {
       const head = <Text dimColor>요청 기록 · {requests.length}개 · {requests.filter(r => r.status === 'running').length}개 진행 중</Text>
-      if (selected === undefined) {
+      if (isAllRequests) {
+        // 요청 하나가 머리줄 + 본문 줄들 + 답 한 줄 + 빈 줄. 스크롤은 이 논리 줄 단위로, 넘치는 줄은 창이 자른다
+        const segments: RenderElement[] = []
+        for (const r of [...requests].reverse()) {
+          segments.push(
+            <Text key={`all-head:${r.n}`} bold wrap="truncate-end">
+              #{r.n} · {dayClock(r.at)} · {REQUEST_ICON[r.status]} {requestStatus(r)}
+            </Text>,
+          )
+          r.text.split('\n').forEach((line, i) => segments.push(<Text key={`all-line:${r.n}:${i}`} color="success">{line === '' ? ' ' : line}</Text>))
+          if (r.answer !== '') segments.push(<Text key={`all-answer:${r.n}`} dimColor wrap="truncate-end">  └ Claude: {r.answer}</Text>)
+          segments.push(<Text key={`all-gap:${r.n}`}> </Text>)
+        }
+        const offset = clamp(offsets[rightKey] ?? 0, 0, segments.length - 1)
+        layout.fileMaxOffset = Math.max(0, segments.length - 1)
+        fileColumn = (
+          <Box key="ide-file" flexDirection="column" width={fileWidth} height={mainRows} overflow="hidden">
+            <Text bold wrap="truncate-end">이번 세션 요청 {requests.length}개 전부 · 최근 것이 위 · 휠로 스크롤</Text>
+            <Box flexDirection="column" height={Math.max(1, mainRows - 1)} overflow="hidden">
+              {segments.slice(offset)}
+            </Box>
+          </Box>
+        )
+      } else if (selected === undefined) {
         fileColumn = (
           <Box key="ide-file" flexDirection="column" width={fileWidth} height={mainRows} overflow="hidden">
             {head}
@@ -924,8 +954,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
         const lines = selected.text.split('\n')
         const offset = clamp(offsets[rightKey] ?? 0, 0, lines.length - 1)
         layout.fileMaxOffset = Math.max(0, lines.length - 1)
-        const took = selected.endedAt !== undefined ? ` · ${formatElapsed(selected.endedAt - selected.at)}` : ''
-        const status = selected.status === 'running' ? '진행 중' : selected.status === 'done' ? `끝남${took}` : `중단됨${took}`
+        const status = requestStatus(selected)
         fileColumn = (
           <Box key="ide-file" flexDirection="column" width={fileWidth} height={mainRows} overflow="hidden">
             <Text bold wrap="truncate-end">요청 #{selected.n} · {clock(selected.at)} · {status}</Text>
@@ -1009,6 +1038,7 @@ const leftModeAtom = atom({ plugin: 'ide-mod', key: 'leftMode' } as const, 'file
 const requestsAtom = atom({ plugin: 'ide-mod', key: 'requests' } as const, [] as RequestItem[])
 const selectedRequestAtom = atom({ plugin: 'ide-mod', key: 'selectedRequest' } as const, 0)
 const requestOffsetAtom = atom({ plugin: 'ide-mod', key: 'requestOffset' } as const, 0)
+const requestViewAtom = atom({ plugin: 'ide-mod', key: 'requestView' } as const, 'all' as 'all' | 'one')
 const hwpViewAtom = atom({ plugin: 'ide-mod', key: 'hwpView' } as const, 'doc' as 'doc' | 'image')
 const hwpPagesAtom = atom({ plugin: 'ide-mod', key: 'hwpPages' } as const, {} as Record<string, number>)
 const lectureAtom = atom({ plugin: 'ide-mod', key: 'isLecture' } as const, false)
@@ -1032,6 +1062,19 @@ const clock = (ms: number) => {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 const REQUEST_ICON: Record<RequestItem['status'], string> = { running: '●', done: '✓', stopped: '■' }
+/** 오늘이 아니면 날짜도 붙인다 (세션을 며칠에 걸쳐 이어 쓸 때) */
+const dayClock = (ms: number) => {
+  const d = new Date(ms)
+  const isToday = d.toDateString() === new Date().toDateString()
+  return isToday ? clock(ms) : `${d.getMonth() + 1}/${d.getDate()} ${clock(ms)}`
+}
+const requestStatus = (r: RequestItem) => {
+  const took = r.endedAt !== undefined ? ` · ${formatElapsed(r.endedAt - r.at)}` : ''
+  return r.status === 'running' ? '진행 중' : r.status === 'done' ? `끝남${took}` : `중단됨${took}`
+}
+/** 요청 기록 전체를 붙여 넣기 좋은 글로 (오래된 것부터) */
+export const requestsAsText = (items: RequestItem[]) =>
+  items.map(r => `#${r.n} ${dayClock(r.at)} ${REQUEST_ICON[r.status]}\n${r.text}${r.answer !== '' ? `\n└ Claude: ${r.answer}` : ''}`).join('\n\n')
 
 async function saveRequests($: EngineInterface) {
   const id = await $.session.id()

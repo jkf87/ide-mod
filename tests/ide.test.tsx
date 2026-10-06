@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { blockStarts, captionFor, describeCall, fit, shortModel, styleGate } from '../hooks/register'
+import { blockStarts, captionFor, describeCall, fit, requestsAsText, shortModel, styleGate } from '../hooks/register'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
 const ROOT = '/work'
@@ -423,14 +423,22 @@ describe('요청 기록', () => {
     await ui.press({ key: 'left-mode' })
     expect((await ui.find({ key: 'req:1' }))?.props.label).toContain('✓')
     expect((await ui.find({ key: 'req:2' }))?.props.label).toContain('●')
-    // 기본으로 가장 최근 요청이 펼쳐진다
-    expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('요청 #2')
+    // 기본은 이번 세션 요청 전부를 최근 것부터 이어서 보여 준다
+    const all = textOf(await ui.findAll({ type: 'Text' }))
+    expect(all).toContain('이번 세션 요청 2개 전부')
+    expect(all.indexOf('테스트도 추가해줘')).toBeLessThan(all.indexOf('로그인 버그 고쳐줘'))
+    expect(all).toContain('└ Claude: 고쳤어요. login.ts 42행이 원인')
+    expect((await ui.find({ key: 'request-all' }))?.props.label).toBe('하나만 보기')
+    expect(requestsAsText((world.saved as { items: Parameters<typeof requestsAsText>[0] }).items)).toMatch(/#1 .*✓\n로그인 버그 고쳐줘\n└ Claude: 고쳤어요/)
+    // 하나를 고르면 그 요청만 펼치고, l로 다시 전부 보기
     await ui.press({ key: 'req:1' })
     const text = textOf(await ui.findAll({ type: 'Text' }))
     expect(text).toContain('요청 #1')
     expect(text).toContain('Claude 답: 고쳤어요. login.ts 42행이 원인')
     expect((await ui.findAll({ type: 'Text' })).find(x => x.text === '로그인 버그 고쳐줘')?.props.color).toBe('success')
     expect(JSON.stringify(world.saved)).toContain('테스트도 추가해줘')
+    await ui.press({ key: 'request-all' })
+    expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('이번 세션 요청 2개 전부')
     await ui.unmount()
   })
 })
