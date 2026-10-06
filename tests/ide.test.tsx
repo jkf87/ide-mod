@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { blockStarts, captionFor, describeCall, fit, handoffNote, parsePeers, pickPeer, requestsAsText, shortModel, styleGate } from '../hooks/register'
+import { blockStarts, captionFor, describeCall, fit, handoffNote, isMachineText, parsePeers, personText, pickPeer, requestsAsText, shortModel, styleGate } from '../hooks/register'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
 const ROOT = '/work'
@@ -554,6 +554,14 @@ describe('데스크톱 앱', () => {
 })
 
 describe('요청 기록 거르기', () => {
+  test('데스크톱이 앞에 붙이는 system-reminder 블록은 걷어 내고 사람이 쓴 글만 남긴다', () => {
+    const typed = '<system-reminder>\nThe user started this session without choosing a project folder.\n</system-reminder>\n로그인 버그 고쳐줘'
+    expect(personText(typed)).toBe('로그인 버그 고쳐줘')
+    expect(isMachineText(typed)).toBe(false)
+    expect(isMachineText('<system-reminder>only a notice</system-reminder>')).toBe(true)
+    expect(isMachineText('<task-notification>done</task-notification>')).toBe(true)
+  })
+
   test('작업 알림으로 시작한 턴은 요청으로 적지 않고 메인 작업 줄도 그대로 둔다', async ($, on) => {
     const world = fakeWorld(on)
     await ask($, '로그인 버그 고쳐줘', 't1')

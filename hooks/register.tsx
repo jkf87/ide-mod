@@ -223,7 +223,8 @@ function registerAgents(on: On) {
   on('turn.start', async ($, e, next) => {
     // 사람이 보낸 요청으로 시작한 턴만 메인 작업을 바꾼다. 백그라운드 작업 알림·다른 세션 메시지로 시작한 턴은
     // 작업 줄은 두고 "지금 하는 일"만 바꾼다 (그 글은 사람이 쓴 게 아니라서 요청 기록에도 넣지 않는다)
-    const isPersonTurn = e.text.trim() !== '' && (await requestTurnStarted($, e.text, e.turnId).catch(() => false))
+    const own = personText(e.text)
+    const isPersonTurn = own !== '' && (await requestTurnStarted($, own, e.turnId).catch(() => false))
     if (!isPersonTurn && e.text.trim() !== '') {
       await patch($, MAIN, row => ({ ...row, role: 'main', phase: 'running', activity: '알림·메시지 처리 중', updatedAt: Date.now(), endedAt: undefined }))
     }
@@ -231,7 +232,7 @@ function registerAgents(on: On) {
       await patch($, MAIN, row => ({
         ...row,
         role: 'main',
-        task: oneLine(e.text, 120),
+        task: oneLine(own, 120),
         phase: 'running',
         activity: '생각 중',
         log: [],
@@ -1276,16 +1277,24 @@ async function saveRequests($: EngineInterface) {
 }
 
 /** 세션을 이어 열었거나 모드가 다시 로드됐을 때 저장해 둔 요청을 되살리고, 오래된 세션 기록은 정리한다 */
-/** 사람이 쓴 글이 아닌 것: 백그라운드 작업 알림, 시스템 알림, 다른 세션·팀원이 보낸 메시지 */
-export const isMachineText = (text: string) =>
-  /^\s*(<(task-notification|system-reminder|teammate-message|peer-message|cross-session-message)\b|\[SYSTEM NOTIFICATION)/i.test(text)
+/** 프롬프트에서 사람이 쓴 부분만: 데스크톱 앱·훅이 앞뒤에 붙이는 <system-reminder> 같은 안내 블록을 걷어 낸다 */
+export const personText = (text: string) =>
+  text
+    .replace(/<(system-reminder|local-command-caveat|command-message|command-name|command-args)\b[^>]*>[\s\S]*?<\/\1>/gi, '')
+    .trim()
+
+/** 사람이 쓴 글이 아닌 것: 안내 블록을 걷어 내면 비거나, 백그라운드 작업 알림·다른 세션·팀원이 보낸 메시지 */
+export const isMachineText = (text: string) => {
+  const own = personText(text)
+  return own === '' || /^\s*(<(task-notification|teammate-message|peer-message|cross-session-message)\b|\[SYSTEM NOTIFICATION)/i.test(own)
+}
 
 async function loadRequests($: EngineInterface) {
   const id = await $.session.id()
   if ((await read($, requestsAtom)).length === 0) {
     const saved = (await $.store.get(`${STORE_PREFIX}${id}`)) as { items?: RequestItem[] } | undefined
     // 0.5.0까지는 작업 알림·다른 세션 메시지로 시작한 턴도 요청으로 적었다: 불러올 때 걸러 낸다
-    const items = Array.isArray(saved?.items) ? saved.items.filter(r => !isMachineText(r.text)) : []
+    const items = Array.isArray(saved?.items) ? saved.items.filter(r => !isMachineText(r.text)).map(r => ({ ...r, text: personText(r.text) })) : []
     if (items.length > 0) await update($, requestsAtom, () => items)
   }
   const keys = (await $.store.keys()).filter(k => k.startsWith(STORE_PREFIX))
@@ -1667,8 +1676,8 @@ export const register: Register = on => {
   // 턴이 시작되기 전에 기록해 두어야 turn.start가 그 요청과 이을 수 있다
   on('prompt.submit', async ($, e, next) => {
     try {
-      const text = e.text.trim()
-      if (REQUEST_ORIGINS.includes(e.origin.kind) && text !== '' && !/^\/[\w:.-]+$/.test(text)) await addRequest($, text, e.turnId)
+      const text = personText(e.text)
+      if (REQUEST_ORIGINS.includes(e.origin.kind) && text !== '' && !isMachineText(text) && !/^\/[\w:.-]+$/.test(text)) await addRequest($, text, e.turnId)
     } catch {
       // 기록은 덤이라 실패해도 프롬프트는 그대로 간다
     }
