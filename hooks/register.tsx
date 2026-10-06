@@ -374,7 +374,10 @@ async function drawBoard($: EngineInterface, e: RenderInput<'Pane'>, width: numb
     const elapsed = formatElapsed((row.endedAt ?? now) - row.startedAt)
     const brain = `${shortModel(row.model) || '모델 확인 중'}${row.effort ? ` · ${row.effort}` : ''}`
     const pad = `${lead}${depth === 0 ? '' : branch === '└─ ' ? '   ' : '│  '}  `
-    const doing = row.phase === 'running' && row.recap !== '' ? `요약 ${row.recap}` : row.phase === 'running' && row.activity !== '' ? `지금 ${row.activity}` : row.recap !== '' ? `결과 ${row.recap}` : row.activity
+    // 지금 하는 일·요약은 노란색(돌고 있을 때만), 끝난 결과는 흐리게
+    const isLive = row.phase === 'running'
+    const [label, body] = isLive && row.recap !== '' ? ['요약', row.recap] : isLive && row.activity !== '' ? ['지금', row.activity] : row.recap !== '' ? ['결과', row.recap] : ['', row.activity]
+    const live = isLive && body !== ''
     lines.push(
       <Text key={`agent:${row.id}`} wrap="truncate-end">
         <Text dimColor>{lead}{depth === 0 ? '' : branch}</Text>
@@ -382,13 +385,15 @@ async function drawBoard($: EngineInterface, e: RenderInput<'Pane'>, width: numb
         <Text bold color={row.id === MAIN ? 'claude' : colorOf(row.role)}>{row.id === MAIN ? '메인' : row.role}</Text>
         <Text>  {brain}</Text>
         <Text dimColor>  {PHASE_LABEL[row.phase]} {elapsed}{row.isBackground ? ' · 백그라운드' : ''}{row.toolCount > 0 ? ` · 도구 ${row.toolCount}` : ''}</Text>
-        <Text>{row.task !== '' ? `  ${oneLine(row.task, 80)}` : ''}</Text>
+        {/* 메인의 작업은 사람이 입력한 프롬프트라 초록색 */}
+        <Text color={row.id === MAIN ? 'success' : undefined}>{row.task !== '' ? `  ${oneLine(row.task, 80)}` : ''}</Text>
       </Text>,
     )
-    if (doing !== '') {
+    if (body !== '') {
       lines.push(
-        <Text key={`agent-doing:${row.id}`} wrap="truncate-end" dimColor>
-          {pad}{oneLine(doing, Math.max(10, width))}
+        <Text key={`agent-doing:${row.id}`} wrap="truncate-end">
+          <Text dimColor>{pad}{label === '' ? '' : `${label} `}</Text>
+          <Text color={live ? 'warning' : undefined} dimColor={!live}>{oneLine(body, Math.max(10, width))}</Text>
         </Text>,
       )
     }
@@ -926,7 +931,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
             <Text bold wrap="truncate-end">요청 #{selected.n} · {clock(selected.at)} · {status}</Text>
             {selected.answer !== '' ? <Text dimColor wrap="truncate-end">Claude 답: {selected.answer}</Text> : <Text dimColor> </Text>}
             <Box flexDirection="column" height={contentRows} overflow="hidden">
-              <Text>{lines.slice(offset).join('\n')}</Text>
+              <Text color="success">{lines.slice(offset).join('\n')}</Text>
             </Box>
           </Box>
         )
@@ -1448,7 +1453,7 @@ export const register: Register = on => {
       <Box flexDirection="column" width={width}>
         {caption !== undefined && (
           <Box key="lecture" flexDirection="column" borderStyle="round" borderColor="claude" paddingX={1}>
-            <Text bold color="claude" wrap="truncate-end">▶ {caption.text || '대기 중'}</Text>
+            <Text bold color="warning" wrap="truncate-end">▶ {caption.text || '대기 중'}</Text>
             <Text dimColor wrap="truncate-end">
               {caption.prev !== '' ? `방금: ${caption.prev} · ` : ''}{caption.step}단계{caption.startedAt > 0 ? ` · ${formatElapsed(Date.now() - caption.startedAt)}` : ''}{running > 0 ? ` · 도우미 에이전트 ${running}명 작업 중` : ''}
             </Text>

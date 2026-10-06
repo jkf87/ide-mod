@@ -266,6 +266,12 @@ describe('에이전트 보드', () => {
       await ui.unmount()
     }
     expect(world.statuses.some(s => s?.includes('서브에이전트 1개'))).toBe(true)
+    // 색: 사람이 입력한 프롬프트(메인 작업)는 초록, 돌고 있는 에이전트의 지금 하는 일은 노랑
+    const colored = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    const texts = await colored.findAll({ type: 'Text' })
+    expect(texts.find(x => x.text.includes('로그인 버그 고쳐줘') && x.props.color === 'success')).toBeDefined()
+    expect(texts.find(x => x.text.includes('Grep') && x.props.color === 'warning')).toBeDefined()
+    await colored.unmount()
 
     await $.turn.complete({ answer: '## 찾았다\nlogin.ts 42행', durationMs: 1200, isAborted: false, turnId: 't2', agentId: 'sub-1', reason: 'answer' } as never)
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
@@ -421,6 +427,7 @@ describe('요청 기록', () => {
     const text = textOf(await ui.findAll({ type: 'Text' }))
     expect(text).toContain('요청 #1')
     expect(text).toContain('Claude 답: 고쳤어요. login.ts 42행이 원인')
+    expect((await ui.findAll({ type: 'Text' })).find(x => x.text === '로그인 버그 고쳐줘')?.props.color).toBe('success')
     expect(JSON.stringify(world.saved)).toContain('테스트도 추가해줘')
     await ui.unmount()
   })
