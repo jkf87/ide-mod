@@ -32,6 +32,7 @@ const LIST_PHASE: Record<string, AgentPhase> = {
 
 // 재로드되면 처음부터 다시 세는 값들: 화면이 읽는 값은 전부 $.state에 둔다
 let isInteractive = true
+let timersStarted = false
 let isRecapping = false
 let recapFailures = 0
 let lastStatus: string | undefined
@@ -151,7 +152,7 @@ async function reconcile($: EngineInterface) {
 
 /** 쌓인 도구 기록을 haiku로 한 줄 요약한다. 타이머에서만, 보드가 화면에 있을 때만 부른다 */
 async function recapStale($: EngineInterface) {
-  if (isRecapping || !isInteractive || Date.now() - lastDrawnAt > 30_000) return
+  if (isRecapping || Date.now() - lastDrawnAt > 30_000) return
   if (!(await read($, recapOnAtom))) return
   isRecapping = true
   try {
@@ -188,10 +189,16 @@ async function recapStale($: EngineInterface) {
   }
 }
 
-/** session.start에서 한 번: 요약·정리 타이머를 건다 (비대화형 세션에서는 걸지 않는다) */
+/** 요약·정리 타이머를 건다. 터미널(REPL)은 session.start에서, 데스크톱 앱·SDK처럼 isInteractive가 false로 오는
+ *  화면은 보드가 처음 그려질 때 건다 (-p 실행처럼 아무것도 그리지 않으면 걸리지 않는다) */
 function startAgents($: EngineInterface, interactive: boolean) {
   isInteractive = interactive
-  if (!interactive) return
+  if (interactive) startTimers($)
+}
+
+function startTimers($: EngineInterface) {
+  if (timersStarted) return
+  timersStarted = true
   $.clock.every(RECAP_EVERY_MS, () => void recapStale($).catch(() => undefined))
   $.clock.every(5_000, () =>
     void (async () => {
@@ -322,6 +329,7 @@ async function recordToolCall($: EngineInterface, agentId: string | undefined, t
 async function drawBoard($: EngineInterface, e: RenderInput<'Pane'>, width: number, maxRows: number): Promise<RenderElement[]> {
   const { Box, Text, Button } = $.ui.resolve(e)
   lastDrawnAt = Date.now()
+  startTimers($)
   const all = await read($, agentsAtom)
   const isFolded = await read($, foldedAtom)
   const hideDone = await read($, hideDoneAtom)

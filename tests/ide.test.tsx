@@ -531,6 +531,28 @@ describe('핸드오프', () => {
   })
 })
 
+describe('데스크톱 앱', () => {
+  test('isInteractive가 false로 와도(데스크톱·SDK) 보드가 그려지면 요약 타이머가 돈다', async ($, on) => {
+    fakeWorld(on)
+    const clock = mock.clock(on)
+    const asked: string[] = []
+    on('model.complete', ($, e) => {
+      asked.push(String((e as unknown as { prompt: string }).prompt))
+      return { value: { isAnswered: true, text: '로그인 코드를 읽는 중' } } as never
+    })
+    // 데스크톱 앱은 session.start에 isInteractive: false를 준다 → 그때는 타이머를 걸지 않고, 보드를 처음 그릴 때 건다
+    await ask($, '로그인 버그 고쳐줘', 't1')
+    await $.tool.call({ tool: 'Read', file_path: '/work/src/app.ts' } as never)
+    await clock.advance(25_000)
+    expect(asked).toEqual([])
+    await $.command.run(typed('ide', ''))
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: props(140) })
+    await clock.advance(25_000)
+    expect(asked.length).toBe(1)
+    await ui.unmount()
+  })
+})
+
 describe('요청 기록 거르기', () => {
   test('작업 알림으로 시작한 턴은 요청으로 적지 않고 메인 작업 줄도 그대로 둔다', async ($, on) => {
     const world = fakeWorld(on)
