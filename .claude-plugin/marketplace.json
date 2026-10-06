@@ -1,0 +1,13 @@
+{
+  "name": "ide-mod",
+  "owner": {
+    "name": "jkf87"
+  },
+  "plugins": [
+    {
+      "name": "ide-mod",
+      "source": "./"
+    }
+  ],
+  "description": "Claude Code 안의 IDE 창 모드: 에이전트 보드 + 파일 트리 + 탭 에디터"
+}
