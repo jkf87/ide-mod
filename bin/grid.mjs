@@ -25,7 +25,22 @@ export const textColor = fill => {
 }
 
 /** 글자·선 목록을 cols칸짜리 격자로: 글줄마다 한 행, 표 테두리는 상자 문자로 */
-export function layoutGrid({ glyphs, hLines, vLines }, cols) {
+// 그림자·외곽선 효과는 같은 글자를 거의 같은 자리에 한 번 더 그린다: 한 번만 남긴다 ("주주요요" → "주요")
+export function dedupeGlyphs(glyphs) {
+  const kept = []
+  const seen = new Map()
+  for (const g of glyphs) {
+    const near = seen.get(g.ch)?.some(o => Math.abs(o.x - g.x) < g.size * 0.35 && Math.abs(o.y - g.y) < g.size * 0.35)
+    if (near) continue
+    kept.push(g)
+    if (!seen.has(g.ch)) seen.set(g.ch, [])
+    seen.get(g.ch).push(g)
+  }
+  return kept
+}
+
+export function layoutGrid({ glyphs: drawn, hLines, vLines }, cols) {
+  const glyphs = dedupeGlyphs(drawn)
   if (glyphs.length === 0 && hLines.length === 0) return { width: 0, rows: [] }
   // 세로: 글줄(가운데 높이)과 가로선을 높이 순서대로 줄 세워 한 줄에 하나씩 둔다
   const levels = []

@@ -2,6 +2,10 @@
 
 Claude Code 안에 IDE 창을 띄우는 모드(function-hooks 플러그인)예요. 창 위쪽에는 **에이전트 보드**가, 아래쪽에는 **파일 트리와 탭 에디터**가 있어요. 탭에서 **HWP·HWPX·PDF 문서**를 쪽 모양 그대로 열어 보고, 왼쪽 칸을 **이번 세션의 요청 기록**으로 바꿔 볼 수 있어요. 입력창 위에는 **강의 자막**과 **한국어 문체 게이트**가 떠요.
 
+![ide-mod 데모: IDE 창 열기, 코드·한글(HWPX) 문서 보기, 서브에이전트 보드, 요청 기록](docs/demo.gif)
+
+<sub>데모 녹화: [`docs/demo.tape`](docs/demo.tape) ([VHS](https://github.com/charmbracelet/vhs)) · 샘플 문서는 행정안전부 「2025년 주요업무 추진계획」(공공 문서)</sub>
+
 ```
 에이전트 ● opus 5.5 1M · xhigh · 서브 1개 작업 중 / 1개 끝남   a: 보드 접기  h: 끝난 것 숨기기  s: 요약 끄기(haiku)  x: 끝난 것 지우기
 ● 메인  opus 5.5 1M · xhigh  작업 중 3m12s · 도구 14  로그인 버그 고쳐줘
