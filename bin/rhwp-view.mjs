@@ -421,6 +421,21 @@ async function gridMode(file, pageArg, colsArg) {
   return { pages: page.pages, page: page.page, cols, ...pageGrid(svg, cols) }
 }
 
+/**
+ * 데스크톱 앱의 Svg 요소(최대 131072자)에 들어가도록 줄인다. rhwp는 글자마다 긴 글꼴 목록을 붙이므로
+ * 글꼴은 스타일 한 줄로 모으고(명조·고딕 두 갈래), 좌표는 소수 한 자리로 줄인다.
+ */
+export function slimSvg(svg) {
+  const families = new Map()
+  let slim = svg.replace(/ font-family="([^"]*)"/g, (_, family) => {
+    if (!families.has(family)) families.set(family, `f${families.size}`)
+    return ` class="${families.get(family)}"`
+  })
+  slim = slim.replace(/(\d+\.\d)\d+/g, '$1')
+  const rules = [...families].map(([family, name]) => `.${name}{font-family:${family.replace(/&apos;/g, "'")}}`).join('')
+  return slim.replace(/(<svg\b[^>]*>)/, `$1<style>${rules}</style>`)
+}
+
 /** SVG를 PNG로: rsvg-convert → resvg → (macOS) qlmanage → 없으면 PNG 없이 */
 function toPng(svgPath, pngPath) {
   const tryRun = (cmd, args) => {
@@ -476,6 +491,7 @@ async function pageMode(file, pageArg, options = { png: true }) {
     const pngPath = path.join(dir, `page-${page}.png`)
     if (!fs.existsSync(svgPath)) fs.writeFileSync(svgPath, doc.renderPageSvg(page))
     const svg = fs.readFileSync(svgPath, 'utf8')
+    const slim = slimSvg(svg)
     const png = fs.existsSync(pngPath) ? pngPath : options.png ? toPng(svgPath, pngPath) : undefined
     const size = svg.match(/width="([\d.]+)"\s+height="([\d.]+)"/)
     // PNG의 실제 크기 (qlmanage는 정사각형 썸네일을 만든다): IHDR의 너비·높이
@@ -484,7 +500,7 @@ async function pageMode(file, pageArg, options = { png: true }) {
       pages,
       page,
       svgPath,
-      svg: svg.length <= SVG_INLINE_MAX ? svg : undefined,
+      svg: slim.length <= SVG_INLINE_MAX ? slim : undefined,
       pngPath: png,
       width: size ? Number(size[1]) : undefined,
       height: size ? Number(size[2]) : undefined,
