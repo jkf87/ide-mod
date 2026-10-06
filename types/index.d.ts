@@ -30,6 +30,36 @@ export type AgentRow = {
   endedAt?: number
 }
 
+/** 이번 세션에 사람이 보낸 요청 하나 */
+export type RequestItem = {
+  n: number
+  text: string
+  at: number
+  status: 'running' | 'done' | 'stopped'
+  /** 이 요청을 처리한 턴 */
+  turnId?: string
+  /** Claude 답의 첫 줄 */
+  answer: string
+  endedAt?: number
+}
+
+export type GateCheck = { label: string; count: number; limit: number; isHard: boolean }
+
+/** 한국어 문체 게이트 결과 (noslop-ko grep 게이트와 같은 기준) */
+export type GateResult = {
+  path: string
+  verdict: 'pass' | 'warn' | 'stop'
+  violations: number
+  checks: GateCheck[]
+  examples: string[]
+  sentences: number
+  longRuns: number
+  at: number
+}
+
+/** 강의 모드 자막 */
+export type Caption = { text: string; prev: string; step: number; startedAt: number }
+
 declare module 'claude-code' {
   interface PluginState {
     'ide-mod': {
@@ -62,6 +92,25 @@ declare module 'claude-code' {
       isBoardFolded: boolean
       hideDone: boolean
       isRecapOn: boolean
+
+      // ── 요청 기록 ──
+      /** 왼쪽 칸: 파일 트리 또는 요청 기록 */
+      leftMode: 'files' | 'requests'
+      requests: RequestItem[]
+      /** 오른쪽에 펼친 요청 번호; 0이면 가장 최근 */
+      selectedRequest: number
+      requestOffset: number
+
+      // ── HWP 뷰어 ──
+      hwpView: 'body' | 'page'
+      hwpPages: Record<string, number>
+
+      // ── 강의 모드·문체 게이트 ──
+      isLecture: boolean
+      caption: Caption
+      gate: GateResult | null
+      isGateOn: boolean
+      isGateOpen: boolean
     }
   }
 }

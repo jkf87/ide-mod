@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Color, EngineInterface, On, Register, RenderElement, RenderInput } from 'claude-code'
 
-import type { AgentPhase, AgentRow, ViewMode } from '../types'
+import type { AgentPhase, AgentRow, Caption, GateCheck, GateResult, RequestItem, ViewMode } from '../types'
 
 // ════════════════ 에이전트 보드 ════════════════
 const MAIN = 'main'
@@ -228,6 +228,8 @@ function registerAgents(on: On) {
         updatedAt: Date.now(),
         endedAt: undefined,
       }))
+      await requestTurnStarted($, e.text, e.turnId).catch(() => undefined)
+      await setCaption($, '요청을 읽고 계획을 세우는 중이에요', true).catch(() => undefined)
     }
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -265,6 +267,7 @@ function registerAgents(on: On) {
       }),
       true,
     )
+    await setCaption($, `${role} 에이전트가 일을 시작했어요 · ${oneLine(e.description, 50)}`).catch(() => undefined)
     return started
   }).catch(($, e, next) => next(e))
 
@@ -285,6 +288,10 @@ function registerAgents(on: On) {
         endedAt: Date.now(),
       }
     })
+    if (id === MAIN) {
+      await requestTurnEnded($, e.turnId, e.answer, e.isAborted || e.reason !== 'answer').catch(() => undefined)
+      await setCaption($, e.isAborted ? '작업을 멈췄어요' : '답을 다 썼어요. 다음 요청을 기다려요').catch(() => undefined)
+    }
     return next(e)
   }).catch(($, e, next) => next(e))
 }
@@ -438,6 +445,8 @@ const layout = {
   treeView: 10,
   active: '',
   fileMaxOffset: 0,
+  leftMode: 'files' as 'files' | 'requests',
+  requestRows: 0,
 }
 // 스크롤할 때마다 디스크를 다시 읽지 않도록: 트리는 (뿌리·펼친 폴더·세대)로, 파일은 수정 시각으로 재사용한다
 let treeEpoch = 0
@@ -641,7 +650,9 @@ function registerExplorerScroll(on: On) {
   on('ui.scroll', { component: 'Pane', requestId: PANE }, async ($, e) => {
     if (e.pointer !== undefined && e.pointer.row < layout.topRows) return {}
     const isOverTree = layout.showTree && (!layout.showFile || layout.active === '' || (e.pointer !== undefined && e.pointer.column < layout.treeWidth))
-    if (isOverTree) {
+    if (isOverTree && layout.leftMode === 'requests') {
+      await update($, requestOffsetAtom, n => clamp(n + e.by, 0, layout.requestRows - layout.treeView))
+    } else if (isOverTree) {
       await update($, treeOffsetAtom, n => clamp(n + e.by, 0, layout.treeRows - layout.treeView))
     } else if (layout.active !== '') {
       const path = layout.active
@@ -663,20 +674,42 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
   const touched = new Set(await read($, touchedAtom))
   const isTreeHidden = await read($, treeHiddenAtom)
   const rev = await read($, revAtom)
+  const leftMode = await read($, leftModeAtom)
+  const requests = await read($, requestsAtom)
+  const selectedN = await read($, selectedRequestAtom)
+  const hwpView = await read($, hwpViewAtom)
+  const isRequests = leftMode === 'requests'
+  // 요청 기록 모드에서는 오른쪽에 고른 요청(없으면 가장 최근)을 펼친다
+  const selected = requests.find(r => r.n === selectedN) ?? requests[requests.length - 1]
+  const rightKey = isRequests ? (selected === undefined ? '' : `request:${selected.n}`) : active
+  const isHwp = !isRequests && HWP.test(active)
 
   const isWide = width >= SPLIT_MIN_COLUMNS
-  const showTree = isWide ? !isTreeHidden || active === '' : !(isTreeHidden && active !== '')
+  const showTree = isWide ? !isTreeHidden || rightKey === '' : !(isTreeHidden && rightKey !== '')
   const showFile = isWide ? true : !showTree
   const treeWidth = showTree && showFile ? clamp(Math.round(width * 0.3), 24, 44) : width
   const fileWidth = showTree && showFile ? width - treeWidth - 1 : width
   const mainRows = Math.max(1, rows - 1)
-  const isMarkdown = MARKDOWN.test(active)
+  const isMarkdown = !isRequests && MARKDOWN.test(active)
   layout.topRows = topRows
+  layout.leftMode = leftMode
 
   // ── 툴바 ──
   const toolbar = (
     <Box key="ide-toolbar" flexDirection="row" columnGap={2} height={1} overflow="hidden">
-      <Button key="tree" plain hotkey="t" label={showTree && showFile ? '트리 접기' : '트리'} onPress={() => void update($, treeHiddenAtom, v => (active === '' ? false : !v))} />
+      <Button key="tree" plain hotkey="t" label={showTree && showFile ? '트리 접기' : '트리'} onPress={() => void update($, treeHiddenAtom, v => (rightKey === '' ? false : !v))} />
+      <Button
+        key="left-mode"
+        plain
+        hotkey="q"
+        label={isRequests ? '파일 트리' : `요청 기록 ${requests.length}`}
+        onPress={() =>
+          void (async () => {
+            await update($, leftModeAtom, m => (m === 'files' ? 'requests' : 'files'))
+            await update($, treeHiddenAtom, () => false)
+          })()
+        }
+      />
       <Button
         key="up"
         plain
@@ -701,18 +734,62 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
           void update($, revAtom, n => n + 1)
         }}
       />
-      {active !== '' && isMarkdown && (
+      {isHwp && (
+        <Button key="hwp-view" plain hotkey="v" label={hwpView === 'page' ? '본문 보기' : '페이지 보기'} onPress={() => void update($, hwpViewAtom, v => (v === 'page' ? 'body' : 'page'))} />
+      )}
+      {isHwp && hwpView === 'page' && (
+        <Button key="hwp-prev" plain hotkey="b" label="◀ 앞쪽" onPress={() => void update($, hwpPagesAtom, all => ({ ...all, [active]: Math.max(0, (all[active] ?? 0) - 1) }))} />
+      )}
+      {isHwp && hwpView === 'page' && (
+        <Button key="hwp-next" plain hotkey="n" label="뒤쪽 ▶" onPress={() => void update($, hwpPagesAtom, all => ({ ...all, [active]: (all[active] ?? 0) + 1 }))} />
+      )}
+      {isRequests && selected !== undefined && (
+        <Button key="request-again" plain hotkey="p" label="입력창에 다시 넣기" onPress={() => void $.prompt.fill({ text: selected.text, mode: 'insert' })} />
+      )}
+      {isRequests && selected !== undefined && <Button key="request-copy" plain hotkey="c" label="복사" onPress={() => void $.ui.copy({ text: selected.text, surface: e.surface })} />}
+      {!isRequests && active !== '' && isMarkdown && (
         <Button key="mode" plain hotkey="m" label={mode === 'rendered' ? '원문' : '렌더'} onPress={() => void update($, modeAtom, m => (m === 'rendered' ? 'code' : 'rendered'))} />
       )}
-      {active !== '' && <Button key="mention" plain hotkey="p" label="@프롬프트" onPress={() => void $.prompt.fill({ text: `@${active} `, mode: 'insert' })} />}
-      {active !== '' && <Button key="copy" plain hotkey="c" label="경로 복사" onPress={() => void $.ui.copy({ text: active, surface: e.surface })} />}
-      {active !== '' && <Button key="close" plain hotkey="w" label="탭 닫기" onPress={() => void closeTab($, active)} />}
+      {!isRequests && active !== '' && <Button key="mention" plain hotkey="p" label="@프롬프트" onPress={() => void $.prompt.fill({ text: `@${active} `, mode: 'insert' })} />}
+      {!isRequests && active !== '' && <Button key="copy" plain hotkey="c" label="경로 복사" onPress={() => void $.ui.copy({ text: active, surface: e.surface })} />}
+      {!isRequests && active !== '' && <Button key="close" plain hotkey="w" label="탭 닫기" onPress={() => void closeTab($, active)} />}
     </Box>
   )
 
-  // ── 트리 ──
+  // ── 트리 / 요청 기록 ──
   let treeColumn: RenderElement | false = false
-  if (showTree) {
+  if (showTree && isRequests) {
+    const treeView = Math.max(1, mainRows - 1)
+    const newestFirst = [...requests].reverse()
+    const requestOffset = clamp(await read($, requestOffsetAtom), 0, newestFirst.length - treeView)
+    Object.assign(layout, { requestRows: newestFirst.length, treeView })
+    const shown = newestFirst.slice(requestOffset, requestOffset + treeView)
+    treeColumn = (
+      <Box key="ide-requests" flexDirection="column" width={treeWidth} height={mainRows} overflow="hidden">
+        <Text bold wrap="truncate-end">요청 기록 {requests.length}개{requests.length > treeView ? ` · ${requestOffset + 1}-${requestOffset + shown.length}` : ''}</Text>
+        {shown.length === 0 && <Text dimColor>아직 보낸 요청이 없어요. 이 세션에서 보내는 요청이 여기 쌓여요.</Text>}
+        {shown.map(r => {
+          const isOn = r.n === selected?.n
+          return (
+            <Box key={`req-row:${r.n}`} flexDirection="row" height={1} overflow="hidden" backgroundColor={isOn ? 'promptBorder' : undefined}>
+              <Button
+                key={`req:${r.n}`}
+                plain
+                dimColor={r.status !== 'running' && !isOn}
+                label={fit(`${r.n}. ${REQUEST_ICON[r.status]} ${clock(r.at)} ${oneLine(r.text, 200)}`, treeWidth)}
+                onPress={() =>
+                  void (async () => {
+                    await update($, selectedRequestAtom, () => r.n)
+                    if (!(layout.showTree && layout.showFile)) await update($, treeHiddenAtom, () => true)
+                  })()
+                }
+              />
+            </Box>
+          )
+        })}
+      </Box>
+    )
+  } else if (showTree) {
     const tree = await treeRows($, root, expanded, rev)
     const treeView = Math.max(1, mainRows - 1)
     const treeOffset = clamp(await read($, treeOffsetAtom), 0, tree.rows.length - treeView)
@@ -771,9 +848,34 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
         <Box flexDirection="column" height={contentRows} overflow="hidden">{body}</Box>
       </Box>
     )
-    Object.assign(layout, { active, fileMaxOffset: 0 })
+    Object.assign(layout, { active: rightKey, fileMaxOffset: 0 })
 
-    if (active === '') {
+    if (isRequests) {
+      const head = <Text dimColor>요청 기록 · {requests.length}개 · {requests.filter(r => r.status === 'running').length}개 진행 중</Text>
+      if (selected === undefined) {
+        fileColumn = (
+          <Box key="ide-file" flexDirection="column" width={fileWidth} height={mainRows} overflow="hidden">
+            {head}
+            <Text dimColor>이 세션에서 보낸 요청이 왼쪽에 쌓이고, 고르면 여기 전문이 보여요.</Text>
+          </Box>
+        )
+      } else {
+        const lines = selected.text.split('\n')
+        const offset = clamp(offsets[rightKey] ?? 0, 0, lines.length - 1)
+        layout.fileMaxOffset = Math.max(0, lines.length - 1)
+        const took = selected.endedAt !== undefined ? ` · ${formatElapsed(selected.endedAt - selected.at)}` : ''
+        const status = selected.status === 'running' ? '진행 중' : selected.status === 'done' ? `끝남${took}` : `중단됨${took}`
+        fileColumn = (
+          <Box key="ide-file" flexDirection="column" width={fileWidth} height={mainRows} overflow="hidden">
+            <Text bold wrap="truncate-end">요청 #{selected.n} · {clock(selected.at)} · {status}</Text>
+            {selected.answer !== '' ? <Text dimColor wrap="truncate-end">Claude 답: {selected.answer}</Text> : <Text dimColor> </Text>}
+            <Box flexDirection="column" height={contentRows} overflow="hidden">
+              <Text>{lines.slice(offset).join('\n')}</Text>
+            </Box>
+          </Box>
+        )
+      }
+    } else if (active === '') {
       fileColumn = frame('', <Text dimColor>왼쪽 트리에서 파일을 고르세요. 휠·방향키로 스크롤, j/k로 트리 넘기기.</Text>)
     } else {
       const relative = isInside(active, root) && active !== root ? active.slice(root.length).replace(/^\//, '') : active
@@ -782,6 +884,9 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
         fileColumn = frame(relative, <Text color="error">파일이 없어졌어요.</Text>)
       } else if (stat.kind !== 'file') {
         fileColumn = frame(relative, <Text dimColor>일반 파일이 아니라 미리볼 수 없어요.</Text>)
+      } else if (isHwp) {
+        const hwp = await drawHwp($, e, active, stat, fileWidth, contentRows, offsets[active] ?? 0)
+        fileColumn = frame(hwp.info, hwp.body)
       } else if (PNG.test(active)) {
         if (e.surface === 'terminal') {
           const { Image } = $.ui.resolve(e)
@@ -835,6 +940,311 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
   )
 }
 
+// ════════════════ 요청 기록 · HWP 뷰어 · 강의 모드 · 문체 게이트 ════════════════
+const leftModeAtom = atom({ plugin: 'ide-mod', key: 'leftMode' } as const, 'files' as 'files' | 'requests')
+const requestsAtom = atom({ plugin: 'ide-mod', key: 'requests' } as const, [] as RequestItem[])
+const selectedRequestAtom = atom({ plugin: 'ide-mod', key: 'selectedRequest' } as const, 0)
+const requestOffsetAtom = atom({ plugin: 'ide-mod', key: 'requestOffset' } as const, 0)
+const hwpViewAtom = atom({ plugin: 'ide-mod', key: 'hwpView' } as const, 'body' as 'body' | 'page')
+const hwpPagesAtom = atom({ plugin: 'ide-mod', key: 'hwpPages' } as const, {} as Record<string, number>)
+const lectureAtom = atom({ plugin: 'ide-mod', key: 'isLecture' } as const, false)
+const captionAtom = atom({ plugin: 'ide-mod', key: 'caption' } as const, { text: '', prev: '', step: 0, startedAt: 0 } as Caption)
+const gateAtom = atom({ plugin: 'ide-mod', key: 'gate' } as const, null as GateResult | null)
+const gateOnAtom = atom({ plugin: 'ide-mod', key: 'isGateOn' } as const, true)
+const gateOpenAtom = atom({ plugin: 'ide-mod', key: 'isGateOpen' } as const, false)
+
+const HWP = /\.(hwp|hwpx)$/i
+const PROSE = /\.(md|markdown|txt)$/i
+const MAX_REQUESTS = 300
+const STORE_PREFIX = 'requests:'
+const STORE_SESSIONS = 40
+const REQUEST_ORIGINS = ['composer', 'bridge', 'sdk']
+
+// ── 요청 기록 ──
+const clock = (ms: number) => {
+  const d = new Date(ms)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+const REQUEST_ICON: Record<RequestItem['status'], string> = { running: '●', done: '✓', stopped: '■' }
+
+async function saveRequests($: EngineInterface) {
+  const id = await $.session.id()
+  await $.store.set(`${STORE_PREFIX}${id}`, { updatedAt: Date.now(), items: await read($, requestsAtom) })
+}
+
+/** 세션을 이어 열었거나 모드가 다시 로드됐을 때 저장해 둔 요청을 되살리고, 오래된 세션 기록은 정리한다 */
+async function loadRequests($: EngineInterface) {
+  const id = await $.session.id()
+  if ((await read($, requestsAtom)).length === 0) {
+    const saved = (await $.store.get(`${STORE_PREFIX}${id}`)) as { items?: RequestItem[] } | undefined
+    if (Array.isArray(saved?.items) && saved.items.length > 0) await update($, requestsAtom, () => saved.items as RequestItem[])
+  }
+  const keys = (await $.store.keys()).filter(k => k.startsWith(STORE_PREFIX))
+  if (keys.length <= STORE_SESSIONS) return
+  const dated = await Promise.all(keys.map(async k => ({ k, at: ((await $.store.get(k)) as { updatedAt?: number } | undefined)?.updatedAt ?? 0 })))
+  for (const { k } of dated.sort((a, b) => a.at - b.at).slice(0, keys.length - STORE_SESSIONS)) await $.store.delete(k)
+}
+
+async function addRequest($: EngineInterface, text: string, turnId: string | undefined) {
+  await update($, requestsAtom, list => {
+    const n = (list[list.length - 1]?.n ?? 0) + 1
+    const item: RequestItem = { n, text: text.slice(0, 8000), at: Date.now(), status: 'running', answer: '' }
+    if (turnId !== undefined) item.turnId = turnId
+    return [...list, item].slice(-MAX_REQUESTS)
+  })
+  await update($, selectedRequestAtom, () => 0)
+  await saveRequests($)
+}
+
+/** 턴이 시작되면 그 글을 보낸 요청과 잇는다. 키보드를 거치지 않은 요청(다른 플러그인이 보낸 것 등)은 여기서 새로 기록한다 */
+async function requestTurnStarted($: EngineInterface, text: string, turnId: string) {
+  const wanted = text.trim()
+  let isNew = false
+  await update($, requestsAtom, list => {
+    const at = [...list].reverse().find(r => r.status === 'running' && r.turnId === undefined && r.text.trim() === wanted)
+    if (at !== undefined) return list.map(r => (r === at ? { ...r, turnId } : r))
+    isNew = true
+    const n = (list[list.length - 1]?.n ?? 0) + 1
+    return [...list, { n, text: wanted.slice(0, 8000), at: Date.now(), status: 'running' as const, turnId, answer: '' }].slice(-MAX_REQUESTS)
+  })
+  if (isNew) await saveRequests($)
+}
+
+async function requestTurnEnded($: EngineInterface, turnId: string, answer: string, isStopped: boolean) {
+  let changed = false
+  await update($, requestsAtom, list =>
+    list.map(r => {
+      if (r.turnId !== turnId || r.status !== 'running') return r
+      changed = true
+      return { ...r, status: isStopped ? 'stopped' : 'done', answer: firstLine(answer).slice(0, 300), endedAt: Date.now() }
+    }),
+  )
+  if (changed) await saveRequests($)
+}
+
+// ── 강의 모드 자막 ──
+const shortPath = (value: unknown) => (typeof value === 'string' ? baseName(value) : '')
+/** 도구 호출 하나를 수강생이 읽을 한국어 한 줄로 */
+export const captionFor = (tool: string, input: Record<string, unknown>) => {
+  const str = (k: string) => (typeof input[k] === 'string' ? oneLine(String(input[k]), 60) : '')
+  switch (tool) {
+    case 'Read': return `파일을 읽고 있어요 · ${shortPath(input.file_path)}`
+    case 'Write': return `새 파일을 쓰고 있어요 · ${shortPath(input.file_path)}`
+    case 'Edit':
+    case 'MultiEdit': return `파일을 고치고 있어요 · ${shortPath(input.file_path)}`
+    case 'NotebookEdit': return `노트북을 고치고 있어요 · ${shortPath(input.notebook_path)}`
+    case 'Bash': return str('description') !== '' ? `터미널에서: ${str('description')}` : `터미널 명령을 실행해요 · ${str('command')}`
+    case 'Grep': return `코드에서 찾는 중 · '${str('pattern')}'`
+    case 'Glob': return `파일을 찾는 중 · ${str('pattern')}`
+    case 'WebFetch': return `웹페이지를 읽고 있어요 · ${str('url').replace(/^https?:\/\//, '').split('/')[0] ?? ''}`
+    case 'WebSearch': return `웹에서 검색해요 · ${str('query')}`
+    case 'Agent': return `${str('subagent_type') || '도우미'} 에이전트에게 맡겼어요 · ${str('description')}`
+    case 'TodoWrite':
+    case 'TaskCreate':
+    case 'TaskUpdate': return '할 일 목록을 정리해요'
+    case 'AskUserQuestion': return '사용자에게 물어보고 있어요'
+    case 'Skill': return `'${str('skill')}' 스킬을 꺼내 써요`
+    default: {
+      if (tool.startsWith('mcp__')) {
+        const [, server = '', name = ''] = tool.split('__')
+        return `${server} 도구를 써요 · ${name}`
+      }
+      return `${tool} 도구를 써요`
+    }
+  }
+}
+
+async function setCaption($: EngineInterface, text: string, isNewTurn = false) {
+  if (!(await read($, lectureAtom))) return
+  await update($, captionAtom, c => ({
+    text,
+    prev: isNewTurn ? '' : c.text,
+    step: isNewTurn ? 0 : c.step + 1,
+    startedAt: isNewTurn || c.startedAt === 0 ? Date.now() : c.startedAt,
+  }))
+}
+
+// ── 한국어 문체 게이트 (noslop-ko grep_gate.sh 이식) ──
+type GateRule = { label: string; re: RegExp; limit: number; isHard: boolean; isPerLine?: boolean }
+const GATE_RULES: GateRule[] = [
+  { label: '대조 구문(~이 아니라)', re: /아니라|[가-힣]인가,/g, limit: 2, isHard: true },
+  { label: '접속어 뒤 쉼표', re: /(고|며|지만|면서|는데|니까|서), /g, limit: 3, isHard: true },
+  { label: '맺음 상투어', re: /결론적으로|요약하면|정리하자면|라고 할 수 있다|라고 볼 수 있다|에 다름 아니다/g, limit: 2, isHard: true },
+  { label: '이중 피동', re: /되어진다|지게 된다/g, limit: 1, isHard: true },
+  { label: '중요성 부풀리기', re: /시사하는 바가|주목할 만|간과할 수 없|매우 중요하/g, limit: 2, isHard: true },
+  { label: '이모지', re: /🚀|💡|✅|⚠️|📊|🎯|🔥|🙌|✨/gu, limit: 1, isHard: true },
+  { label: '마무리 공식(~할 때입니다)', re: /때입니다|시점입니다|나아가야 합니다|해야 할 때/g, limit: 2, isHard: true },
+  { label: '과장 어휘', re: /혁신적|획기적|압도적|파격적|폭발적|전례 없/g, limit: 2, isHard: true },
+  { label: '영어 유행어', re: /seamless|robust|leverage|cutting-edge/g, limit: 1, isHard: true },
+  { label: '번역투 조사', re: /에 대해|에 있어서|에 기반하여|와 관련하여/g, limit: 3, isHard: false },
+  { label: '~에 의해', re: /에 의해/g, limit: 2, isHard: false },
+  { label: '균형 얼버무림', re: /양쪽 모두|균형 잡힌|신중하게/g, limit: 3, isHard: false },
+  { label: '메타 진입', re: /이는 .*을 의미한다|이 점에서|이 관점에서/g, limit: 3, isHard: false, isPerLine: true },
+]
+const countOf = (re: RegExp, text: string) => (text.match(new RegExp(re.source, re.flags)) ?? []).length
+
+/** 원고 하나를 검사한다. 코드 펜스 안은 빼고 센다 */
+export const styleGate = (text: string, path: string): GateResult => {
+  const lines = text.split('\n')
+  let isFenced = false
+  const bodyLines = lines.filter(line => {
+    if (/^```/.test(line)) {
+      isFenced = !isFenced
+      return false
+    }
+    return !isFenced
+  })
+  const body = bodyLines.join('\n')
+  const checks: GateCheck[] = GATE_RULES.map(rule => ({
+    label: rule.label,
+    count: rule.isPerLine ? bodyLines.reduce((n, line) => n + countOf(rule.re, line), 0) : countOf(rule.re, body),
+    limit: rule.limit,
+    isHard: rule.isHard,
+  }))
+  checks.push({ label: '소제목 콜론', count: lines.filter(l => /^#+ [^:]+: /.test(l)).length, limit: 2, isHard: false })
+  const violations = checks.filter(c => c.isHard && c.count >= c.limit).length
+  const sentences = bodyLines.join(' ').split(/(?<=[.!?])\s+/).map(s => s.trim()).filter(s => s !== '')
+  const examples: string[] = []
+  for (const rule of GATE_RULES.filter(r => r.isHard)) {
+    if (countOf(rule.re, body) < rule.limit) continue
+    const hit = sentences.find(s => countOf(rule.re, s) > 0)
+    if (hit !== undefined && examples.length < 4) examples.push(`${rule.label}: ${oneLine(hit, 70)}`)
+  }
+  return {
+    path,
+    verdict: violations >= 3 ? 'stop' : violations >= 1 ? 'warn' : 'pass',
+    violations,
+    checks,
+    examples,
+    sentences: countOf(/[.!?]/g, body),
+    longRuns: bodyLines.reduce((n, line) => n + countOf(/[^.!?]{100,}[.!?]/g, line), 0),
+    at: Date.now(),
+  }
+}
+const isKoreanProse = (text: string) => (text.match(/[가-힣]/g) ?? []).length >= 50
+
+async function runGate($: EngineInterface, path: string) {
+  const stat = await $.fs.stat(path).catch(() => undefined)
+  if (stat?.kind !== 'file' || stat.size > 1024 * 1024) return undefined
+  const text = await $.fs.read(path)
+  if (!isKoreanProse(text)) return undefined
+  const result = styleGate(text, path)
+  await update($, gateAtom, () => result)
+  return result
+}
+
+const VERDICT_LABEL: Record<GateResult['verdict'], string> = { pass: '통과', warn: '경고', stop: '중단(다시 쓰기 권장)' }
+const gateSummary = (g: GateResult) => {
+  const over = g.checks.filter(c => c.count >= c.limit).map(c => `${c.label} ${c.count}`)
+  return `${baseName(g.path)} · ${VERDICT_LABEL[g.verdict]} · 위반 ${g.violations}${over.length > 0 ? ` (${over.join(', ')})` : ''}${g.longRuns > 0 ? ` · 100자 넘는 문장 ${g.longRuns}` : ''}`
+}
+
+// ── HWP 뷰어 (rhwp 엔진: 플러그인의 bin/rhwp-view.mjs를 node로 부른다) ──
+type HwpBlock = { t: 'p'; text: string } | { t: 'table'; rows: string[][] }
+type HwpText = { format?: string; pages?: number; blocks?: HwpBlock[]; residues?: string[]; error?: string }
+type HwpPage = { pages?: number; page?: number; svg?: string; pngPath?: string; pngWidth?: number; pngHeight?: number; error?: string }
+const hwpTextCache = new Map<string, { key: string; data: HwpText }>()
+const hwpPageCache = new Map<string, HwpPage>()
+
+async function runRhwp($: EngineInterface, args: string[]): Promise<Record<string, unknown>> {
+  const dir = $.plugin.root.replace(/\/\.claude-plugin\/?$/, '')
+  const ran = await $.process.run(['node', `${dir}/bin/rhwp-view.mjs`, ...args], { timeoutMs: 60_000 }).catch(error => ({ exitCode: 127, stdout: '', stderr: String(error) }))
+  try {
+    return JSON.parse(ran.stdout) as Record<string, unknown>
+  } catch {
+    const why = ran.stderr.trim()
+    return { error: /ENOENT|not found|spawn/i.test(why) || ran.exitCode === 127 ? 'rhwp 엔진을 돌리려면 Node.js가 필요해요 (node 명령을 찾지 못함)' : oneLine(why, 200) || `rhwp 실행 실패 (exit ${ran.exitCode})` }
+  }
+}
+
+const RESIDUE = /\{\{[^{}\n]{1,60}\}\}/g
+const mdEscape = (text: string) => text.replace(/^([#>*+-]|\d+[.)])/, '\\$1')
+const cellEscape = (text: string) => text.replace(/\|/g, '\\|').replace(/\n/g, ' ')
+const markResidue = (text: string) => text.replace(RESIDUE, m => `**⟦${m}⟧**`)
+
+/** rhwp가 꺼낸 문단·표를 마크다운 줄로 */
+export const hwpMarkdown = (blocks: HwpBlock[]) => {
+  const out: string[] = []
+  for (const block of blocks) {
+    if (block.t === 'p') {
+      for (const line of block.text.split('\n')) out.push(markResidue(mdEscape(line)))
+      out.push('')
+      continue
+    }
+    const width = Math.max(1, ...block.rows.map(r => r.length))
+    const rows = block.rows.map(r => [...r, ...Array<string>(width - r.length).fill('')].map(c => markResidue(cellEscape(c)) || ' '))
+    const [head = [], ...rest] = rows
+    out.push(`| ${head.join(' | ')} |`, `|${' --- |'.repeat(width)}`, ...rest.map(r => `| ${r.join(' | ')} |`), '')
+  }
+  while (out.length > 0 && out[out.length - 1] === '') out.pop()
+  return out
+}
+
+/** HWP를 그린다: 본문(문단·표) 또는 페이지 그림 */
+async function drawHwp(
+  $: EngineInterface,
+  e: RenderInput<'Pane'>,
+  path: string,
+  stat: { mtimeMs: number; size: number },
+  fileWidth: number,
+  contentRows: number,
+  offset: number,
+): Promise<{ info: string; body: RenderElement }> {
+  const { Text, Markdown } = $.ui.resolve(e)
+  const view = await read($, hwpViewAtom)
+  const key = `${stat.mtimeMs}|${stat.size}`
+  let doc = hwpTextCache.get(path)
+  if (doc?.key !== key) {
+    doc = { key, data: (await runRhwp($, ['text', path])) as HwpText }
+    hwpTextCache.set(path, doc)
+  }
+  const data = doc.data
+  if (data.error !== undefined) return { info: baseName(path), body: <Text color="error">{data.error}</Text> }
+  const residues = data.residues ?? []
+  const head = `${baseName(path)} · ${(data.format ?? '').toUpperCase()} ${data.pages ?? '?'}쪽 · rhwp${residues.length > 0 ? ` · 치환 안 된 칸 ${residues.length}개: ${residues.slice(0, 4).join(' ')}` : ''}`
+
+  if (view === 'page') {
+    const pages = await read($, hwpPagesAtom)
+    const page = clamp(pages[path] ?? 0, 0, Math.max(0, (data.pages ?? 1) - 1))
+    const pageKey = `${path}|${key}|${page}`
+    let shot = hwpPageCache.get(pageKey)
+    if (shot === undefined) {
+      shot = (await runRhwp($, ['page', path, String(page)])) as HwpPage
+      if (shot.error === undefined) hwpPageCache.set(pageKey, shot)
+    }
+    const info = `${head} · ${page + 1}/${data.pages ?? '?'}쪽`
+    if (shot.error !== undefined) return { info, body: <Text color="error">{shot.error}</Text> }
+    const alt = `${baseName(path)} ${page + 1}쪽`
+    if (e.surface === 'terminal') {
+      if (shot.pngPath === undefined) return { info, body: <Text dimColor>페이지 그림(PNG)을 만들 도구가 없어요. rsvg-convert를 설치하거나 데스크톱 앱에서 열어 주세요.</Text> }
+      const { Image } = $.ui.resolve(e)
+      const aspect = (shot.pngHeight ?? 1) / (shot.pngWidth ?? 1)
+      let columns = clamp(fileWidth, 1, 255)
+      let rows = Math.round((columns * aspect) / 2)
+      if (rows > contentRows) {
+        rows = contentRows
+        columns = clamp(Math.round((rows * 2) / aspect), 1, 255)
+      }
+      return { info, body: <Image source={{ file: shot.pngPath, format: 'png' }} columns={columns} rows={clamp(rows, 1, 255)} alt={`${alt} (kitty·Ghostty 터미널에서 그림으로 보여요)`} /> }
+    }
+    if (e.surface === 'desktop' || e.surface === 'vscode' || e.surface === 'mobile') {
+      const { Svg } = $.ui.resolve(e)
+      if (shot.svg !== undefined) return { info, body: <Svg source={shot.svg} alt={alt} /> }
+    }
+    return { info, body: <Text dimColor>이 쪽은 그림이 커서 이 화면에 못 그려요. 본문 보기(v)를 써 주세요.</Text> }
+  }
+
+  const lines = hwpMarkdown(data.blocks ?? [])
+  if (lines.length === 0) return { info: head, body: <Text dimColor>본문 글자가 없어요.</Text> }
+  const starts = blockStarts(lines)
+  const wanted = clamp(offset, 0, lines.length - 1)
+  const start = [...starts].reverse().find(s => s <= wanted) ?? 0
+  layout.fileMaxOffset = lines.length - 1
+  let text = lines.slice(start).join('\n')
+  if (text.length > MAX_RENDERED_CHARS) text = text.slice(0, MAX_RENDERED_CHARS)
+  return { info: `${head} · ${start + 1}줄부터/${lines.length}줄`, body: <Markdown text={text} /> }
+}
+
 // ════════════════ 연결 ════════════════
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -842,11 +1252,54 @@ export const register: Register = on => {
     await $.command.register({ name: 'ide', description: 'IDE 창: 에이전트 보드 + 파일 트리 + 탭 에디터', argumentHint: '[경로]' }).catch(() => undefined)
     startAgents($, e.isInteractive)
     await $.command.register({ name: 'open', description: 'IDE 창에서 폴더나 파일을 엽니다', argumentHint: '[경로]' }).catch(() => undefined)
+    await $.command.register({ name: 'lecture', description: '강의 모드: Claude가 하는 일을 입력창 위에 쉬운 한국어 자막으로', argumentHint: '[on|off]' }).catch(() => undefined)
+    await $.command.register({ name: 'style-gate', description: '한국어 문체 게이트: 원고의 AI티 지표를 검사 (자동 검사 on/off)', argumentHint: '[파일|on|off]' }).catch(() => undefined)
+    await loadRequests($).catch(() => undefined)
     return next(e)
   })
 
   on('command.run', { command: 'ide' }, async ($, e) => ({ text: await openIde($, e.args ?? '') }))
   on('command.run', { command: 'open' }, async ($, e) => ({ text: await openIde($, e.args ?? '.') }))
+
+  on('command.run', { command: 'lecture' }, async ($, e) => {
+    const arg = (e.args ?? '').trim()
+    const isOn = arg === 'on' ? true : arg === 'off' ? false : !(await read($, lectureAtom))
+    await update($, lectureAtom, () => isOn)
+    if (isOn) await update($, captionAtom, () => ({ text: '강의 모드를 켰어요. Claude가 하는 일을 여기 보여 드려요', prev: '', step: 0, startedAt: Date.now() }))
+    return { text: isOn ? '강의 모드를 켰어요. 입력창 위에 자막이 떠요 (/lecture off로 끄기).' : '강의 모드를 껐어요.' }
+  })
+
+  on('command.run', { command: 'style-gate' }, async ($, e) => {
+    const arg = (e.args ?? '').trim()
+    if (arg === 'on' || arg === 'off') {
+      await update($, gateOnAtom, () => arg === 'on')
+      if (arg === 'off') await update($, gateAtom, () => null)
+      return { text: arg === 'on' ? '문체 게이트 자동 검사를 켰어요. Claude가 .md·.txt 원고를 쓰면 검사해요.' : '문체 게이트 자동 검사를 껐어요.' }
+    }
+    if (arg === '') {
+      const g = await read($, gateAtom)
+      return { text: `자동 검사 ${(await read($, gateOnAtom)) ? '켜짐' : '꺼짐'}. ${g === null ? '아직 검사한 원고가 없어요.' : `마지막 결과: ${gateSummary(g)}`} 사용법: /style-gate <파일> 또는 on/off` }
+    }
+    const real = (await $.fs.stat(arg.replace(/^@/, ''), { resolve: true }).catch(() => undefined))?.realPath
+    if (real === undefined) return { text: `파일을 찾을 수 없어요: ${arg}` }
+    const result = await runGate($, real)
+    if (result === undefined) return { text: '한국어 원고가 아니거나(한글 50자 미만) 1 MB가 넘어서 검사하지 않았어요.' }
+    await update($, gateOpenAtom, () => true)
+    const lines = [gateSummary(result), ...result.checks.filter(c => c.count > 0).map(c => `- ${c.label}: ${c.count}회 (기준 ${c.limit}회${c.isHard ? '' : ', 참고'})`), ...result.examples.map(x => `  예) ${x}`)]
+    return { text: lines.join('\n') }
+  })
+
+  // 사람이 보낸 요청을 기록한다 (키보드·원격 조종·SDK에서 온 것만, 인자 없는 슬래시 명령은 빼고)
+  on('prompt.submit', async ($, e, next) => {
+    const result = await next(e)
+    try {
+      const text = e.text.trim()
+      if (REQUEST_ORIGINS.includes(e.origin.kind) && text !== '' && !/^\/[\w:.-]+$/.test(text)) await addRequest($, text, e.turnId)
+    } catch {
+      // 기록은 덤이라 실패해도 프롬프트는 그대로 간다
+    }
+    return result
+  }).catch(($, e, next) => next(e))
 
   registerAgents(on)
   registerExplorerScroll(on)
@@ -856,10 +1309,58 @@ export const register: Register = on => {
     const tool = String(e.tool)
     const input = e as unknown as Record<string, unknown>
     await recordToolCall($, e.agentId, tool, input).catch(() => undefined)
+    const role = e.agentId === undefined ? undefined : (await read($, agentsAtom))[e.agentId]?.role
+    await setCaption($, `${role === undefined ? '' : `[${role}] `}${captionFor(tool, input)}`).catch(() => undefined)
     const ran = await next(e)
-    await noteEdit($, tool, input, ran as { deny?: string; isError?: true }).catch(() => undefined)
+    const outcome = ran as { deny?: string; isError?: true }
+    await noteEdit($, tool, input, outcome).catch(() => undefined)
+    // Claude가 한국어 원고를 쓰거나 고치면 문체 게이트를 돌린다
+    const written = typeof input.file_path === 'string' ? input.file_path : undefined
+    if (EDIT_TOOLS.includes(tool) && written !== undefined && PROSE.test(written) && outcome.deny === undefined && outcome.isError !== true && (await read($, gateOnAtom))) {
+      const real = (await $.fs.stat(written, { resolve: true }).catch(() => undefined))?.realPath
+      if (real !== undefined) await runGate($, real).catch(() => undefined)
+    }
     return ran
   }).catch(($, e, next) => next(e))
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
+    const isLecture = await read($, lectureAtom)
+    const gate = await read($, gateAtom)
+    const isGateOpen = await read($, gateOpenAtom)
+    const showGate = gate !== null && gate.verdict !== 'pass'
+    if (!isLecture && !showGate) return next(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const width = Math.max(10, e.props.bodyColumns)
+    await read($, tickAtom)
+    const below = await next(e)
+    const caption = isLecture ? await read($, captionAtom) : undefined
+    const running = isLecture ? Object.values(await read($, agentsAtom)).filter(r => r.id !== MAIN && r.phase === 'running').length : 0
+
+    return (
+      <Box flexDirection="column" width={width}>
+        {caption !== undefined && (
+          <Box key="lecture" flexDirection="column" borderStyle="round" borderColor="claude" paddingX={1}>
+            <Text bold color="claude" wrap="truncate-end">▶ {caption.text || '대기 중'}</Text>
+            <Text dimColor wrap="truncate-end">
+              {caption.prev !== '' ? `방금: ${caption.prev} · ` : ''}{caption.step}단계{caption.startedAt > 0 ? ` · ${formatElapsed(Date.now() - caption.startedAt)}` : ''}{running > 0 ? ` · 도우미 에이전트 ${running}명 작업 중` : ''}
+            </Text>
+          </Box>
+        )}
+        {showGate && gate !== null && (
+          <Box key="gate" flexDirection="column">
+            <Box flexDirection="row" columnGap={2} height={1} overflow="hidden">
+              <Text color={gate.verdict === 'stop' ? 'error' : 'warning'} wrap="truncate-end">문체 게이트 · {gateSummary(gate)}</Text>
+              <Button key="gate-open" plain hotkey="g" label={isGateOpen ? '접기' : '예문'} onPress={() => void update($, gateOpenAtom, v => !v)} />
+              <Button key="gate-close" plain hotkey="d" label="닫기" onPress={() => void update($, gateAtom, () => null)} />
+            </Box>
+            {isGateOpen && gate.examples.map((x, i) => <Text key={`gate-ex:${i}`} dimColor wrap="truncate-end">  {x}</Text>)}
+          </Box>
+        )}
+        {below}
+      </Box>
+    )
+  })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)

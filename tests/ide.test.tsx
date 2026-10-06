@@ -1,18 +1,21 @@
 import { describe, expect, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { blockStarts, describeCall, fit, shortModel } from '../hooks/register'
+import { blockStarts, captionFor, describeCall, fit, hwpMarkdown, shortModel, styleGate } from '../hooks/register'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
 const ROOT = '/work'
+const SLOP = '이것은 단순한 도구가 아니라 동반자다. 결론적으로 혁신적이고 획기적인 변화다. 요약하면 이제 나아가야 할 때입니다. 그것은 기술이 아니라 문화다. 우리는 모두 함께 앞으로 걸어가야 한다는 사실을 잊지 말아야 한다.'
 const LONG = Array.from({ length: 100 }, (_, i) => `const line${i + 1} = ${i + 1}`).join('\n')
 const FILES: Record<string, string> = {
   '/work/README.md': '# 제목\n\n본문 문단',
   '/work/src/app.ts': 'export const answer = 42\n',
   '/work/src/long.ts': LONG,
+  '/work/doc.hwpx': 'PK-가짜-hwpx',
+  '/work/draft.md': SLOP,
 }
 const DIRS: Record<string, string[]> = {
-  '/work': ['src', 'link', 'README.md', '.DS_Store'],
+  '/work': ['src', 'link', 'README.md', 'doc.hwpx', 'draft.md', '.DS_Store'],
   '/work/src': ['app.ts', 'long.ts'],
 }
 // /work/link → /work/src 를 가리키는 심볼릭 링크
@@ -25,10 +28,10 @@ const real = (p: string) => {
   return abs
 }
 
-type World = { opened: number; statuses: (string | undefined)[] }
+type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; saved?: unknown }
 
 function fakeWorld(on: On): World {
-  const world: World = { opened: 0, statuses: [] }
+  const world: World = { opened: 0, statuses: [], rhwpCalls: [] }
   on('session.cwd', () => ({ value: ROOT }))
   on('env.get', () => ({ value: '/home/me' }))
   on('fs.stat', ($, e) => {
@@ -67,6 +70,24 @@ function fakeWorld(on: On): World {
   on('tool.call', ($, e) => (String(e.tool) === 'Write' && (e as unknown as { content?: string }).content === 'DENY' ? { deny: 'no' } : ({ result: 'ok' } as never)))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('process.run', ($, e) => {
+    world.rhwpCalls.push(e.argv.slice(2).join(' '))
+    const stdout = e.argv[2] === 'text'
+      ? JSON.stringify({ format: 'hwpx', pages: 2, residues: ['{{기관명}}'], blocks: [{ t: 'p', text: '연구 계획서' }, { t: 'table', rows: [['항목', '내용'], ['기관', '{{기관명}}']] }] })
+      : JSON.stringify({ pages: 2, page: Number(e.argv[4]), pngPath: '/tmp/page.png', pngWidth: 1400, pngHeight: 1400, svg: '<svg xmlns="http://www.w3.org/2000/svg"/>' })
+    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box />
+  })
+  on('session.id', () => ({ value: 'test-session' }))
+  on('store.get', () => ({ value: undefined }) as never)
+  on('store.set', ($, e) => {
+    world.saved = (e as unknown as { value: unknown }).value
+    return { value: undefined } as never
+  })
+  on('store.keys', () => ({ value: [] }))
   return world
 }
 
@@ -85,6 +106,8 @@ const props = (bodyColumns: number, bodyRows = 30) => ({
   view: {},
 })
 const PANE = { plugin: 'ide-mod', component: 'Pane', requestId: 'ide-mod' } as const
+const BAND = { plugin: 'ide-mod', component: 'AbovePrompt' } as const
+const bandProps = { hasSurvey: false, isWorking: true, maxRows: 12, bodyColumns: 100, scroll: { offset: 0, bodyRows: 11 }, view: {} }
 const textOf = (found: { text: string }[]) => found.map(f => f.text).join('\n')
 const spawn = (id: string, description: string, subagentType: string) => ({
   tool_use_id: `tu-${id}`,
@@ -275,6 +298,102 @@ describe('에이전트 보드', () => {
     expect(text).toContain('손자 작업')
     await ui.press({ key: 'board-fold' })
     expect(textOf(await ui.findAll({ type: 'Text' }))).not.toContain('손자 작업')
+    await ui.unmount()
+  })
+})
+
+describe('HWP 뷰어 (rhwp)', () => {
+  test('문단·표를 마크다운으로 바꾸고 치환 안 된 칸을 표시한다', () => {
+    const md = hwpMarkdown([{ t: 'p', text: '- 목록 같은 문단' }, { t: 'table', rows: [['항목', '내용'], ['기관', '{{기관명}}'], ['짧은 줄']] }])
+    expect(md[0]).toBe('\\- 목록 같은 문단')
+    expect(md).toContain('| 항목 | 내용 |')
+    expect(md).toContain('| 기관 | **⟦{{기관명}}⟧** |')
+    expect(md).toContain('| 짧은 줄 |   |')
+  })
+
+  test('본문 보기와 페이지 보기를 오가고 쪽을 넘긴다', async ($, on) => {
+    const world = fakeWorld(on)
+    await $.command.run(typed('open', '/work/doc.hwpx'))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    const md = await ui.find({ type: 'Markdown' })
+    expect(String(md?.props.text)).toContain('⟦{{기관명}}⟧')
+    expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('치환 안 된 칸 1개')
+    await ui.press({ key: 'hwp-view' })
+    expect((await ui.find({ type: 'Image' }))?.props.source).toEqual({ file: '/tmp/page.png', format: 'png' })
+    await ui.press({ key: 'hwp-next' })
+    expect(world.rhwpCalls).toEqual(['text /work/doc.hwpx', 'page /work/doc.hwpx 0', 'page /work/doc.hwpx 1'])
+    await ui.unmount()
+
+    const desk = await $.ui.mount({ ...PANE, surface: 'desktop', props: props(140) })
+    expect(await desk.find({ type: 'Svg' })).toBeDefined()
+    await desk.unmount()
+  })
+})
+
+describe('요청 기록', () => {
+  test('보낸 요청이 쌓이고 끝나면 답 첫 줄과 함께 완료로 바뀐다', async ($, on) => {
+    const world = fakeWorld(on)
+    await $.turn.start({ text: '로그인 버그 고쳐줘', turnId: 't1' })
+    await $.turn.complete({ answer: '고쳤어요. login.ts 42행이 원인', durationMs: 50, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+    await $.turn.start({ text: '테스트도 추가해줘', turnId: 't2' })
+    await $.command.run(typed('ide', ''))
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    await ui.press({ key: 'left-mode' })
+    expect((await ui.find({ key: 'req:1' }))?.props.label).toContain('✓')
+    expect((await ui.find({ key: 'req:2' }))?.props.label).toContain('●')
+    // 기본으로 가장 최근 요청이 펼쳐진다
+    expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('요청 #2')
+    await ui.press({ key: 'req:1' })
+    const text = textOf(await ui.findAll({ type: 'Text' }))
+    expect(text).toContain('요청 #1')
+    expect(text).toContain('Claude 답: 고쳤어요. login.ts 42행이 원인')
+    expect(JSON.stringify(world.saved)).toContain('테스트도 추가해줘')
+    await ui.unmount()
+  })
+})
+
+describe('강의 모드·문체 게이트', () => {
+  test('도구 호출을 쉬운 한국어 자막으로', () => {
+    expect(captionFor('Read', { file_path: '/a/b/login.ts' })).toBe('파일을 읽고 있어요 · login.ts')
+    expect(captionFor('Bash', { command: 'npm test', description: '테스트 실행' })).toBe('터미널에서: 테스트 실행')
+    expect(captionFor('Grep', { pattern: 'login' })).toBe("코드에서 찾는 중 · 'login'")
+    expect(captionFor('mcp__stitch__stitch_get', {})).toBe('stitch 도구를 써요 · stitch_get')
+  })
+
+  test('문체 게이트가 noslop 기준으로 판정한다', () => {
+    const g = styleGate(SLOP, '/work/draft.md')
+    expect(g.verdict).toBe('stop')
+    expect(g.violations).toBe(3)
+    expect(g.examples[0]).toContain('대조 구문')
+    expect(styleGate('평범한 문장입니다. 오늘은 회의를 했습니다.', 'a.md').verdict).toBe('pass')
+    // 코드 펜스 안은 세지 않는다
+    expect(styleGate('```\n혁신적 획기적 압도적\n```', 'a.md').violations).toBe(0)
+  })
+
+  test('/lecture를 켜면 입력창 위에 자막이 뜨고, 원고를 쓰면 문체 게이트가 뜬다', async ($, on) => {
+    fakeWorld(on)
+    await $.command.run(typed('lecture', 'on'))
+    await $.tool.call({ tool: 'Read', file_path: '/work/src/app.ts' } as never)
+    await $.tool.call({ tool: 'Write', file_path: '/work/draft.md', content: SLOP } as never)
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const ui = await $.ui.mount({ ...BAND, surface, props: bandProps })
+      const text = textOf(await ui.findAll({ type: 'Text' }))
+      expect(text).toContain('새 파일을 쓰고 있어요 · draft.md')
+      expect(text).toContain('방금: 파일을 읽고 있어요 · app.ts')
+      expect(text).toContain('문체 게이트 · draft.md · 중단')
+      await ui.press({ key: 'gate-open' })
+      expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('대조 구문')
+      await ui.press({ key: 'gate-open' })
+      await ui.unmount()
+    }
+    const closing = await $.ui.mount({ ...BAND, surface: 'terminal', props: bandProps })
+    await closing.press({ key: 'gate-close' })
+    expect(textOf(await closing.findAll({ type: 'Text' }))).not.toContain('문체 게이트')
+    await closing.unmount()
+    await $.command.run(typed('lecture', 'off'))
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal', props: bandProps })
+    expect(textOf(await ui.findAll({ type: 'Text' }))).not.toContain('▶')
     await ui.unmount()
   })
 })
