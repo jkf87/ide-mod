@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'claude-code/testing'
+import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { blockStarts, captionFor, describeCall, fit, hwpMarkdown, shortModel, styleGate } from '../hooks/register'
@@ -311,17 +311,28 @@ describe('HWP 뷰어 (rhwp)', () => {
     expect(md).toContain('| 짧은 줄 |   |')
   })
 
-  test('본문 보기와 페이지 보기를 오가고 쪽을 넘긴다', async ($, on) => {
+  test('그리기 밖에서 rhwp를 돌리고, 본문 보기와 페이지 보기를 오가며 쪽을 넘긴다', async ($, on) => {
     const world = fakeWorld(on)
+    const clock = mock.clock(on)
     await $.command.run(typed('open', '/work/doc.hwpx'))
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    // 처음 그릴 때는 읽는 중이라고만 보이고, 엔진은 타이머에서 돈다
+    expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('rhwp 엔진으로 읽는 중')
+    expect(world.rhwpCalls).toEqual([])
+    await clock.advance(5)
     const md = await ui.find({ type: 'Markdown' })
     expect(String(md?.props.text)).toContain('⟦{{기관명}}⟧')
     expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('치환 안 된 칸 1개')
     await ui.press({ key: 'hwp-view' })
+    await clock.advance(5)
     expect((await ui.find({ type: 'Image' }))?.props.source).toEqual({ file: '/tmp/page.png', format: 'png' })
     await ui.press({ key: 'hwp-next' })
+    await clock.advance(5)
     expect(world.rhwpCalls).toEqual(['text /work/doc.hwpx', 'page /work/doc.hwpx 0', 'page /work/doc.hwpx 1'])
+    // 같은 쪽은 다시 돌리지 않는다
+    await ui.press({ key: 'hwp-prev' })
+    await clock.advance(5)
+    expect(world.rhwpCalls.length).toBe(3)
     await ui.unmount()
 
     const desk = await $.ui.mount({ ...PANE, surface: 'desktop', props: props(140) })

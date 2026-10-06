@@ -730,6 +730,8 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
         label="새로고침"
         onPress={() => {
           fileCache.clear()
+          hwpTextCache.clear()
+          hwpPageCache.clear()
           treeEpoch += 1
           void update($, revAtom, n => n + 1)
         }}
@@ -1143,17 +1145,38 @@ const gateSummary = (g: GateResult) => {
 type HwpBlock = { t: 'p'; text: string } | { t: 'table'; rows: string[][] }
 type HwpText = { format?: string; pages?: number; blocks?: HwpBlock[]; residues?: string[]; error?: string }
 type HwpPage = { pages?: number; page?: number; svg?: string; pngPath?: string; pngWidth?: number; pngHeight?: number; error?: string }
-const hwpTextCache = new Map<string, { key: string; data: HwpText }>()
+const hwpTextCache = new Map<string, HwpText>()
 const hwpPageCache = new Map<string, HwpPage>()
+const hwpLoading = new Set<string>()
+
+/**
+ * rhwp를 그리기 밖에서 돌린다. 그리기는 자주 다시 시작되고(보드 시계·핫 리로드), 끊긴 그리기 안에서
+ * 돌던 프로세스는 출력이 잘린다. 그래서 타이머로 넘겨 끝까지 돌리고, 끝나면 다시 그리게 한다.
+ */
+function loadHwp($: EngineInterface, key: string, args: string[], into: Map<string, Record<string, unknown>>) {
+  if (hwpLoading.has(key) || into.has(key)) return
+  hwpLoading.add(key)
+  $.clock.after(1, () =>
+    void (async () => {
+      try {
+        into.set(key, await runRhwp($, args))
+      } finally {
+        hwpLoading.delete(key)
+        await update($, revAtom, n => n + 1)
+      }
+    })().catch(() => undefined),
+  )
+}
 
 async function runRhwp($: EngineInterface, args: string[]): Promise<Record<string, unknown>> {
   const dir = $.plugin.root.replace(/\/\.claude-plugin\/?$/, '')
   const ran = await $.process.run(['node', `${dir}/bin/rhwp-view.mjs`, ...args], { timeoutMs: 60_000 }).catch(error => ({ exitCode: 127, stdout: '', stderr: String(error) }))
   try {
-    return JSON.parse(ran.stdout) as Record<string, unknown>
+    const out = ran.stdout
+    return JSON.parse(out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1)) as Record<string, unknown>
   } catch {
     const why = ran.stderr.trim()
-    return { error: /ENOENT|not found|spawn/i.test(why) || ran.exitCode === 127 ? 'rhwp 엔진을 돌리려면 Node.js가 필요해요 (node 명령을 찾지 못함)' : oneLine(why, 200) || `rhwp 실행 실패 (exit ${ran.exitCode})` }
+    return { error: /ENOENT|not found|spawn/i.test(why) || ran.exitCode === 127 ? 'rhwp 엔진을 돌리려면 Node.js가 필요해요 (node 명령을 찾지 못함)' : oneLine(why, 200) || `rhwp 출력을 읽지 못했어요 (exit ${ran.exitCode}, ${ran.stdout.length}자)` }
   }
 }
 
@@ -1193,13 +1216,13 @@ async function drawHwp(
   const { Text, Markdown } = $.ui.resolve(e)
   const view = await read($, hwpViewAtom)
   const key = `${stat.mtimeMs}|${stat.size}`
-  let doc = hwpTextCache.get(path)
-  if (doc?.key !== key) {
-    doc = { key, data: (await runRhwp($, ['text', path])) as HwpText }
-    hwpTextCache.set(path, doc)
+  const textKey = `${path}|${key}`
+  const data = hwpTextCache.get(textKey)
+  if (data === undefined) {
+    loadHwp($, textKey, ['text', path], hwpTextCache as Map<string, Record<string, unknown>>)
+    return { info: baseName(path), body: <Text dimColor>rhwp 엔진으로 읽는 중…</Text> }
   }
-  const data = doc.data
-  if (data.error !== undefined) return { info: baseName(path), body: <Text color="error">{data.error}</Text> }
+  if (data.error !== undefined) return { info: baseName(path), body: <Text color="error">{data.error} (r로 다시 시도)</Text> }
   const residues = data.residues ?? []
   const head = `${baseName(path)} · ${(data.format ?? '').toUpperCase()} ${data.pages ?? '?'}쪽 · rhwp${residues.length > 0 ? ` · 치환 안 된 칸 ${residues.length}개: ${residues.slice(0, 4).join(' ')}` : ''}`
 
@@ -1207,13 +1230,13 @@ async function drawHwp(
     const pages = await read($, hwpPagesAtom)
     const page = clamp(pages[path] ?? 0, 0, Math.max(0, (data.pages ?? 1) - 1))
     const pageKey = `${path}|${key}|${page}`
-    let shot = hwpPageCache.get(pageKey)
-    if (shot === undefined) {
-      shot = (await runRhwp($, ['page', path, String(page)])) as HwpPage
-      if (shot.error === undefined) hwpPageCache.set(pageKey, shot)
-    }
+    const shot = hwpPageCache.get(pageKey)
     const info = `${head} · ${page + 1}/${data.pages ?? '?'}쪽`
-    if (shot.error !== undefined) return { info, body: <Text color="error">{shot.error}</Text> }
+    if (shot === undefined) {
+      loadHwp($, pageKey, ['page', path, String(page)], hwpPageCache as Map<string, Record<string, unknown>>)
+      return { info, body: <Text dimColor>{page + 1}쪽을 그리는 중…</Text> }
+    }
+    if (shot.error !== undefined) return { info, body: <Text color="error">{shot.error} (r로 다시 시도)</Text> }
     const alt = `${baseName(path)} ${page + 1}쪽`
     if (e.surface === 'terminal') {
       if (shot.pngPath === undefined) return { info, body: <Text dimColor>페이지 그림(PNG)을 만들 도구가 없어요. rsvg-convert를 설치하거나 데스크톱 앱에서 열어 주세요.</Text> }
