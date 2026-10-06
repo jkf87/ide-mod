@@ -654,6 +654,20 @@ function registerExplorerScroll(on: On) {
       await update($, requestOffsetAtom, n => clamp(n + e.by, 0, layout.requestRows - layout.treeView))
     } else if (isOverTree) {
       await update($, treeOffsetAtom, n => clamp(n + e.by, 0, layout.treeRows - layout.treeView))
+    } else if (layout.active !== '' && hwpNow.path === layout.active && HWP.test(layout.active) && (await read($, hwpViewAtom)) === 'doc') {
+      // 문서 보기: 쪽 안에서 움직이다 끝에 닿으면 다음(앞) 쪽으로 넘긴다
+      const { path, page, pages } = hwpNow
+      const key = hwpOffsetKey(path, page)
+      const now = (await read($, offsetsAtom))[key] ?? 0
+      if (e.by > 0 && now >= layout.fileMaxOffset && page < pages - 1) {
+        await update($, offsetsAtom, all => ({ ...all, [hwpOffsetKey(path, page + 1)]: 0 }))
+        await update($, hwpPagesAtom, all => ({ ...all, [path]: page + 1 }))
+      } else if (e.by < 0 && now <= 0 && page > 0) {
+        await update($, offsetsAtom, all => ({ ...all, [hwpOffsetKey(path, page - 1)]: 100_000 }))
+        await update($, hwpPagesAtom, all => ({ ...all, [path]: page - 1 }))
+      } else {
+        await update($, offsetsAtom, all => ({ ...all, [key]: clamp(now + e.by, 0, layout.fileMaxOffset) }))
+      }
     } else if (layout.active !== '') {
       const path = layout.active
       await update($, offsetsAtom, all => ({ ...all, [path]: clamp((all[path] ?? 0) + e.by, 0, layout.fileMaxOffset) }))
@@ -732,17 +746,21 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
           fileCache.clear()
           hwpTextCache.clear()
           hwpPageCache.clear()
+          hwpGridCache.clear()
           treeEpoch += 1
           void update($, revAtom, n => n + 1)
         }}
       />
       {isHwp && (
-        <Button key="hwp-view" plain hotkey="v" label={hwpView === 'page' ? '본문 보기' : '페이지 보기'} onPress={() => void update($, hwpViewAtom, v => (v === 'page' ? 'body' : 'page'))} />
+        <Button key="hwp-view" plain hotkey="v" label={hwpView === 'image' ? '문서 보기' : '그림 보기'} onPress={() => void update($, hwpViewAtom, v => (v === 'image' ? 'doc' : 'image'))} />
       )}
-      {isHwp && hwpView === 'page' && (
+      {isHwp && (
+        <Button key="hwp-open" plain hotkey="o" label="미리보기로 열기" onPress={() => void openHwpPreview($, active, hwpNow.path === active ? hwpNow.page : 0)} />
+      )}
+      {isHwp && (
         <Button key="hwp-prev" plain hotkey="b" label="◀ 앞쪽" onPress={() => void update($, hwpPagesAtom, all => ({ ...all, [active]: Math.max(0, (all[active] ?? 0) - 1) }))} />
       )}
-      {isHwp && hwpView === 'page' && (
+      {isHwp && (
         <Button key="hwp-next" plain hotkey="n" label="뒤쪽 ▶" onPress={() => void update($, hwpPagesAtom, all => ({ ...all, [active]: (all[active] ?? 0) + 1 }))} />
       )}
       {isRequests && selected !== undefined && (
@@ -887,7 +905,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
       } else if (stat.kind !== 'file') {
         fileColumn = frame(relative, <Text dimColor>일반 파일이 아니라 미리볼 수 없어요.</Text>)
       } else if (isHwp) {
-        const hwp = await drawHwp($, e, active, stat, fileWidth, contentRows, offsets[active] ?? 0)
+        const hwp = await drawHwp($, e, active, stat, fileWidth, contentRows, offsets)
         fileColumn = frame(hwp.info, hwp.body)
       } else if (PNG.test(active)) {
         if (e.surface === 'terminal') {
@@ -947,7 +965,7 @@ const leftModeAtom = atom({ plugin: 'ide-mod', key: 'leftMode' } as const, 'file
 const requestsAtom = atom({ plugin: 'ide-mod', key: 'requests' } as const, [] as RequestItem[])
 const selectedRequestAtom = atom({ plugin: 'ide-mod', key: 'selectedRequest' } as const, 0)
 const requestOffsetAtom = atom({ plugin: 'ide-mod', key: 'requestOffset' } as const, 0)
-const hwpViewAtom = atom({ plugin: 'ide-mod', key: 'hwpView' } as const, 'body' as 'body' | 'page')
+const hwpViewAtom = atom({ plugin: 'ide-mod', key: 'hwpView' } as const, 'doc' as 'doc' | 'image')
 const hwpPagesAtom = atom({ plugin: 'ide-mod', key: 'hwpPages' } as const, {} as Record<string, number>)
 const lectureAtom = atom({ plugin: 'ide-mod', key: 'isLecture' } as const, false)
 const captionAtom = atom({ plugin: 'ide-mod', key: 'caption' } as const, { text: '', prev: '', step: 0, startedAt: 0 } as Caption)
@@ -1142,16 +1160,21 @@ const gateSummary = (g: GateResult) => {
 }
 
 // ── HWP 뷰어 (rhwp 엔진: 플러그인의 bin/rhwp-view.mjs를 node로 부른다) ──
-type HwpBlock = { t: 'p'; text: string } | { t: 'table'; rows: string[][] }
-type HwpText = { format?: string; pages?: number; blocks?: HwpBlock[]; residues?: string[]; error?: string }
+type HwpText = { format?: string; pages?: number; residues?: string[]; error?: string }
 type HwpPage = { pages?: number; page?: number; svg?: string; pngPath?: string; pngWidth?: number; pngHeight?: number; error?: string }
+type GridSeg = { t: string; b?: 1; c?: string; l?: 1; r?: 1 }
+type HwpGrid = { pages?: number; page?: number; rows?: GridSeg[][]; error?: string }
 const hwpTextCache = new Map<string, HwpText>()
 const hwpPageCache = new Map<string, HwpPage>()
+const hwpGridCache = new Map<string, HwpGrid>()
 const hwpLoading = new Set<string>()
+/** 문서 보기의 쪽 넘김: 스크롤 훅이 쓰는 지금 쪽 */
+const hwpNow = { path: '', page: 0, pages: 0 }
+const hwpOffsetKey = (path: string, page: number) => `${path}#${page}`
 
 /**
- * rhwp를 그리기 밖에서 돌린다. 그리기는 자주 다시 시작되고(보드 시계·핫 리로드), 끊긴 그리기 안에서
- * 돌던 프로세스는 출력이 잘린다. 그래서 타이머로 넘겨 끝까지 돌리고, 끝나면 다시 그리게 한다.
+ * rhwp를 그리기 밖에서 돌린다. 그리기는 자주 다시 시작되므로(보드 시계·핫 리로드) 타이머로 넘겨
+ * 끝까지 돌리고, 끝나면 다시 그리게 한다.
  */
 function loadHwp($: EngineInterface, key: string, args: string[], into: Map<string, Record<string, unknown>>) {
   if (hwpLoading.has(key) || into.has(key)) return
@@ -1180,30 +1203,17 @@ async function runRhwp($: EngineInterface, args: string[]): Promise<Record<strin
   }
 }
 
-const RESIDUE = /\{\{[^{}\n]{1,60}\}\}/g
-const mdEscape = (text: string) => text.replace(/^([#>*+-]|\d+[.)])/, '\\$1')
-const cellEscape = (text: string) => text.replace(/\|/g, '\\|').replace(/\n/g, ' ')
-const markResidue = (text: string) => text.replace(RESIDUE, m => `**⟦${m}⟧**`)
-
-/** rhwp가 꺼낸 문단·표를 마크다운 줄로 */
-export const hwpMarkdown = (blocks: HwpBlock[]) => {
-  const out: string[] = []
-  for (const block of blocks) {
-    if (block.t === 'p') {
-      for (const line of block.text.split('\n')) out.push(markResidue(mdEscape(line)))
-      out.push('')
-      continue
-    }
-    const width = Math.max(1, ...block.rows.map(r => r.length))
-    const rows = block.rows.map(r => [...r, ...Array<string>(width - r.length).fill('')].map(c => markResidue(cellEscape(c)) || ' '))
-    const [head = [], ...rest] = rows
-    out.push(`| ${head.join(' | ')} |`, `|${' --- |'.repeat(width)}`, ...rest.map(r => `| ${r.join(' | ')} |`), '')
+/** 지금 쪽을 그림(PNG)으로 만들어 macOS 미리보기로 연다: 그래픽이 없는 터미널에서 원본 그대로 보기 */
+async function openHwpPreview($: EngineInterface, path: string, page: number) {
+  const shot = (await runRhwp($, ['page', path, String(page)])) as HwpPage
+  if (shot.error !== undefined || shot.pngPath === undefined) {
+    $.ui.toast(`미리보기를 만들지 못했어요: ${shot.error ?? 'PNG 변환 도구 없음'}`)
+    return
   }
-  while (out.length > 0 && out[out.length - 1] === '') out.pop()
-  return out
+  await $.process.run(['open', shot.pngPath], { timeoutMs: 10_000 }).catch(() => undefined)
 }
 
-/** HWP를 그린다: 본문(문단·표) 또는 페이지 그림 */
+/** HWP를 그린다: 문서 보기(쪽을 글자 격자로) 또는 그림 보기(rhwp가 그린 쪽 그림) */
 async function drawHwp(
   $: EngineInterface,
   e: RenderInput<'Pane'>,
@@ -1211,12 +1221,12 @@ async function drawHwp(
   stat: { mtimeMs: number; size: number },
   fileWidth: number,
   contentRows: number,
-  offset: number,
+  offsets: Record<string, number>,
 ): Promise<{ info: string; body: RenderElement }> {
-  const { Text, Markdown } = $.ui.resolve(e)
+  const { Box, Text } = $.ui.resolve(e)
   const view = await read($, hwpViewAtom)
-  const key = `${stat.mtimeMs}|${stat.size}`
-  const textKey = `${path}|${key}`
+  const version = `${stat.mtimeMs}|${stat.size}`
+  const textKey = `${path}|${version}`
   const data = hwpTextCache.get(textKey)
   if (data === undefined) {
     loadHwp($, textKey, ['text', path], hwpTextCache as Map<string, Record<string, unknown>>)
@@ -1224,14 +1234,15 @@ async function drawHwp(
   }
   if (data.error !== undefined) return { info: baseName(path), body: <Text color="error">{data.error} (r로 다시 시도)</Text> }
   const residues = data.residues ?? []
-  const head = `${baseName(path)} · ${(data.format ?? '').toUpperCase()} ${data.pages ?? '?'}쪽 · rhwp${residues.length > 0 ? ` · 치환 안 된 칸 ${residues.length}개: ${residues.slice(0, 4).join(' ')}` : ''}`
+  const pages = Math.max(1, data.pages ?? 1)
+  const page = clamp((await read($, hwpPagesAtom))[path] ?? 0, 0, pages - 1)
+  Object.assign(hwpNow, { path, page, pages })
+  const head = `${baseName(path)} · ${page + 1}/${pages}쪽${residues.length > 0 ? ` · 치환 안 된 칸 ${residues.length}개: ${residues.slice(0, 3).join(' ')}` : ''}`
 
-  if (view === 'page') {
-    const pages = await read($, hwpPagesAtom)
-    const page = clamp(pages[path] ?? 0, 0, Math.max(0, (data.pages ?? 1) - 1))
-    const pageKey = `${path}|${key}|${page}`
+  if (view === 'image') {
+    const pageKey = `${path}|${version}|${page}`
     const shot = hwpPageCache.get(pageKey)
-    const info = `${head} · ${page + 1}/${data.pages ?? '?'}쪽`
+    const info = `${head} · 그림 보기 (o: 미리보기로 열기)`
     if (shot === undefined) {
       loadHwp($, pageKey, ['page', path, String(page)], hwpPageCache as Map<string, Record<string, unknown>>)
       return { info, body: <Text dimColor>{page + 1}쪽을 그리는 중…</Text> }
@@ -1239,7 +1250,7 @@ async function drawHwp(
     if (shot.error !== undefined) return { info, body: <Text color="error">{shot.error} (r로 다시 시도)</Text> }
     const alt = `${baseName(path)} ${page + 1}쪽`
     if (e.surface === 'terminal') {
-      if (shot.pngPath === undefined) return { info, body: <Text dimColor>페이지 그림(PNG)을 만들 도구가 없어요. rsvg-convert를 설치하거나 데스크톱 앱에서 열어 주세요.</Text> }
+      if (shot.pngPath === undefined) return { info, body: <Text dimColor>쪽 그림(PNG)을 만들 도구가 없어요. 문서 보기(v)를 쓰거나 rsvg-convert를 설치해 주세요.</Text> }
       const { Image } = $.ui.resolve(e)
       const aspect = (shot.pngHeight ?? 1) / (shot.pngWidth ?? 1)
       let columns = clamp(fileWidth, 1, 255)
@@ -1248,24 +1259,48 @@ async function drawHwp(
         rows = contentRows
         columns = clamp(Math.round((rows * 2) / aspect), 1, 255)
       }
-      return { info, body: <Image source={{ file: shot.pngPath, format: 'png' }} columns={columns} rows={clamp(rows, 1, 255)} alt={`${alt} (kitty·Ghostty 터미널에서 그림으로 보여요)`} /> }
+      return {
+        info,
+        body: <Image source={{ file: shot.pngPath, format: 'png' }} columns={columns} rows={clamp(rows, 1, 255)} alt={`${alt}: 이 터미널은 그림을 못 그려요(kitty·Ghostty 필요). v로 문서 보기, o로 미리보기에서 열기`} />,
+      }
     }
     if (e.surface === 'desktop' || e.surface === 'vscode' || e.surface === 'mobile') {
       const { Svg } = $.ui.resolve(e)
       if (shot.svg !== undefined) return { info, body: <Svg source={shot.svg} alt={alt} /> }
     }
-    return { info, body: <Text dimColor>이 쪽은 그림이 커서 이 화면에 못 그려요. 본문 보기(v)를 써 주세요.</Text> }
+    return { info, body: <Text dimColor>이 쪽은 그림이 너무 커서 여기 못 그려요. v로 문서 보기를 쓰거나 o로 미리보기에서 열어 주세요.</Text> }
   }
 
-  const lines = hwpMarkdown(data.blocks ?? [])
-  if (lines.length === 0) return { info: head, body: <Text dimColor>본문 글자가 없어요.</Text> }
-  const starts = blockStarts(lines)
-  const wanted = clamp(offset, 0, lines.length - 1)
-  const start = [...starts].reverse().find(s => s <= wanted) ?? 0
-  layout.fileMaxOffset = lines.length - 1
-  let text = lines.slice(start).join('\n')
-  if (text.length > MAX_RENDERED_CHARS) text = text.slice(0, MAX_RENDERED_CHARS)
-  return { info: `${head} · ${start + 1}줄부터/${lines.length}줄`, body: <Markdown text={text} /> }
+  // 문서 보기: rhwp가 그린 쪽을 이 칸 너비의 글자 격자로 (가운데 정렬·표·굵은 글씨를 그대로)
+  const cols = clamp(fileWidth, 20, 400)
+  const gridKey = `${path}|${version}|${page}|${cols}`
+  const grid = hwpGridCache.get(gridKey)
+  const info = `${head} · 문서 보기`
+  if (grid === undefined) {
+    loadHwp($, gridKey, ['grid', path, String(page), String(cols)], hwpGridCache as Map<string, Record<string, unknown>>)
+    return { info, body: <Text dimColor>{page + 1}쪽을 펼치는 중…</Text> }
+  }
+  if (grid.error !== undefined) return { info, body: <Text color="error">{grid.error} (r로 다시 시도)</Text> }
+  const rows = grid.rows ?? []
+  const offset = clamp(offsets[hwpOffsetKey(path, page)] ?? 0, 0, rows.length - contentRows)
+  layout.fileMaxOffset = Math.max(0, rows.length - contentRows)
+  const shown = rows.slice(offset, offset + contentRows)
+  return {
+    info: `${info} ${offset + 1}-${offset + shown.length}/${rows.length}줄`,
+    body: (
+      <Box flexDirection="column">
+        {shown.map((segments, i) => (
+          <Text key={`hwp-row:${offset + i}`} wrap="truncate-end">
+            {segments.length === 0 ? ' ' : segments.map((seg, j) => (
+              <Text key={`s${j}`} bold={seg.b === 1} dimColor={seg.l === 1} color={seg.r === 1 ? 'error' : seg.c}>
+                {seg.t}
+              </Text>
+            ))}
+          </Text>
+        ))}
+      </Box>
+    ),
+  }
 }
 
 // ════════════════ 연결 ════════════════

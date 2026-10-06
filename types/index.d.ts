@@ -102,7 +102,8 @@ declare module 'claude-code' {
       requestOffset: number
 
       // ── HWP 뷰어 ──
-      hwpView: 'body' | 'page'
+      /** doc: 쪽을 글자 격자로(기본), image: rhwp가 그린 쪽 그림 */
+      hwpView: 'doc' | 'image'
       hwpPages: Record<string, number>
 
       // ── 강의 모드·문체 게이트 ──

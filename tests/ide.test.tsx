@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { blockStarts, captionFor, describeCall, fit, hwpMarkdown, shortModel, styleGate } from '../hooks/register'
+import { blockStarts, captionFor, describeCall, fit, shortModel, styleGate } from '../hooks/register'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
 const ROOT = '/work'
@@ -72,9 +72,16 @@ function fakeWorld(on: On): World {
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('process.run', ($, e) => {
     world.rhwpCalls.push(e.argv.slice(2).join(' '))
+    const page = Number(e.argv[4])
+    const grid: { t: string; b?: number; l?: number; r?: number }[][] = Array.from({ length: 30 }, (_, i) => [{ t: `${page + 1}쪽 ${i + 1}줄` }])
+    grid[0] = [{ t: '연구 계획서', b: 1 }]
+    grid[1] = [{ t: '┌──┬──┐', l: 1 }]
+    grid[2] = [{ t: '기관 ' }, { t: '{{기관명}}', r: 1 }]
     const stdout = e.argv[2] === 'text'
-      ? JSON.stringify({ format: 'hwpx', pages: 2, residues: ['{{기관명}}'], blocks: [{ t: 'p', text: '연구 계획서' }, { t: 'table', rows: [['항목', '내용'], ['기관', '{{기관명}}']] }] })
-      : JSON.stringify({ pages: 2, page: Number(e.argv[4]), pngPath: '/tmp/page.png', pngWidth: 1400, pngHeight: 1400, svg: '<svg xmlns="http://www.w3.org/2000/svg"/>' })
+      ? JSON.stringify({ format: 'hwpx', pages: 2, residues: ['{{기관명}}'], blocks: [] })
+      : e.argv[2] === 'grid'
+        ? JSON.stringify({ pages: 2, page, cols: Number(e.argv[5]), width: 40, rows: grid })
+        : JSON.stringify({ pages: 2, page, pngPath: '/tmp/page.png', pngWidth: 990, pngHeight: 1400, svg: '<svg xmlns="http://www.w3.org/2000/svg"/>' })
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
@@ -303,39 +310,51 @@ describe('에이전트 보드', () => {
 })
 
 describe('HWP 뷰어 (rhwp)', () => {
-  test('문단·표를 마크다운으로 바꾸고 치환 안 된 칸을 표시한다', () => {
-    const md = hwpMarkdown([{ t: 'p', text: '- 목록 같은 문단' }, { t: 'table', rows: [['항목', '내용'], ['기관', '{{기관명}}'], ['짧은 줄']] }])
-    expect(md[0]).toBe('\\- 목록 같은 문단')
-    expect(md).toContain('| 항목 | 내용 |')
-    expect(md).toContain('| 기관 | **⟦{{기관명}}⟧** |')
-    expect(md).toContain('| 짧은 줄 |   |')
-  })
-
-  test('그리기 밖에서 rhwp를 돌리고, 본문 보기와 페이지 보기를 오가며 쪽을 넘긴다', async ($, on) => {
+  test('문서 보기로 쪽을 글자 격자 그대로 그리고, 끝까지 내리면 다음 쪽으로 넘어간다', async ($, on) => {
     const world = fakeWorld(on)
     const clock = mock.clock(on)
     await $.command.run(typed('open', '/work/doc.hwpx'))
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
-    // 처음 그릴 때는 읽는 중이라고만 보이고, 엔진은 타이머에서 돈다
+    // 엔진은 그리기 밖(타이머)에서 돈다
     expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('rhwp 엔진으로 읽는 중')
     expect(world.rhwpCalls).toEqual([])
     await clock.advance(5)
-    const md = await ui.find({ type: 'Markdown' })
-    expect(String(md?.props.text)).toContain('⟦{{기관명}}⟧')
-    expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('치환 안 된 칸 1개')
+    await clock.advance(5)
+    const text = textOf(await ui.findAll({ type: 'Text' }))
+    expect(text).toContain('연구 계획서')
+    expect(text).toContain('┌──┬──┐')
+    expect(text).toContain('치환 안 된 칸 1개')
+    expect(text).toContain('1/2쪽')
+    const residue = (await ui.findAll({ type: 'Text' })).find(t => t.text === '{{기관명}}')
+    expect(residue?.props.color).toBe('error')
+    expect(world.rhwpCalls[0]).toBe('text /work/doc.hwpx')
+    expect(world.rhwpCalls[1]).toMatch(/^grid \/work\/doc\.hwpx 0 \d+$/)
+    await ui.unmount()
+  })
+
+  test('그림 보기와 쪽 넘김, 데스크톱은 SVG로 그린다', async ($, on) => {
+    const world = fakeWorld(on)
+    const clock = mock.clock(on)
+    await $.command.run(typed('open', '/work/doc.hwpx'))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    await clock.advance(5)
     await ui.press({ key: 'hwp-view' })
     await clock.advance(5)
-    expect((await ui.find({ type: 'Image' }))?.props.source).toEqual({ file: '/tmp/page.png', format: 'png' })
+    const image = await ui.find({ type: 'Image' })
+    expect(image?.props.source).toEqual({ file: '/tmp/page.png', format: 'png' })
+    expect(String(image?.props.alt)).toContain('o로 미리보기')
     await ui.press({ key: 'hwp-next' })
     await clock.advance(5)
-    expect(world.rhwpCalls).toEqual(['text /work/doc.hwpx', 'page /work/doc.hwpx 0', 'page /work/doc.hwpx 1'])
+    expect(world.rhwpCalls).toContain('page /work/doc.hwpx 1')
     // 같은 쪽은 다시 돌리지 않는다
+    const before = world.rhwpCalls.length
     await ui.press({ key: 'hwp-prev' })
     await clock.advance(5)
-    expect(world.rhwpCalls.length).toBe(3)
+    expect(world.rhwpCalls.length).toBe(before)
     await ui.unmount()
 
     const desk = await $.ui.mount({ ...PANE, surface: 'desktop', props: props(140) })
+    await clock.advance(5)
     expect(await desk.find({ type: 'Svg' })).toBeDefined()
     await desk.unmount()
   })
