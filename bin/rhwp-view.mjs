@@ -184,11 +184,33 @@ function toPng(svgPath, pngPath) {
   if (tryRun('rsvg-convert', ['-w', '1400', '-b', 'white', '-o', pngPath, svgPath])) return pngPath
   if (tryRun('resvg', ['-w', '1400', '--background', 'white', svgPath, pngPath])) return pngPath
   if (process.platform === 'darwin') {
+    // qlmanage는 정사각형 썸네일을 만들면서 세로로 긴 쪽의 아래를 잘라낸다. 그래서 쪽을 정사각형
+    // 흰 바탕 가운데에 놓고 변환한 뒤, sips로 쪽의 가로세로 비율만큼 가운데를 다시 잘라낸다
+    const svg = fs.readFileSync(svgPath, 'utf8')
+    const size = svg.match(/<svg\b[^>]*?\swidth="([\d.]+)"[^>]*?\sheight="([\d.]+)"/)
+    const width = size ? Number(size[1]) : 0
+    const height = size ? Number(size[2]) : 0
+    const side = Math.max(width, height)
+    const squarePath = svgPath.replace(/\.svg$/, '.square.svg')
+    if (side > 0) {
+      const inner = svg.replace(/^<\?xml[^>]*>\s*/, '').replace(/^<svg\b/, `<svg x="${(side - width) / 2}" y="${(side - height) / 2}"`)
+      fs.writeFileSync(
+        squarePath,
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${side}" height="${side}" viewBox="0 0 ${side} ${side}"><rect width="${side}" height="${side}" fill="white"/>${inner}</svg>`,
+      )
+    }
+    const source = side > 0 ? squarePath : svgPath
     const dir = path.dirname(pngPath)
-    const run = spawnSync('qlmanage', ['-t', '-s', '1400', '-o', dir, svgPath], { timeout: 20_000 })
-    const made = `${svgPath}.png`.replace(path.dirname(svgPath), dir)
+    const run = spawnSync('qlmanage', ['-t', '-s', '1400', '-o', dir, source], { timeout: 20_000 })
+    const made = path.join(dir, `${path.basename(source)}.png`)
     if (run.status === 0 && fs.existsSync(made)) {
       fs.renameSync(made, pngPath)
+      if (side > 0) {
+        fs.rmSync(squarePath, { force: true })
+        const keepH = Math.round((1400 * height) / side)
+        const keepW = Math.round((1400 * width) / side)
+        spawnSync('sips', ['--cropToHeightWidth', String(keepH), String(keepW), pngPath], { timeout: 20_000 })
+      }
       return pngPath
     }
   }
@@ -228,7 +250,16 @@ async function pageMode(file, pageArg) {
   }
 }
 
-const isMain = process.argv[1] !== undefined && path.resolve(process.argv[1]) === url.fileURLToPath(import.meta.url)
+// Node는 실행 파일의 심볼릭 링크를 풀어 import.meta.url에 실제 경로를 넣는다. argv[1]은 링크 경로
+// 그대로일 수 있어서(개발 중 mod 폴더 링크, 플러그인 캐시) 둘 다 실제 경로로 풀어 비교한다
+const realOf = file => {
+  try {
+    return fs.realpathSync(file)
+  } catch {
+    return path.resolve(file)
+  }
+}
+const isMain = process.argv[1] !== undefined && realOf(process.argv[1]) === realOf(url.fileURLToPath(import.meta.url))
 if (isMain) {
   const [mode, file, page] = process.argv.slice(2)
   try {

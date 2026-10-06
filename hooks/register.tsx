@@ -1176,7 +1176,7 @@ async function runRhwp($: EngineInterface, args: string[]): Promise<Record<strin
     return JSON.parse(out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1)) as Record<string, unknown>
   } catch {
     const why = ran.stderr.trim()
-    return { error: /ENOENT|not found|spawn/i.test(why) || ran.exitCode === 127 ? 'rhwp 엔진을 돌리려면 Node.js가 필요해요 (node 명령을 찾지 못함)' : oneLine(why, 200) || `rhwp 출력을 읽지 못했어요 (exit ${ran.exitCode}, ${ran.stdout.length}자)` }
+    return { error: /ENOENT|not found|spawn/i.test(why) || ran.exitCode === 127 ? 'rhwp 엔진을 돌리려면 Node.js가 필요해요 (node 명령을 찾지 못함)' : oneLine(why, 200) || `rhwp 출력을 읽지 못했어요 (exit ${ran.exitCode}, ${ran.stdout.length}자, ${dir}/bin/rhwp-view.mjs)` }
   }
 }
 
