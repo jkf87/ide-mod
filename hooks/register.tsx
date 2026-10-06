@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Color, EngineInterface, On, Register, RenderElement, RenderInput } from 'claude-code'
 
-import type { AgentPhase, AgentRow, Caption, GateCheck, GateResult, RequestItem, ViewMode } from '../types'
+import type { AgentPhase, AgentRow, Caption, GateCheck, GateResult, PeerRow, RequestItem, ViewMode } from '../types'
 
 // ════════════════ 에이전트 보드 ════════════════
 const MAIN = 'main'
@@ -330,9 +330,12 @@ async function drawBoard($: EngineInterface, e: RenderInput<'Pane'>, width: numb
   const mainBrain = main === undefined ? '' : `${shortModel(main.model) || '…'}${main.effort ? ` · ${main.effort}` : ''}`
   const summary = `에이전트 ${main === undefined ? '대기' : `${PHASE_ICON[main.phase]} ${mainBrain}`} · 서브 ${running}개 작업 중 / ${subs.length - running}개 끝남`
 
+  const sessionId = await $.session.id().catch(() => '')
   const header = (
     <Box key="board-header" flexDirection="row" columnGap={2} height={1} overflow="hidden">
       <Text bold wrap="truncate-end">{summary}</Text>
+      {sessionId !== '' && <Text dimColor wrap="truncate-end">세션 {sessionId.slice(0, 8)}</Text>}
+      <Button key="board-handoff" plain hotkey="i" label="핸드오프" onPress={() => void openHandoff($)} />
       <Button key="board-fold" plain hotkey="a" label={isFolded ? '보드 펼치기' : '보드 접기'} onPress={() => void update($, foldedAtom, v => !v)} />
       {!isFolded && <Button key="board-hide" plain hotkey="h" label={hideDone ? '끝난 것 보이기' : '끝난 것 숨기기'} onPress={() => void update($, hideDoneAtom, v => !v)} />}
       {!isFolded && <Button key="board-recap" plain hotkey="s" label={isRecapOn ? `요약 끄기(${RECAP_MODEL})` : '요약 켜기'} onPress={() => { recapFailures = 0; void update($, recapOnAtom, v => !v) }} />}
@@ -450,7 +453,7 @@ const layout = {
   treeView: 10,
   active: '',
   fileMaxOffset: 0,
-  leftMode: 'files' as 'files' | 'requests',
+  leftMode: 'files' as 'files' | 'requests' | 'handoff',
   requestRows: 0,
 }
 // 스크롤할 때마다 디스크를 다시 읽지 않도록: 트리는 (뿌리·펼친 폴더·세대)로, 파일은 수정 시각으로 재사용한다
@@ -734,12 +737,17 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
   const selectedN = await read($, selectedRequestAtom)
   const hwpView = await read($, hwpViewAtom)
   const isRequests = leftMode === 'requests'
+  const isHandoff = leftMode === 'handoff'
+  const isFiles = leftMode === 'files'
+  const peers = isHandoff ? await read($, peersAtom) : []
+  const handoff = isHandoff ? await currentHandoff($).catch(() => undefined) : undefined
+  const sent = isHandoff ? await read($, handoffSentAtom) : null
   // 요청 기록 모드: 기본은 이번 세션 요청 전부를 오른쪽에 이어서 보여 주고, 왼쪽에서 고르면 그 요청 하나만 펼친다
   const requestView = await read($, requestViewAtom)
   const isAllRequests = isRequests && requestView === 'all' && requests.length > 0
   const selected = requests.find(r => r.n === selectedN) ?? requests[requests.length - 1]
-  const rightKey = isRequests ? (isAllRequests ? 'requests:all' : selected === undefined ? '' : `request:${selected.n}`) : active
-  const isHwp = !isRequests && HWP.test(active)
+  const rightKey = isHandoff ? 'handoff' : isRequests ? (isAllRequests ? 'requests:all' : selected === undefined ? '' : `request:${selected.n}`) : active
+  const isHwp = isFiles && HWP.test(active)
 
   const isWide = width >= SPLIT_MIN_COLUMNS
   const showTree = isWide ? !isTreeHidden || rightKey === '' : !(isTreeHidden && rightKey !== '')
@@ -747,7 +755,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
   const treeWidth = showTree && showFile ? clamp(Math.round(width * 0.3), 24, 44) : width
   const fileWidth = showTree && showFile ? width - treeWidth - 1 : width
   const mainRows = Math.max(1, rows - 1)
-  const isMarkdown = !isRequests && MARKDOWN.test(active)
+  const isMarkdown = isFiles && MARKDOWN.test(active)
   layout.topRows = topRows
   layout.leftMode = leftMode
 
@@ -759,7 +767,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
         key="left-mode"
         plain
         hotkey="q"
-        label={isRequests ? '파일 트리' : `요청 기록 ${requests.length}`}
+        label={isFiles ? `요청 기록 ${requests.length}` : '파일 트리'}
         onPress={() =>
           void (async () => {
             await update($, leftModeAtom, m => (m === 'files' ? 'requests' : 'files'))
@@ -786,6 +794,10 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
         hotkey="r"
         label="새로고침"
         onPress={() => {
+          if (isHandoff) {
+            void loadPeers($).catch(() => undefined)
+            return
+          }
           fileCache.clear()
           hwpTextCache.clear()
           hwpPageCache.clear()
@@ -814,18 +826,51 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
       )}
       {isRequests && !isAllRequests && selected !== undefined && <Button key="request-copy" plain hotkey="c" label="복사" onPress={() => void $.ui.copy({ text: selected.text, surface: e.surface })} />}
       {isAllRequests && <Button key="request-copy-all" plain hotkey="c" label="전부 복사" onPress={() => void $.ui.copy({ text: requestsAsText(requests), surface: e.surface })} />}
-      {!isRequests && active !== '' && isMarkdown && (
+      {isHandoff && handoff !== undefined && (
+        <Button key="handoff-copy" plain hotkey="c" label="핸드오프 글 복사" onPress={() => void $.ui.copy({ text: handoff.text, surface: e.surface })} />
+      )}
+      {isHandoff && handoff !== undefined && <Button key="handoff-id" plain hotkey="y" label="세션 ID 복사" onPress={() => void $.ui.copy({ text: handoff.info.id, surface: e.surface })} />}
+      {isHandoff && handoff !== undefined && (
+        <Button
+          key="handoff-resume"
+          plain
+          hotkey="e"
+          label="이어서 열기 명령 복사"
+          onPress={() => void $.ui.copy({ text: `cd ${shellQuote(handoff.info.root)} && claude --resume ${handoff.info.id} --fork-session`, surface: e.surface })}
+        />
+      )}
+      {isFiles && active !== '' && isMarkdown && (
         <Button key="mode" plain hotkey="m" label={mode === 'rendered' ? '원문' : '렌더'} onPress={() => void update($, modeAtom, m => (m === 'rendered' ? 'code' : 'rendered'))} />
       )}
-      {!isRequests && active !== '' && <Button key="mention" plain hotkey="p" label="@프롬프트" onPress={() => void $.prompt.fill({ text: `@${active} `, mode: 'insert' })} />}
-      {!isRequests && active !== '' && <Button key="copy" plain hotkey="c" label="경로 복사" onPress={() => void $.ui.copy({ text: active, surface: e.surface })} />}
-      {!isRequests && active !== '' && <Button key="close" plain hotkey="w" label="탭 닫기" onPress={() => void closeTab($, active)} />}
+      {isFiles && active !== '' && <Button key="mention" plain hotkey="p" label="@프롬프트" onPress={() => void $.prompt.fill({ text: `@${active} `, mode: 'insert' })} />}
+      {isFiles && active !== '' && <Button key="copy" plain hotkey="c" label="경로 복사" onPress={() => void $.ui.copy({ text: active, surface: e.surface })} />}
+      {isFiles && active !== '' && <Button key="close" plain hotkey="w" label="탭 닫기" onPress={() => void closeTab($, active)} />}
     </Box>
   )
 
   // ── 트리 / 요청 기록 ──
   let treeColumn: RenderElement | false = false
-  if (showTree && isRequests) {
+  if (showTree && isHandoff) {
+    const self = await read($, selfNameAtom)
+    treeColumn = (
+      <Box key="ide-peers" flexDirection="column" width={treeWidth} height={mainRows} overflow="hidden">
+        <Text bold wrap="truncate-end">보낼 세션 {peers.length}개 · r 새로고침</Text>
+        {self !== '' && <Text dimColor wrap="truncate-end">이 세션: {self}</Text>}
+        {peers.length === 0 && <Text dimColor>열려 있는 다른 세션이 없어요. c로 핸드오프 글을 복사해 다른 에이전트에 붙여 넣으세요.</Text>}
+        {peers.slice(0, Math.max(1, mainRows - 2)).map(peer => (
+          <Box key={`peer-row:${peer.ref}`} flexDirection="row" height={1} overflow="hidden">
+            <Button
+              key={`peer:${peer.ref}`}
+              plain
+              dimColor={peer.status !== 'idle'}
+              label={fit(`→ ${peer.name} · ${peer.status === 'busy' ? '작업 중' : peer.status === 'idle' ? '대기' : peer.status}`, treeWidth)}
+              onPress={() => void sendHandoff($, peer)}
+            />
+          </Box>
+        ))}
+      </Box>
+    )
+  } else if (showTree && isRequests) {
     const treeView = Math.max(1, mainRows - 1)
     const newestFirst = [...requests].reverse()
     const requestOffset = clamp(await read($, requestOffsetAtom), 0, newestFirst.length - treeView)
@@ -918,7 +963,30 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
     )
     Object.assign(layout, { active: rightKey, fileMaxOffset: 0 })
 
-    if (isRequests) {
+    if (isHandoff) {
+      const lines = handoff === undefined ? ['세션 정보를 읽지 못했어요.'] : handoff.text.split('\n')
+      const offset = clamp(offsets[rightKey] ?? 0, 0, lines.length - 1)
+      layout.fileMaxOffset = Math.max(0, lines.length - 1)
+      const note =
+        sent === null
+          ? '왼쪽에서 세션을 누르면 아래 글을 그 세션에 보내요.'
+          : sent.ok
+            ? `${clock(sent.at)} ${sent.to}에 보냈어요.`
+            : `${clock(sent.at)} ${sent.to}에 못 보냈어요: ${sent.reason ?? ''}`
+      fileColumn = (
+        <Box key="ide-file" flexDirection="column" width={fileWidth} height={mainRows} overflow="hidden">
+          <Text bold wrap="truncate-end">핸드오프 · 세션 {handoff?.info.id ?? ''}</Text>
+          <Text dimColor={sent === null} color={sent === null ? undefined : sent.ok ? 'success' : 'error'} wrap="truncate-end">{note}</Text>
+          <Box flexDirection="column" height={Math.max(1, mainRows - 2)} overflow="hidden">
+            {lines.slice(offset).map((line, i) => (
+              <Text key={`handoff-line:${offset + i}`} color={line.startsWith('세션 ID') || line.startsWith('이어서 열기') ? 'warning' : undefined} dimColor={line.startsWith('#')}>
+                {line === '' ? ' ' : line}
+              </Text>
+            ))}
+          </Box>
+        </Box>
+      )
+    } else if (isRequests) {
       const head = <Text dimColor>요청 기록 · {requests.length}개 · {requests.filter(r => r.status === 'running').length}개 진행 중</Text>
       if (isAllRequests) {
         // 요청 하나가 머리줄 + 본문 줄들 + 답 한 줄 + 빈 줄. 스크롤은 이 논리 줄 단위로, 넘치는 줄은 창이 자른다
@@ -1034,7 +1102,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
 }
 
 // ════════════════ 요청 기록 · HWP 뷰어 · 강의 모드 · 문체 게이트 ════════════════
-const leftModeAtom = atom({ plugin: 'ide-mod', key: 'leftMode' } as const, 'files' as 'files' | 'requests')
+const leftModeAtom = atom({ plugin: 'ide-mod', key: 'leftMode' } as const, 'files' as 'files' | 'requests' | 'handoff')
 const requestsAtom = atom({ plugin: 'ide-mod', key: 'requests' } as const, [] as RequestItem[])
 const selectedRequestAtom = atom({ plugin: 'ide-mod', key: 'selectedRequest' } as const, 0)
 const requestOffsetAtom = atom({ plugin: 'ide-mod', key: 'requestOffset' } as const, 0)
@@ -1072,6 +1140,113 @@ const requestStatus = (r: RequestItem) => {
   const took = r.endedAt !== undefined ? ` · ${formatElapsed(r.endedAt - r.at)}` : ''
   return r.status === 'running' ? '진행 중' : r.status === 'done' ? `끝남${took}` : `중단됨${took}`
 }
+// ════════════════ 핸드오프 ════════════════
+// 이 세션을 다른 에이전트 세션에 넘긴다: 세션 ID·작업 폴더·대화 기록 경로·이어서 여는 명령·요청 목록을 한 글로
+
+const peersAtom = atom({ plugin: 'ide-mod', key: 'peers' } as const, [] as PeerRow[])
+const selfNameAtom = atom({ plugin: 'ide-mod', key: 'selfName' } as const, '')
+const handoffSentAtom = atom({ plugin: 'ide-mod', key: 'handoffSent' } as const, null as { to: string; at: number; ok: boolean; reason?: string } | null)
+
+type SessionInfo = { id: string; root: string; transcript: string | undefined }
+let sessionInfoCache: SessionInfo | undefined
+
+/** 세션 ID와 대화 기록 파일 경로. 기록은 <설정 폴더>/projects/<루트의 영숫자 외 문자를 -로>/<id>.jsonl 에 있다 */
+async function sessionInfo($: EngineInterface): Promise<SessionInfo> {
+  const id = await $.session.id()
+  const root = await $.session.root()
+  if (sessionInfoCache?.id === id && sessionInfoCache.root === root && sessionInfoCache.transcript !== undefined) return sessionInfoCache
+  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${(await $.env.get('HOME')) ?? ''}/.claude`
+  const projects = `${config}/projects`
+  let transcript: string | undefined = `${projects}/${root.replace(/[^a-zA-Z0-9]/g, '-')}/${id}.jsonl`
+  if (!(await $.fs.exists(transcript).catch(() => false))) {
+    transcript = undefined
+    const dirs = await $.fs.list(projects).catch(() => [])
+    for (const d of dirs) {
+      const candidate = `${projects}/${d.name}/${id}.jsonl`
+      if (await $.fs.exists(candidate).catch(() => false)) {
+        transcript = candidate
+        break
+      }
+    }
+  }
+  sessionInfoCache = { id, root, transcript }
+  return sessionInfoCache
+}
+
+/** 다른 에이전트가 읽고 바로 이어받을 수 있는 핸드오프 글 */
+export function handoffNote(info: SessionInfo, requests: RequestItem[], status: string, memo = '') {
+  const recent = requests.slice(-12)
+  const lines = [
+    '[핸드오프] Claude Code 세션을 이어받아 주세요.',
+    '',
+    `세션 ID: ${info.id}`,
+    `작업 폴더: ${info.root}`,
+    `대화 기록: ${info.transcript ?? '(찾지 못함)'}`,
+    `이어서 열기: cd ${shellQuote(info.root)} && claude --resume ${info.id} --fork-session`,
+  ]
+  if (memo.trim() !== '') lines.push('', `메모: ${memo.trim()}`)
+  if (status !== '') lines.push('', `지금 상태: ${status}`)
+  if (recent.length > 0) {
+    lines.push('', `받은 요청 ${requests.length}개 중 최근 ${recent.length}개 (오래된 것부터):`)
+    for (const r of recent) lines.push(`#${r.n} ${dayClock(r.at)} ${REQUEST_ICON[r.status]} ${oneLine(r.text, 300)}${r.answer !== '' ? ` → ${oneLine(r.answer, 160)}` : ''}`)
+  }
+  lines.push('', '먼저 대화 기록 파일을 읽어 맥락을 잡고, 이어서 할 일을 정리해 알려 주세요.')
+  return lines.join('\n')
+}
+
+const shellQuote = (s: string) => (/^[\w./~-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`)
+
+/** ListAgents 결과에서 다른 세션들과 이 세션의 이름을 읽는다 */
+export function parsePeers(listing: string): { self: string; peers: PeerRow[] } {
+  const self = listing.match(/This session is (.+?) \[[0-9a-f]+\]/)?.[1] ?? ''
+  const peers: PeerRow[] = []
+  for (const line of listing.split('\n')) {
+    const m = line.match(/^\s+(.+?) \[([0-9a-f]{4,})\]\s+·\s+(.*)$/)
+    if (m === null) continue
+    const parts = m[3].split('·').map(x => x.trim()).filter(Boolean)
+    peers.push({ name: m[1], ref: m[2], status: parts[1] ?? parts[0] ?? '', detail: parts.slice(2).join(' · ') })
+  }
+  return { self, peers }
+}
+
+async function loadPeers($: EngineInterface) {
+  const ran = (await $.tool.call({ tool: 'ListAgents' } as never)) as { result?: { listing?: string }; text?: string; deny?: string }
+  const listing = ran.result?.listing ?? ran.text ?? ''
+  const { self, peers } = parsePeers(listing)
+  await update($, peersAtom, () => peers)
+  if (self !== '') await update($, selfNameAtom, () => self)
+  return peers
+}
+
+/** 탐색기 왼쪽 칸을 핸드오프 화면으로 바꾸고 다른 세션 목록을 새로 받는다 */
+async function openHandoff($: EngineInterface) {
+  await update($, leftModeAtom, m => (m === 'handoff' ? 'files' : 'handoff'))
+  await update($, treeHiddenAtom, () => false)
+  if ((await read($, leftModeAtom)) === 'handoff') await loadPeers($).catch(() => undefined)
+}
+
+async function currentHandoff($: EngineInterface, memo = '') {
+  const info = await sessionInfo($)
+  const main = (await read($, agentsAtom))[MAIN]
+  const status = main === undefined ? '' : oneLine(main.recap || main.activity || '', 200)
+  return { info, text: handoffNote(info, await read($, requestsAtom), status, memo) }
+}
+
+/** 인자 앞부분과 가장 길게 맞는 세션 이름 또는 ref */
+export function pickPeer(peers: PeerRow[], arg: string): PeerRow | undefined {
+  const hits = peers.filter(p => arg === p.name || arg.startsWith(`${p.name} `) || arg === p.ref || arg.startsWith(`${p.ref} `))
+  return hits.sort((a, b) => b.name.length - a.name.length)[0]
+}
+
+async function sendHandoff($: EngineInterface, peer: PeerRow, memo = '') {
+  const { text } = await currentHandoff($, memo)
+  const sent = await $.session.send({ to: `${peer.name} [${peer.ref}]`, text }).catch((err: unknown) => ({ isDelivered: false as const, reason: String(err) }))
+  const result = { to: peer.name, at: Date.now(), ok: sent.isDelivered, reason: sent.isDelivered ? undefined : sent.reason }
+  await update($, handoffSentAtom, () => result)
+  $.ui.toast(sent.isDelivered ? `핸드오프를 보냈어요 → ${peer.name}` : `못 보냈어요: ${sent.reason ?? ''}`)
+  return result
+}
+
 /** 요청 기록 전체를 붙여 넣기 좋은 글로 (오래된 것부터) */
 export const requestsAsText = (items: RequestItem[]) =>
   items.map(r => `#${r.n} ${dayClock(r.at)} ${REQUEST_ICON[r.status]}\n${r.text}${r.answer !== '' ? `\n└ Claude: ${r.answer}` : ''}`).join('\n\n')
@@ -1408,6 +1583,7 @@ export const register: Register = on => {
     startAgents($, e.isInteractive)
     await $.command.register({ name: 'open', description: 'IDE 창에서 폴더나 파일을 엽니다', argumentHint: '[경로]' }).catch(() => undefined)
     await $.command.register({ name: 'lecture', description: '강의 모드: Claude가 하는 일을 입력창 위에 쉬운 한국어 자막으로', argumentHint: '[on|off]' }).catch(() => undefined)
+    await $.command.register({ name: 'handoff', description: '이 세션을 다른 에이전트 세션에 넘깁니다 (세션 ID·대화 기록·요청 목록)', argumentHint: '[세션 이름 또는 ref] [메모]' }).catch(() => undefined)
     await $.command.register({ name: 'style-gate', description: '한국어 문체 게이트: 원고의 AI티 지표를 검사 (자동 검사 on/off)', argumentHint: '[파일|on|off]' }).catch(() => undefined)
     await loadRequests($).catch(() => undefined)
     return next(e)
@@ -1422,6 +1598,23 @@ export const register: Register = on => {
     await update($, lectureAtom, () => isOn)
     if (isOn) await update($, captionAtom, () => ({ text: '강의 모드를 켰어요. Claude가 하는 일을 여기 보여 드려요', prev: '', step: 0, startedAt: Date.now() }))
     return { text: isOn ? '강의 모드를 켰어요. 입력창 위에 자막이 떠요 (/lecture off로 끄기).' : '강의 모드를 껐어요.' }
+  })
+
+  // /handoff: 인자가 없으면 핸드오프 글을 보여 주고 화면을 열고, 세션 이름(또는 ref)으로 시작하면 그 세션에 보낸다
+  on('command.run', { command: 'handoff' }, async ($, e) => {
+    const arg = (e.args ?? '').trim()
+    if (arg === '') {
+      const { text } = await currentHandoff($)
+      await update($, leftModeAtom, () => 'handoff')
+      await loadPeers($).catch(() => undefined)
+      return { text: `${text}\n\n(/ide 창의 핸드오프 화면에서 보낼 세션을 고르거나 c로 복사하세요. /handoff <세션 이름> [메모]로 바로 보낼 수도 있어요.)` }
+    }
+    const peers = await loadPeers($).catch(() => [] as PeerRow[])
+    const peer = pickPeer(peers, arg)
+    if (peer === undefined) return { text: `그 이름의 세션을 찾지 못했어요. 열려 있는 세션: ${peers.map(p => `${p.name} [${p.ref}]`).join(', ') || '없음'}` }
+    const memo = arg.startsWith(peer.ref) ? arg.slice(peer.ref.length) : arg.slice(peer.name.length)
+    const sent = await sendHandoff($, peer, memo)
+    return { text: sent.ok ? `핸드오프를 보냈어요 → ${peer.name} [${peer.ref}]` : `못 보냈어요 (${peer.name}): ${sent.reason ?? ''}` }
   })
 
   on('command.run', { command: 'style-gate' }, async ($, e) => {
@@ -1462,6 +1655,8 @@ export const register: Register = on => {
   // 도구 호출 하나를 보드에는 "지금 하는 일"로, 탐색기에는 "고친 파일"로 남긴다
   on('tool.call', async ($, e, next) => {
     const tool = String(e.tool)
+    // 핸드오프 화면이 세션 목록을 받으려고 부른 ListAgents는 보드·자막에 올리지 않는다
+    if (tool === 'ListAgents' && e.agentId === undefined) return next(e)
     const input = e as unknown as Record<string, unknown>
     await recordToolCall($, e.agentId, tool, input).catch(() => undefined)
     const role = e.agentId === undefined ? undefined : (await read($, agentsAtom))[e.agentId]?.role

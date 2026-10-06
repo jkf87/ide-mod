@@ -31,6 +31,13 @@ export type AgentRow = {
 }
 
 /** 이번 세션에 사람이 보낸 요청 하나 */
+export type PeerRow = {
+  name: string
+  ref: string
+  status: string
+  detail: string
+}
+
 export type RequestItem = {
   n: number
   text: string
@@ -95,13 +102,21 @@ declare module 'claude-code' {
 
       // ── 요청 기록 ──
       /** 왼쪽 칸: 파일 트리 또는 요청 기록 */
-      leftMode: 'files' | 'requests'
+      leftMode: 'files' | 'requests' | 'handoff'
       requests: RequestItem[]
       /** 오른쪽에 펼친 요청 번호; 0이면 가장 최근 */
       selectedRequest: number
       requestOffset: number
       /** 오른쪽: all 이번 세션 요청 전부를 이어서, one 고른 요청 하나 */
       requestView: 'all' | 'one'
+
+      // ── 핸드오프 ──
+      /** ListAgents로 받은 다른 세션들 (핸드오프 화면을 열 때·r로 새로 받음) */
+      peers: PeerRow[]
+      /** 이 세션이 다른 세션에 불리는 이름 */
+      selfName: string
+      /** 마지막으로 보낸 핸드오프 결과 */
+      handoffSent: { to: string; at: number; ok: boolean; reason?: string } | null
 
       // ── HWP 뷰어 ──
       /** doc: 쪽을 글자 격자로(기본), image: rhwp가 그린 쪽 그림 */

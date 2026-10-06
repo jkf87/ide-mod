@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { blockStarts, captionFor, describeCall, fit, requestsAsText, shortModel, styleGate } from '../hooks/register'
+import { blockStarts, captionFor, describeCall, fit, handoffNote, parsePeers, pickPeer, requestsAsText, shortModel, styleGate } from '../hooks/register'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
 const ROOT = '/work'
@@ -32,10 +32,16 @@ const real = (p: string) => {
   return abs
 }
 
-type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown }
+type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[] }
+
+const LISTING = `This session is 모드에 대해 [634505] — the name other sessions use to message it.
+
+Peer sessions (2):
+  화목난로 자동 보충 기능 [a33860]  ·  interactive  ·  idle  ·  Claude Desktop session  ·  started 10h ago
+  목차작성 [ed478e]  ·  interactive  ·  busy  ·  started 3h ago`
 
 function fakeWorld(on: On): World {
-  const world: World = { opened: 0, statuses: [], rhwpCalls: [], scripts: [] }
+  const world: World = { opened: 0, statuses: [], rhwpCalls: [], scripts: [], sent: [], copied: [] }
   on('session.cwd', () => ({ value: ROOT }))
   on('env.get', () => ({ value: '/home/me' }))
   on('fs.stat', ($, e) => {
@@ -73,7 +79,21 @@ function fakeWorld(on: On): World {
     world.statuses.push((e as unknown as { text?: string }).text)
     return { value: undefined } as never
   })
-  on('tool.call', ($, e) => (String(e.tool) === 'Write' && (e as unknown as { content?: string }).content === 'DENY' ? { deny: 'no' } : ({ result: 'ok' } as never)))
+  on('tool.call', ($, e) => {
+    if (String(e.tool) === 'ListAgents') return { result: { listing: LISTING } } as never
+    return String(e.tool) === 'Write' && (e as unknown as { content?: string }).content === 'DENY' ? { deny: 'no' } : ({ result: 'ok' } as never)
+  })
+  on('session.root', () => ({ value: ROOT }))
+  on('fs.exists', ($, e) => ({ value: e.path === `/home/me/projects/${ROOT.replace(/[^a-zA-Z0-9]/g, '-')}/test-session.jsonl` }))
+  on('session.send', ($, e) => {
+    world.sent.push({ to: e.to, text: e.text })
+    return { isDelivered: true as const }
+  })
+  on('ui.copy', ($, e) => {
+    world.copied.push((e as unknown as { text: string }).text)
+    return { value: undefined } as never
+  })
+  on('ui.toast', () => ({ value: undefined }) as never)
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('process.run', ($, e) => {
@@ -440,6 +460,56 @@ describe('요청 기록', () => {
     await ui.press({ key: 'request-all' })
     expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('이번 세션 요청 2개 전부')
     await ui.unmount()
+  })
+})
+
+describe('핸드오프', () => {
+  test('ListAgents 목록을 읽고 세션 이름으로 고른다', () => {
+    const { self, peers } = parsePeers(LISTING)
+    expect(self).toBe('모드에 대해')
+    expect(peers.map(p => [p.name, p.ref, p.status])).toEqual([['화목난로 자동 보충 기능', 'a33860', 'idle'], ['목차작성', 'ed478e', 'busy']])
+    expect(pickPeer(peers, '목차작성 3장 검토 부탁')?.ref).toBe('ed478e')
+    expect(pickPeer(peers, 'a33860')?.name).toBe('화목난로 자동 보충 기능')
+    expect(pickPeer(peers, '없는 세션')).toBeUndefined()
+  })
+
+  test('핸드오프 글에 세션 ID·기록 경로·이어서 열기 명령·요청이 들어간다', () => {
+    const note = handoffNote({ id: 'abc', root: '/my proj', transcript: '/c/projects/-my-proj/abc.jsonl' }, [{ n: 1, text: '로그인 고쳐줘', at: Date.now(), status: 'done', answer: '고쳤어요' }], '테스트 돌리는 중', '3장만')
+    expect(note).toContain('세션 ID: abc')
+    expect(note).toContain('대화 기록: /c/projects/-my-proj/abc.jsonl')
+    expect(note).toContain("이어서 열기: cd '/my proj' && claude --resume abc --fork-session")
+    expect(note).toContain('메모: 3장만')
+    expect(note).toContain('지금 상태: 테스트 돌리는 중')
+    expect(note).toMatch(/#1 .*✓ 로그인 고쳐줘 → 고쳤어요/)
+  })
+
+  test('보드의 i로 핸드오프 화면을 열고, 세션을 누르면 그 세션에 보낸다', async ($, on) => {
+    const world = fakeWorld(on)
+    await $.turn.start({ text: '로그인 버그 고쳐줘', turnId: 't1' })
+    await $.command.run(typed('ide', ''))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('세션 test-ses')
+    await ui.press({ key: 'board-handoff' })
+    const text = textOf(await ui.findAll({ type: 'Text' }))
+    expect(text).toContain('이 세션: 모드에 대해')
+    expect(text).toContain(`대화 기록: /home/me/projects/${ROOT.replace(/[^a-zA-Z0-9]/g, '-')}/test-session.jsonl`)
+    expect((await ui.find({ key: 'peer:ed478e' }))?.props.label).toContain('목차작성 · 작업 중')
+    await ui.press({ key: 'peer:a33860' })
+    expect(world.sent[0].to).toBe('화목난로 자동 보충 기능 [a33860]')
+    expect(world.sent[0].text).toContain('세션 ID: test-session')
+    expect(world.sent[0].text).toContain('로그인 버그 고쳐줘')
+    expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('화목난로 자동 보충 기능에 보냈어요')
+    await ui.press({ key: 'handoff-id' })
+    expect(world.copied.at(-1)).toBe('test-session')
+    await ui.unmount()
+  })
+
+  test('/handoff 세션 이름 메모 로 바로 보낸다', async ($, on) => {
+    const world = fakeWorld(on)
+    const out = await $.command.run(typed('handoff', '목차작성 3장 검토 부탁'))
+    expect(JSON.stringify(out)).toContain('핸드오프를 보냈어요 → 목차작성')
+    expect(world.sent[0].to).toBe('목차작성 [ed478e]')
+    expect(world.sent[0].text).toContain('메모: 3장 검토 부탁')
   })
 })
 
