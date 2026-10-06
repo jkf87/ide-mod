@@ -452,6 +452,42 @@ const layout = {
 let treeEpoch = 0
 let treeCache: { key: string; rows: TreeRow[]; isCut: boolean } | undefined
 const fileCache = new Map<string, { mtimeMs: number; size: number; lines: string[] }>()
+// 그림은 터미널이 파일을 직접 읽게 하지 않고 base64로 넘긴다(그래픽 터미널마다 파일 읽기 처리가 달라 멈출 수 있음).
+// Image가 받는 최대 크기(2 MiB)를 넘으면 그리지 않는다
+const PNG_INLINE_MAX = 2 * 1024 * 1024
+const pngCache = new Map<string, { key: string; base64: string }>()
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+/** base64 앞부분만 바이트로 푼다 */
+const base64Head = (text: string, count: number) => {
+  const out: number[] = []
+  let buffer = 0
+  let bits = 0
+  for (const ch of text) {
+    const v = B64.indexOf(ch)
+    if (v < 0) break
+    buffer = (buffer << 6) | v
+    bits += 6
+    if (bits >= 8) {
+      bits -= 8
+      out.push((buffer >> bits) & 0xff)
+      if (out.length >= count) break
+    }
+  }
+  return out
+}
+async function pngData($: EngineInterface, path: string, key: string) {
+  const hit = pngCache.get(path)
+  if (hit?.key === key) return hit.base64
+  const { base64 } = await $.fs.read(path, { as: 'bytes' })
+  if ((base64.length * 3) / 4 > PNG_INLINE_MAX) return undefined
+  // PNG 서명과 IHDR가 없으면 엔진이 창 전체를 거절하므로 미리 걸러낸다
+  const head = base64Head(base64, 16)
+  const isPng = head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47 && String.fromCharCode(...head.slice(12, 16)) === 'IHDR'
+  if (!isPng) return undefined
+  pngCache.set(path, { key, base64 })
+  while (pngCache.size > 6) pngCache.delete(pngCache.keys().next().value as string)
+  return base64
+}
 const FILE_CACHE_SIZE = 8
 
 const baseName = (path: string) => path.replace(/\/+$/, '').split('/').pop() || path
@@ -910,9 +946,12 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
       } else if (PNG.test(active)) {
         if (e.surface === 'terminal') {
           const { Image } = $.ui.resolve(e)
+          const png = await pngData($, active, `${stat.mtimeMs}|${stat.size}`).catch(() => undefined)
           fileColumn = frame(
             `${relative} · ${formatSize(stat.size)}`,
-            <Image source={{ file: active, format: 'png', generation: stat.mtimeMs }} columns={clamp(fileWidth, 1, 255)} rows={clamp(contentRows, 1, 255)} alt={`이미지 ${baseName(active)} (kitty·Ghostty 터미널에서 보여요)`} />,
+            png === undefined
+              ? <Text dimColor>이 PNG는 창 안에 그리지 않아요 (2 MB 초과 또는 PNG 형식이 아님).</Text>
+              : <Image source={{ png }} columns={clamp(fileWidth, 1, 255)} rows={clamp(contentRows, 1, 255)} alt={`이미지 ${baseName(active)} (kitty·Ghostty 터미널에서 보여요)`} />,
           )
         } else {
           fileColumn = frame(relative, <Text dimColor>이 화면에서는 이미지를 그릴 수 없어요.</Text>)
@@ -1252,6 +1291,8 @@ async function drawHwp(
     if (e.surface === 'terminal') {
       if (shot.pngPath === undefined) return { info, body: <Text dimColor>쪽 그림(PNG)을 만들 도구가 없어요. 문서 보기(v)를 쓰거나 rsvg-convert를 설치해 주세요.</Text> }
       const { Image } = $.ui.resolve(e)
+      const png = await pngData($, shot.pngPath, pageKey).catch(() => undefined)
+      if (png === undefined) return { info, body: <Text dimColor>쪽 그림을 읽지 못했어요. v로 문서 보기, o로 미리보기에서 열기</Text> }
       const aspect = (shot.pngHeight ?? 1) / (shot.pngWidth ?? 1)
       let columns = clamp(fileWidth, 1, 255)
       let rows = Math.round((columns * aspect) / 2)
@@ -1261,7 +1302,7 @@ async function drawHwp(
       }
       return {
         info,
-        body: <Image source={{ file: shot.pngPath, format: 'png' }} columns={columns} rows={clamp(rows, 1, 255)} alt={`${alt}: 이 터미널은 그림을 못 그려요(kitty·Ghostty 필요). v로 문서 보기, o로 미리보기에서 열기`} />,
+        body: <Image source={{ png }} columns={columns} rows={clamp(rows, 1, 255)} alt={`${alt}: 이 터미널은 그림을 못 그려요(kitty·Ghostty 필요). v로 문서 보기, o로 미리보기에서 열기`} />,
       }
     }
     if (e.surface === 'desktop' || e.surface === 'vscode' || e.surface === 'mobile') {

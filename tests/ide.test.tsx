@@ -5,6 +5,8 @@ import { blockStarts, captionFor, describeCall, fit, shortModel, styleGate } fro
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
 const ROOT = '/work'
+// 1×1 PNG (엔진이 IHDR까지 검사한다)
+const TINY_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC'
 const SLOP = '이것은 단순한 도구가 아니라 동반자다. 결론적으로 혁신적이고 획기적인 변화다. 요약하면 이제 나아가야 할 때입니다. 그것은 기술이 아니라 문화다. 우리는 모두 함께 앞으로 걸어가야 한다는 사실을 잊지 말아야 한다.'
 const LONG = Array.from({ length: 100 }, (_, i) => `const line${i + 1} = ${i + 1}`).join('\n')
 const FILES: Record<string, string> = {
@@ -13,9 +15,10 @@ const FILES: Record<string, string> = {
   '/work/src/long.ts': LONG,
   '/work/doc.hwpx': 'PK-가짜-hwpx',
   '/work/draft.md': SLOP,
+  '/work/pic.png': 'PNG',
 }
 const DIRS: Record<string, string[]> = {
-  '/work': ['src', 'link', 'README.md', 'doc.hwpx', 'draft.md', '.DS_Store'],
+  '/work': ['src', 'link', 'README.md', 'doc.hwpx', 'draft.md', 'pic.png', '.DS_Store'],
   '/work/src': ['app.ts', 'long.ts'],
 }
 // /work/link → /work/src 를 가리키는 심볼릭 링크
@@ -41,7 +44,8 @@ function fakeWorld(on: On): World {
     if (target in DIRS) return { value: { kind: 'dir' as const, size: 0, mtimeMs: 1, isLink, realPath: target } }
     const text = FILES[target]
     if (text === undefined) throw new Error('ENOENT')
-    return { value: { kind: 'file' as const, size: text.length, mtimeMs: 1, isLink, realPath: target } }
+    // 실제 파일 시스템처럼 수정 시각에 소수가 붙는다
+    return { value: { kind: 'file' as const, size: text.length, mtimeMs: 1791255799123.456, isLink, realPath: target } }
   })
   on('fs.list', ($, e) => {
     const dir = real(e.path)
@@ -55,6 +59,7 @@ function fakeWorld(on: On): World {
     }
   })
   on('fs.read', ($, e) => {
+    if (e.as === 'bytes') return { value: { base64: TINY_PNG } }
     const text = FILES[real(e.path)]
     if (text === undefined) throw new Error('ENOENT')
     return { value: text }
@@ -341,7 +346,7 @@ describe('HWP 뷰어 (rhwp)', () => {
     await ui.press({ key: 'hwp-view' })
     await clock.advance(5)
     const image = await ui.find({ type: 'Image' })
-    expect(image?.props.source).toEqual({ file: '/tmp/page.png', format: 'png' })
+    expect(image?.props.source).toEqual({ png: TINY_PNG })
     expect(String(image?.props.alt)).toContain('o로 미리보기')
     await ui.press({ key: 'hwp-next' })
     await clock.advance(5)
@@ -357,6 +362,16 @@ describe('HWP 뷰어 (rhwp)', () => {
     await clock.advance(5)
     expect(await desk.find({ type: 'Svg' })).toBeDefined()
     await desk.unmount()
+  })
+})
+
+describe('그림 파일', () => {
+  test('PNG는 base64로 넘기고, 수정 시각에 소수가 있어도 창이 그려진다', async ($, on) => {
+    fakeWorld(on)
+    await $.command.run(typed('open', '/work/pic.png'))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    expect((await ui.find({ type: 'Image' }))?.props.source).toEqual({ png: TINY_PNG })
+    await ui.unmount()
   })
 })
 
