@@ -95,6 +95,7 @@ function fakeWorld(on: On): World {
   })
   on('ui.toast', () => ({ value: undefined }) as never)
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  on('prompt.submit', ($, e) => ({ text: e.text }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('process.run', ($, e) => {
     world.rhwpCalls.push(e.argv.slice(2).join(' '))
@@ -123,6 +124,12 @@ function fakeWorld(on: On): World {
   })
   on('store.keys', () => ({ value: [] }))
   return world
+}
+
+/** 사람이 입력창에서 보낸 요청: prompt.submit(composer) 뒤에 그 턴이 시작된다 */
+async function ask($: Parameters<Parameters<typeof test>[1]>[0], text: string, turnId: string) {
+  await $.prompt.submit({ text, origin: { kind: 'composer' } } as never)
+  await $.turn.start({ text, turnId })
 }
 
 const typed = (command: string, args: string) => ({
@@ -267,7 +274,7 @@ describe('에이전트 보드', () => {
     const world = fakeWorld(on)
     on('agent.spawn', () => ({ model: 'claude-haiku-4-5-20251001', agentId: 'sub-1' }))
     await $.command.run(typed('ide', ''))
-    await $.turn.start({ text: '로그인 버그 고쳐줘', turnId: 't1' })
+    await ask($, '로그인 버그 고쳐줘', 't1')
     await $.agent.spawn(spawn('sub-1', '인증 코드 찾기', 'Explore'))
     await $.tool.call({ tool: 'Grep', pattern: 'login', agentId: 'sub-1' } as never)
 
@@ -306,7 +313,7 @@ describe('에이전트 보드', () => {
   test('오류로 끝난 서브에이전트는 실패로 표시한다', async ($, on) => {
     fakeWorld(on)
     on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'sub-err' }))
-    await $.turn.start({ text: '작업', turnId: 't1' })
+    await ask($, '작업', 't1')
     await $.agent.spawn(spawn('sub-err', '깨질 작업', 'general-purpose'))
     await $.turn.complete({ answer: '', durationMs: 10, isAborted: false, turnId: 't3', agentId: 'sub-err', reason: 'error' } as never)
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
@@ -318,7 +325,7 @@ describe('에이전트 보드', () => {
 
   test('spawn 없이 온 내부 포크는 보드에 줄을 만들지 않는다', async ($, on) => {
     fakeWorld(on)
-    await $.turn.start({ text: '작업', turnId: 't1' })
+    await ask($, '작업', 't1')
     await $.tool.call({ tool: 'Read', file_path: '/work/README.md', agentId: 'compaction-fork' } as never)
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
     const text = textOf(await ui.findAll({ type: 'Text' }))
@@ -330,7 +337,7 @@ describe('에이전트 보드', () => {
     fakeWorld(on)
     let n = 0
     on('agent.spawn', () => ({ model: 'claude-haiku-4-5-20251001', agentId: n++ === 0 ? 'parent' : 'child' }))
-    await $.turn.start({ text: '작업', turnId: 't1' })
+    await ask($, '작업', 't1')
     await $.agent.spawn(spawn('parent', '부모 작업', 'Plan'))
     await $.agent.spawn({ ...spawn('child', '손자 작업', 'Explore'), parentAgentId: 'parent' })
     await $.turn.complete({ answer: '부모 끝', durationMs: 10, isAborted: false, turnId: 't4', agentId: 'parent', reason: 'answer' } as never)
@@ -434,9 +441,9 @@ describe('그림 파일', () => {
 describe('요청 기록', () => {
   test('보낸 요청이 쌓이고 끝나면 답 첫 줄과 함께 완료로 바뀐다', async ($, on) => {
     const world = fakeWorld(on)
-    await $.turn.start({ text: '로그인 버그 고쳐줘', turnId: 't1' })
+    await ask($, '로그인 버그 고쳐줘', 't1')
     await $.turn.complete({ answer: '고쳤어요. login.ts 42행이 원인', durationMs: 50, isAborted: false, turnId: 't1', reason: 'answer' } as never)
-    await $.turn.start({ text: '테스트도 추가해줘', turnId: 't2' })
+    await ask($, '테스트도 추가해줘', 't2')
     await $.command.run(typed('ide', ''))
 
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
@@ -474,18 +481,29 @@ describe('핸드오프', () => {
   })
 
   test('핸드오프 글에 세션 ID·기록 경로·이어서 열기 명령·요청이 들어간다', () => {
-    const note = handoffNote({ id: 'abc', root: '/my proj', transcript: '/c/projects/-my-proj/abc.jsonl' }, [{ n: 1, text: '로그인 고쳐줘', at: Date.now(), status: 'done', answer: '고쳤어요' }], '테스트 돌리는 중', '3장만')
+    const note = handoffNote(
+      { id: 'abc', root: '/my proj', transcript: '/c/projects/-my-proj/abc.jsonl' },
+      [
+        { n: 1, text: '로그인 고쳐줘\n에러 로그도 봐줘', at: Date.now(), status: 'done', answer: '고쳤어요' },
+        { n: 2, text: '<task-notification>agent finished</task-notification>', at: Date.now(), status: 'done', answer: '' },
+      ],
+      '테스트 돌리는 중',
+      '3장만',
+    )
     expect(note).toContain('세션 ID: abc')
     expect(note).toContain('대화 기록: /c/projects/-my-proj/abc.jsonl')
     expect(note).toContain("이어서 열기: cd '/my proj' && claude --resume abc --fork-session")
     expect(note).toContain('메모: 3장만')
-    expect(note).toContain('지금 상태: 테스트 돌리는 중')
-    expect(note).toMatch(/#1 .*✓ 로그인 고쳐줘 → 고쳤어요/)
+    expect(note).toContain('에이전트가 마지막에 하던 일: 테스트 돌리는 중')
+    expect(note).toContain('사용자가 보낸 요청 1개 (오래된 것부터):')
+    expect(note).toMatch(/1\. \[\d\d:\d\d\] 로그인 고쳐줘\n {3}에러 로그도 봐줘/)
+    expect(note).not.toContain('고쳤어요')
+    expect(note).not.toContain('task-notification')
   })
 
   test('보드의 i로 핸드오프 화면을 열고, 세션을 누르면 그 세션에 보낸다', async ($, on) => {
     const world = fakeWorld(on)
-    await $.turn.start({ text: '로그인 버그 고쳐줘', turnId: 't1' })
+    await ask($, '로그인 버그 고쳐줘', 't1')
     await $.command.run(typed('ide', ''))
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
     expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('세션 test-ses')
@@ -510,6 +528,23 @@ describe('핸드오프', () => {
     expect(JSON.stringify(out)).toContain('핸드오프를 보냈어요 → 목차작성')
     expect(world.sent[0].to).toBe('목차작성 [ed478e]')
     expect(world.sent[0].text).toContain('메모: 3장 검토 부탁')
+  })
+})
+
+describe('요청 기록 거르기', () => {
+  test('작업 알림으로 시작한 턴은 요청으로 적지 않고 메인 작업 줄도 그대로 둔다', async ($, on) => {
+    const world = fakeWorld(on)
+    await ask($, '로그인 버그 고쳐줘', 't1')
+    await $.turn.start({ text: '<task-notification>Agent "Explore" finished</task-notification>', turnId: 't2' })
+    await $.command.run(typed('ide', ''))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    await ui.press({ key: 'left-mode' })
+    const text = textOf(await ui.findAll({ type: 'Text' }))
+    expect(text).toContain('이번 세션 요청 1개 전부')
+    expect(text).not.toContain('task-notification')
+    expect(text).toContain('로그인 버그 고쳐줘')
+    expect(JSON.stringify(world.saved)).not.toContain('task-notification')
+    await ui.unmount()
   })
 })
 

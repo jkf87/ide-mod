@@ -214,7 +214,13 @@ function registerAgents(on: On) {
 
   // 사람이 프롬프트를 보내면 메인 에이전트의 작업이 새로 정해진다 (서브에이전트는 turn.start가 없다)
   on('turn.start', async ($, e, next) => {
-    if (e.text.trim() !== '') {
+    // 사람이 보낸 요청으로 시작한 턴만 메인 작업을 바꾼다. 백그라운드 작업 알림·다른 세션 메시지로 시작한 턴은
+    // 작업 줄은 두고 "지금 하는 일"만 바꾼다 (그 글은 사람이 쓴 게 아니라서 요청 기록에도 넣지 않는다)
+    const isPersonTurn = e.text.trim() !== '' && (await requestTurnStarted($, e.text, e.turnId).catch(() => false))
+    if (!isPersonTurn && e.text.trim() !== '') {
+      await patch($, MAIN, row => ({ ...row, role: 'main', phase: 'running', activity: '알림·메시지 처리 중', updatedAt: Date.now(), endedAt: undefined }))
+    }
+    if (isPersonTurn) {
       await patch($, MAIN, row => ({
         ...row,
         role: 'main',
@@ -228,7 +234,6 @@ function registerAgents(on: On) {
         updatedAt: Date.now(),
         endedAt: undefined,
       }))
-      await requestTurnStarted($, e.text, e.turnId).catch(() => undefined)
       await setCaption($, '요청을 읽고 계획을 세우는 중이에요', true).catch(() => undefined)
     }
     return next(e)
@@ -979,7 +984,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
           <Text dimColor={sent === null} color={sent === null ? undefined : sent.ok ? 'success' : 'error'} wrap="truncate-end">{note}</Text>
           <Box flexDirection="column" height={Math.max(1, mainRows - 2)} overflow="hidden">
             {lines.slice(offset).map((line, i) => (
-              <Text key={`handoff-line:${offset + i}`} color={line.startsWith('세션 ID') || line.startsWith('이어서 열기') ? 'warning' : undefined} dimColor={line.startsWith('#')}>
+              <Text key={`handoff-line:${offset + i}`} color={/^\d+\. \[|^ {3}\S/.test(line) ? 'success' : line.startsWith('세션 ID') || line.startsWith('이어서 열기') ? 'warning' : undefined}>
                 {line === '' ? ' ' : line}
               </Text>
             ))}
@@ -1175,7 +1180,8 @@ async function sessionInfo($: EngineInterface): Promise<SessionInfo> {
 
 /** 다른 에이전트가 읽고 바로 이어받을 수 있는 핸드오프 글 */
 export function handoffNote(info: SessionInfo, requests: RequestItem[], status: string, memo = '') {
-  const recent = requests.slice(-12)
+  const prompts = requests.filter(r => !isMachineText(r.text))
+  const recent = prompts.slice(-20)
   const lines = [
     '[핸드오프] Claude Code 세션을 이어받아 주세요.',
     '',
@@ -1185,11 +1191,16 @@ export function handoffNote(info: SessionInfo, requests: RequestItem[], status: 
     `이어서 열기: cd ${shellQuote(info.root)} && claude --resume ${info.id} --fork-session`,
   ]
   if (memo.trim() !== '') lines.push('', `메모: ${memo.trim()}`)
-  if (status !== '') lines.push('', `지금 상태: ${status}`)
   if (recent.length > 0) {
-    lines.push('', `받은 요청 ${requests.length}개 중 최근 ${recent.length}개 (오래된 것부터):`)
-    for (const r of recent) lines.push(`#${r.n} ${dayClock(r.at)} ${REQUEST_ICON[r.status]} ${oneLine(r.text, 300)}${r.answer !== '' ? ` → ${oneLine(r.answer, 160)}` : ''}`)
+    lines.push('', `사용자가 보낸 요청 ${prompts.length}개${prompts.length > recent.length ? ` 중 최근 ${recent.length}개` : ''} (오래된 것부터):`)
+    for (const [i, r] of recent.entries()) {
+      const [first, ...rest] = r.text.trim().split('\n')
+      lines.push(`${prompts.length - recent.length + i + 1}. [${dayClock(r.at)}${r.status === 'running' ? ' · 진행 중' : r.status === 'stopped' ? ' · 중단' : ''}] ${oneLine(first, 400)}`)
+      const more = rest.join(' ').trim()
+      if (more !== '') lines.push(`   ${oneLine(more, 400)}`)
+    }
   }
+  if (status !== '') lines.push('', `에이전트가 마지막에 하던 일: ${status}`)
   lines.push('', '먼저 대화 기록 파일을 읽어 맥락을 잡고, 이어서 할 일을 정리해 알려 주세요.')
   return lines.join('\n')
 }
@@ -1257,11 +1268,17 @@ async function saveRequests($: EngineInterface) {
 }
 
 /** 세션을 이어 열었거나 모드가 다시 로드됐을 때 저장해 둔 요청을 되살리고, 오래된 세션 기록은 정리한다 */
+/** 사람이 쓴 글이 아닌 것: 백그라운드 작업 알림, 시스템 알림, 다른 세션·팀원이 보낸 메시지 */
+export const isMachineText = (text: string) =>
+  /^\s*(<(task-notification|system-reminder|teammate-message|peer-message|cross-session-message)\b|\[SYSTEM NOTIFICATION)/i.test(text)
+
 async function loadRequests($: EngineInterface) {
   const id = await $.session.id()
   if ((await read($, requestsAtom)).length === 0) {
     const saved = (await $.store.get(`${STORE_PREFIX}${id}`)) as { items?: RequestItem[] } | undefined
-    if (Array.isArray(saved?.items) && saved.items.length > 0) await update($, requestsAtom, () => saved.items as RequestItem[])
+    // 0.5.0까지는 작업 알림·다른 세션 메시지로 시작한 턴도 요청으로 적었다: 불러올 때 걸러 낸다
+    const items = Array.isArray(saved?.items) ? saved.items.filter(r => !isMachineText(r.text)) : []
+    if (items.length > 0) await update($, requestsAtom, () => items)
   }
   const keys = (await $.store.keys()).filter(k => k.startsWith(STORE_PREFIX))
   if (keys.length <= STORE_SESSIONS) return
@@ -1280,18 +1297,19 @@ async function addRequest($: EngineInterface, text: string, turnId: string | und
   await saveRequests($)
 }
 
-/** 턴이 시작되면 그 글을 보낸 요청과 잇는다. 키보드를 거치지 않은 요청(다른 플러그인이 보낸 것 등)은 여기서 새로 기록한다 */
+/** 턴이 시작되면 그 글을 보낸 요청(사람이 입력창·원격·SDK로 보낸 것)과 잇는다. 이어지면 true.
+ *  사람이 보낸 요청이 아닌 턴(작업 알림, 다른 세션의 메시지 등)은 기록하지 않는다 */
 async function requestTurnStarted($: EngineInterface, text: string, turnId: string) {
   const wanted = text.trim()
-  let isNew = false
+  let isLinked = false
   await update($, requestsAtom, list => {
-    const at = [...list].reverse().find(r => r.status === 'running' && r.turnId === undefined && r.text.trim() === wanted)
-    if (at !== undefined) return list.map(r => (r === at ? { ...r, turnId } : r))
-    isNew = true
-    const n = (list[list.length - 1]?.n ?? 0) + 1
-    return [...list, { n, text: wanted.slice(0, 8000), at: Date.now(), status: 'running' as const, turnId, answer: '' }].slice(-MAX_REQUESTS)
+    const at = [...list].reverse().find(r => r.status === 'running' && (r.turnId === undefined || r.turnId === turnId) && r.text.trim() === wanted)
+    if (at === undefined) return list
+    isLinked = true
+    return list.map(r => (r === at ? { ...r, turnId } : r))
   })
-  if (isNew) await saveRequests($)
+  if (isLinked) await saveRequests($)
+  return isLinked
 }
 
 async function requestTurnEnded($: EngineInterface, turnId: string, answer: string, isStopped: boolean) {
@@ -1638,15 +1656,15 @@ export const register: Register = on => {
   })
 
   // 사람이 보낸 요청을 기록한다 (키보드·원격 조종·SDK에서 온 것만, 인자 없는 슬래시 명령은 빼고)
+  // 턴이 시작되기 전에 기록해 두어야 turn.start가 그 요청과 이을 수 있다
   on('prompt.submit', async ($, e, next) => {
-    const result = await next(e)
     try {
       const text = e.text.trim()
       if (REQUEST_ORIGINS.includes(e.origin.kind) && text !== '' && !/^\/[\w:.-]+$/.test(text)) await addRequest($, text, e.turnId)
     } catch {
       // 기록은 덤이라 실패해도 프롬프트는 그대로 간다
     }
-    return result
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   registerAgents(on)
