@@ -266,11 +266,13 @@ describe('에이전트 보드', () => {
       await ui.unmount()
     }
     expect(world.statuses.some(s => s?.includes('서브에이전트 1개'))).toBe(true)
-    // 색: 사람이 입력한 프롬프트(메인 작업)는 초록, 돌고 있는 에이전트의 지금 하는 일은 노랑
+    // 색: 맡긴 일(사람의 프롬프트·서브에이전트 작업 설명)은 초록, 돌고 있는 에이전트의 지금 하는 일은 노랑
     const colored = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
     const texts = await colored.findAll({ type: 'Text' })
     expect(texts.find(x => x.text.includes('로그인 버그 고쳐줘') && x.props.color === 'success')).toBeDefined()
     expect(texts.find(x => x.text.includes('Grep') && x.props.color === 'warning')).toBeDefined()
+    // 서브에이전트에게 맡긴 작업 설명도 초록
+    expect(texts.find(x => x.text.includes('인증 코드 찾기') && x.props.color === 'success')).toBeDefined()
     await colored.unmount()
 
     await $.turn.complete({ answer: '## 찾았다\nlogin.ts 42행', durationMs: 1200, isAborted: false, turnId: 't2', agentId: 'sub-1', reason: 'answer' } as never)

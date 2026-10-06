@@ -385,8 +385,8 @@ async function drawBoard($: EngineInterface, e: RenderInput<'Pane'>, width: numb
         <Text bold color={row.id === MAIN ? 'claude' : colorOf(row.role)}>{row.id === MAIN ? '메인' : row.role}</Text>
         <Text>  {brain}</Text>
         <Text dimColor>  {PHASE_LABEL[row.phase]} {elapsed}{row.isBackground ? ' · 백그라운드' : ''}{row.toolCount > 0 ? ` · 도구 ${row.toolCount}` : ''}</Text>
-        {/* 메인의 작업은 사람이 입력한 프롬프트라 초록색 */}
-        <Text color={row.id === MAIN ? 'success' : undefined}>{row.task !== '' ? `  ${oneLine(row.task, 80)}` : ''}</Text>
+        {/* 맡긴 일(메인은 사람이 입력한 프롬프트, 서브에이전트는 받은 작업 설명)은 초록색 */}
+        <Text color="success">{row.task !== '' ? `  ${oneLine(row.task, 80)}` : ''}</Text>
       </Text>,
     )
     if (body !== '') {
