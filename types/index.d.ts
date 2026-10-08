@@ -149,6 +149,10 @@ declare module 'claude-code' {
       /** full: 출처마다 한 줄, compact: 한 줄, off: 숨김 */
       limitsLayout: 'full' | 'compact' | 'off'
 
+      // ── 자동으로 열기 ──
+      /** 이 세션에서 IDE 창을 저절로 한 번 열었는지 (/reload-plugins 뒤에 다시 열지 않게) */
+      autoOpened: boolean
+
       // ── 핸드오프 ──
       /** ListAgents로 받은 다른 세션들 (핸드오프 화면을 열 때·r로 새로 받음) */
       peers: PeerRow[]

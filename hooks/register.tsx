@@ -33,6 +33,8 @@ const LIST_PHASE: Record<string, AgentPhase> = {
 // 재로드되면 처음부터 다시 세는 값들: 화면이 읽는 값은 전부 $.state에 둔다
 let isInteractive = true
 let timersStarted = false
+let autoOpenDefault = true
+let isAutoOpenPending = false
 let isRecapping = false
 let recapFailures = 0
 let lastStatus: string | undefined
@@ -1886,6 +1888,10 @@ async function drawLimits($: EngineInterface, e: RenderInput<'AbovePrompt'>, wid
   const { Box, Text } = $.ui.resolve(e)
   lastBandAt = Date.now()
   startTimers($)
+  if (isAutoOpenPending) {
+    isAutoOpenPending = false
+    $.clock.after(0, () => void autoOpenIde($).catch(() => undefined))
+  }
   const layout = await read($, limitsLayoutAtom)
   if (layout === 'off') return []
   const l = await read($, limitsAtom)
@@ -1927,11 +1933,32 @@ async function drawLimits($: EngineInterface, e: RenderInput<'AbovePrompt'>, wid
   ))
 }
 
+
+// ════════════════ 세션 시작 때 IDE 창 열기 ════════════════
+const autoOpenedAtom = atom({ plugin: 'ide-mod', key: 'autoOpened' } as const, false)
+const AUTO_OPEN_KEY = 'autoOpen'
+
+/** 설정(userConfig auto_open)보다 /ide auto on|off로 정한 값이 먼저다 */
+async function isAutoOpenOn($: EngineInterface) {
+  const saved = await $.store.get(AUTO_OPEN_KEY).catch(() => undefined)
+  return typeof saved === 'boolean' ? saved : autoOpenDefault
+}
+
+/** 세션마다 한 번만 연다: 터미널은 session.start에서, 데스크톱 앱처럼 시작 때 화면이 없으면 처음 그릴 때 */
+async function autoOpenIde($: EngineInterface) {
+  isAutoOpenPending = false
+  if (await read($, autoOpenedAtom)) return
+  if (!(await isAutoOpenOn($))) return
+  await update($, autoOpenedAtom, () => true)
+  await $.ui.open({ id: PANE, title: 'IDE', rows: 36, columns: 150 }).catch(() => undefined)
+}
+
 // ════════════════ 연결 ════════════════
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  autoOpenDefault = options?.auto_open !== false
   on('session.start', async ($, e, next) => {
     // 이름이 다른 플러그인과 겹쳐 하나가 거절돼도 나머지는 등록되게 따로 부른다
-    await $.command.register({ name: 'ide', description: 'IDE 창: 에이전트 보드 + 파일 트리 + 탭 에디터', argumentHint: '[경로]' }).catch(() => undefined)
+    await $.command.register({ name: 'ide', description: 'IDE 창: 에이전트 보드 + 파일 트리 + 탭 에디터 (auto on|off: 세션 시작 때 자동으로 열기)', argumentHint: '[경로|auto on|auto off]' }).catch(() => undefined)
     startAgents($, e.isInteractive)
     await $.command.register({ name: 'open', description: 'IDE 창에서 폴더나 파일을 엽니다', argumentHint: '[경로]' }).catch(() => undefined)
     await $.command.register({ name: 'lecture', description: '강의 모드: Claude가 하는 일을 입력창 위에 쉬운 한국어 자막으로', argumentHint: '[on|off]' }).catch(() => undefined)
@@ -1939,10 +1966,21 @@ export const register: Register = on => {
     await $.command.register({ name: 'limits', description: '입력창 위 사용 한도 띠 (Claude·Codex·Antigravity)', argumentHint: '[full|compact|off|refresh]' }).catch(() => undefined)
     await $.command.register({ name: 'style-gate', description: '한국어 문체 게이트: 원고의 AI티 지표를 검사 (자동 검사 on/off)', argumentHint: '[파일|on|off]' }).catch(() => undefined)
     await loadRequests($).catch(() => undefined)
-    return next(e)
+    const started = await next(e)
+    if (e.isInteractive) await autoOpenIde($).catch(() => undefined)
+    else isAutoOpenPending = true
+    return started
   })
 
-  on('command.run', { command: 'ide' }, async ($, e) => ({ text: await openIde($, e.args ?? '') }))
+  on('command.run', { command: 'ide' }, async ($, e) => {
+    const auto = (e.args ?? '').trim().match(/^auto(?:\s+(on|off))?$/)
+    if (auto !== null) {
+      if (auto[1] !== undefined) await $.store.set(AUTO_OPEN_KEY, auto[1] === 'on')
+      const isOn = await isAutoOpenOn($)
+      return { text: `세션을 시작할 때 IDE 창 자동 열기: ${isOn ? '켜짐' : '꺼짐'} (/ide auto ${isOn ? 'off' : 'on'}로 바꾸기)` }
+    }
+    return { text: await openIde($, e.args ?? '') }
+  })
   on('command.run', { command: 'open' }, async ($, e) => ({ text: await openIde($, e.args ?? '.') }))
 
   on('command.run', { command: 'lecture' }, async ($, e) => {

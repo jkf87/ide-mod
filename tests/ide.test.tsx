@@ -32,7 +32,7 @@ const real = (p: string) => {
   return abs
 }
 
-type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined }
+type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined; store: Map<string, unknown> }
 
 const LISTING = `This session is 모드에 대해 [634505] — the name other sessions use to message it.
 
@@ -41,7 +41,7 @@ Peer sessions (2):
   목차작성 [ed478e]  ·  interactive  ·  busy  ·  started 3h ago`
 
 function fakeWorld(on: On): World {
-  const world: World = { opened: 0, statuses: [], rhwpCalls: [], scripts: [], sent: [], copied: [] }
+  const world: World = { opened: 0, statuses: [], rhwpCalls: [], scripts: [], sent: [], copied: [], store: new Map() }
   on('session.cwd', () => ({ value: ROOT }))
   on('env.get', () => ({ value: '/home/me' }))
   on('fs.stat', ($, e) => {
@@ -122,9 +122,11 @@ function fakeWorld(on: On): World {
     return <Box />
   })
   on('session.id', () => ({ value: 'test-session' }))
-  on('store.get', () => ({ value: undefined }) as never)
+  on('store.get', ($, e) => ({ value: world.store.get(String((e as unknown as { key: string }).key)) }) as never)
   on('store.set', ($, e) => {
-    world.saved = (e as unknown as { value: unknown }).value
+    const { key, value } = e as unknown as { key: string; value: unknown }
+    world.store.set(String(key), value)
+    if (String(key).startsWith('requests:')) world.saved = value
     return { value: undefined } as never
   })
   on('store.keys', () => ({ value: [] }))
@@ -636,6 +638,16 @@ describe('사용 한도 띠', () => {
     await clock.advance(100)
     expect(textOf(await band.findAll({ type: 'Text' }))).toContain('주간 27%')
     await band.unmount()
+  })
+})
+
+describe('세션 시작 때 열기', () => {
+  test('/ide auto off|on으로 자동 열기를 바꾸고 저장한다', async ($, on) => {
+    const world = fakeWorld(on)
+    expect(JSON.stringify(await $.command.run(typed('ide', 'auto')))).toContain('자동 열기: 켜짐')
+    expect(JSON.stringify(await $.command.run(typed('ide', 'auto off')))).toContain('자동 열기: 꺼짐')
+    expect(world.store.get('autoOpen')).toBe(false)
+    expect(JSON.stringify(await $.command.run(typed('ide', 'auto on')))).toContain('자동 열기: 켜짐')
   })
 })
 
