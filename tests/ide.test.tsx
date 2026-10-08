@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { blockStarts, captionFor, describeCall, fit, handoffNote, isMachineText, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, styleGate } from '../hooks/register'
+import { blockStarts, captionFor, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, styleGate, untilReset } from '../hooks/register'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
 const ROOT = '/work'
@@ -32,7 +32,7 @@ const real = (p: string) => {
   return abs
 }
 
-type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[] }
+type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined }
 
 const LISTING = `This session is 모드에 대해 [634505] — the name other sessions use to message it.
 
@@ -98,6 +98,10 @@ function fakeWorld(on: On): World {
   on('prompt.submit', ($, e) => ({ text: e.text }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('process.run', ($, e) => {
+    const extra = world.extraRuns?.(e.argv.map(String))
+    if (extra !== undefined) return { value: { exitCode: 0, stdout: extra, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (e.argv[0] === '/bin/sh' && String(e.argv[2]).includes('agy')) return { value: { exitCode: 127, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (String(e.argv[1]).endsWith('codex-limits.mjs')) return { value: { exitCode: 1, stdout: '{"error":"no codex"}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     if (e.argv[0] === '/bin/sh') return { value: { exitCode: 0, stdout: SYS_MAC, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     world.rhwpCalls.push(e.argv.slice(2).join(' '))
     world.scripts.push(String(e.argv[1]).split('/').pop() ?? '')
@@ -586,6 +590,52 @@ describe('시스템 상태', () => {
     await ui.press({ key: 'sys-procs' })
     expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('Google Chrome 3.0GB · node 1.5GB · Finder 0.5GB')
     await ui.unmount()
+  })
+})
+
+// 2026-10-08 실제 응답에서 뽑은 모양
+const CLAUDE_USAGE = { five_hour: { utilization: 24.0, resets_at: '2026-10-08T15:00:00Z' }, seven_day: { utilization: 20.0, resets_at: '2026-10-13T14:00:00Z' }, limits: [{ kind: 'weekly_scoped', percent: 2, resets_at: '2026-10-13T14:00:00Z', scope: { model: { display_name: 'Fable' } } }, { kind: 'five_hour' }] }
+const CODEX_OUT = '{"primary":{"usedPercent":27,"windowDurationMins":10080,"resetsAt":1791948528},"secondary":{"usedPercent":81,"windowDurationMins":300,"resetsAt":1791900000}}'
+const AGY_OUT = 'Gemini Models\tWeekly Limit Remaining\t94%\t2026-10-14T03:39:45Z\nGemini Models\tFive Hour Limit Remaining\t97%\t2026-10-08T17:01:49Z\nClaude and GPT models\tWeekly Limit Remaining\t100%\t2026-10-15T14:04:10Z\nClaude and GPT models\tFive Hour Limit Remaining\t100%\t2026-10-08T19:04:10Z'
+
+describe('사용 한도 띠', () => {
+  test('Claude·Codex·Antigravity 응답을 쓴 비율로 읽는다', () => {
+    expect(parseClaudeUsage(CLAUDE_USAGE)).toEqual([
+      { label: '5시간', pct: 24, resetsAt: Date.parse('2026-10-08T15:00:00Z') },
+      { label: '주간', pct: 20, resetsAt: Date.parse('2026-10-13T14:00:00Z') },
+      { label: 'Fable', pct: 2, resetsAt: Date.parse('2026-10-13T14:00:00Z') },
+    ])
+    expect(parseCodexLimits(CODEX_OUT).map(w => [w.label, w.pct])).toEqual([['5시간', 81], ['주간', 27]])
+    expect(parseCodexLimits('{"error":"no codex"}')).toEqual([])
+    const agy = parseAgyUsage(AGY_OUT)
+    expect(agy.map(g => [g.group, g.windows.map(w => `${w.label} ${w.pct}`)])).toEqual([['Gemini', ['5시간 3', '주간 6']], ['Claude·GPT', ['5시간 0', '주간 0']]])
+    expect(untilReset(Date.now() + 44 * 60_000 + 10_000)).toBe('44분 후')
+    expect(untilReset(Date.now() + (5 * 1440 + 60) * 60_000 + 10_000)).toBe('5일 1시간 후')
+  })
+
+  test('입력창 위에 출처마다 한 줄, 많이 쓴 창은 색으로', async ($, on) => {
+    const world = fakeWorld(on)
+    const clock = mock.clock(on)
+    on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [], context: { window: 1_000_000, percent: 31 } } }) as never)
+    on('session.authorize', () => ({ value: { handle: 'h', kind: 'bearer' } }))
+    on('http.fetch', () => ({ value: { status: 200, ok: true, headers: {}, text: JSON.stringify(CLAUDE_USAGE) } }) as never)
+    world.extraRuns = (argv: string[]) => (String(argv[1]).endsWith('codex-limits.mjs') ? CODEX_OUT : argv[0] === '/bin/sh' && String(argv[2]).includes('agy') ? AGY_OUT : undefined)
+    const band = await $.ui.mount({ ...BAND, surface: 'terminal', props: bandProps })
+    await clock.advance(1_000)
+    const texts = await band.findAll({ type: 'Text' })
+    const all = textOf(texts)
+    expect(all).toContain('Claude')
+    expect(all).toMatch(/5시간 ██▍?░+\s+24%/)
+    expect(all).toContain('Fable')
+    expect(all).toContain('컨텍스트 31%')
+    expect(all).toContain('Codex')
+    expect(texts.find(t => t.text.startsWith('5시간') && t.text.includes('81%'))?.props.color).toBe('warning')
+    expect(all).toContain('Antigravity')
+    expect(all).toContain('Gemini 5시간')
+    await $.command.run(typed('limits', 'compact'))
+    await clock.advance(100)
+    expect(textOf(await band.findAll({ type: 'Text' }))).toContain('주간 27%')
+    await band.unmount()
   })
 })
 

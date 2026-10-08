@@ -44,6 +44,21 @@ export type SysStat = {
   top: { name: string; bytes: number }[]
 }
 
+/** 사용 한도 창 하나: 쓴 비율(0~100)과 리셋 시각(ms) */
+export type LimitWindow = { label: string; pct: number; resetsAt?: number }
+
+export type LimitsSnapshot = {
+  /** Claude: 5시간·주간·모델별 주간, 컨텍스트 사용률 */
+  claude: LimitWindow[]
+  context?: number
+  codex: LimitWindow[]
+  /** Antigravity: Gemini·Claude·GPT 각각 5시간·주간 */
+  agy: { group: string; windows: LimitWindow[] }[]
+  /** 각 출처를 마지막으로 받은 시각, 받지 못한 이유 */
+  at: { claude?: number; codex?: number; agy?: number }
+  errors: { claude?: string; codex?: string; agy?: string }
+}
+
 export type PeerRow = {
   name: string
   ref: string
@@ -128,6 +143,11 @@ declare module 'claude-code' {
       sys: SysStat | null
       /** 메모리를 많이 쓰는 앱 줄을 펼쳤는지 */
       showProcs: boolean
+
+      // ── 사용 한도 띠 (입력창 위) ──
+      limits: LimitsSnapshot
+      /** full: 출처마다 한 줄, compact: 한 줄, off: 숨김 */
+      limitsLayout: 'full' | 'compact' | 'off'
 
       // ── 핸드오프 ──
       /** ListAgents로 받은 다른 세션들 (핸드오프 화면을 열 때·r로 새로 받음) */

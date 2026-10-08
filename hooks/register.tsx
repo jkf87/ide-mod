@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Color, EngineInterface, On, Register, RenderElement, RenderInput } from 'claude-code'
 
-import type { AgentPhase, AgentRow, Caption, GateCheck, GateResult, PeerRow, RequestItem, SysStat, ViewMode } from '../types'
+import type { AgentPhase, AgentRow, Caption, GateCheck, GateResult, LimitWindow, LimitsSnapshot, PeerRow, RequestItem, SysStat, ViewMode } from '../types'
 
 // ════════════════ 에이전트 보드 ════════════════
 const MAIN = 'main'
@@ -201,6 +201,7 @@ function startTimers($: EngineInterface) {
   timersStarted = true
   $.clock.every(RECAP_EVERY_MS, () => void recapStale($).catch(() => undefined))
   $.clock.every(SYS_EVERY_MS, () => void refreshSys($).catch(() => undefined))
+  $.clock.every(30_000, () => void refreshLimits($).catch(() => undefined))
   $.clock.every(5_000, () =>
     void (async () => {
       await reconcile($)
@@ -1725,6 +1726,207 @@ async function drawHwp(
   }
 }
 
+
+// ════════════════ 사용 한도 띠 (Claude·Codex·Antigravity) ════════════════
+// 입력창 위에 출처마다 한 줄. Claude는 세션 자격 증명으로 사용량 API를(없으면 엔진이 응답마다 주는 한도를),
+// Codex는 codex app-server를, Antigravity는 agy /usage를 읽는다. 띠가 화면에 있을 때만 받는다.
+
+const EMPTY_LIMITS: LimitsSnapshot = { claude: [], codex: [], agy: [], at: {}, errors: {} }
+const limitsAtom = atom({ plugin: 'ide-mod', key: 'limits' } as const, EMPTY_LIMITS)
+const limitsLayoutAtom = atom({ plugin: 'ide-mod', key: 'limitsLayout' } as const, 'full' as 'full' | 'compact' | 'off')
+const CLAUDE_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+const CLAUDE_EVERY_MS = 60_000
+const SLOW_EVERY_MS = 5 * 60_000
+const AGY_SCRIPT = 'for p in "$HOME/.local/bin/agy" /opt/homebrew/bin/agy /usr/local/bin/agy; do [ -x "$p" ] && exec "$p" --print-timeout 8s -p=/usage; done; command -v agy >/dev/null 2>&1 && exec agy --print-timeout 8s -p=/usage; exit 127'
+let lastBandAt = 0
+let isLimitsRunning = false
+let isLimitsRequested = false
+const nextAt = { claude: 0, codex: 0, agy: 0 }
+
+const windowLabel = (mins: number) => (mins === 300 ? '5시간' : mins === 10080 ? '주간' : mins % 1440 === 0 ? `${mins / 1440}일` : `${Math.round(mins / 60)}시간`)
+const toMs = (value: unknown) => {
+  if (typeof value === 'number') return value < 1e12 ? value * 1000 : value
+  if (typeof value === 'string' && value !== '') {
+    const ms = Date.parse(value)
+    return Number.isNaN(ms) ? undefined : ms
+  }
+  return undefined
+}
+const pctOf = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? Math.round(clamp(value, 0, 100)) : undefined)
+
+/** Claude 사용량 API 응답: five_hour·seven_day(utilization)와 limits[]의 모델별 주간(weekly_scoped, percent) */
+export function parseClaudeUsage(raw: unknown): LimitWindow[] {
+  if (raw === null || typeof raw !== 'object') return []
+  const o = raw as Record<string, unknown>
+  const out: LimitWindow[] = []
+  for (const [key, label] of [['five_hour', '5시간'], ['seven_day', '주간']] as const) {
+    const w = o[key] as Record<string, unknown> | null | undefined
+    const pct = pctOf(w?.utilization)
+    if (pct !== undefined) out.push({ label, pct, resetsAt: toMs(w?.resets_at) })
+  }
+  for (const item of Array.isArray(o.limits) ? o.limits : []) {
+    const l = item as Record<string, unknown>
+    if (l?.kind !== 'weekly_scoped') continue
+    const scope = (l.scope ?? {}) as Record<string, { display_name?: unknown } | null>
+    const name = scope.model?.display_name ?? scope.surface?.display_name
+    const pct = pctOf(l.percent ?? l.utilization)
+    if (typeof name === 'string' && pct !== undefined && !out.some(w => w.label === name)) out.push({ label: name, pct, resetsAt: toMs(l.resets_at) })
+  }
+  return out
+}
+
+/** bin/codex-limits.mjs 출력: primary·secondary 창 (usedPercent, windowDurationMins, resetsAt 초) */
+export function parseCodexLimits(out: string): LimitWindow[] {
+  let o: Record<string, Record<string, unknown> | null> | undefined
+  try {
+    o = JSON.parse(out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1))
+  } catch {
+    return []
+  }
+  const windows: LimitWindow[] = []
+  for (const w of [o?.primary, o?.secondary]) {
+    const pct = pctOf(w?.usedPercent)
+    if (w && pct !== undefined) windows.push({ label: windowLabel(Number(w.windowDurationMins) || 0), pct, resetsAt: toMs(w.resetsAt) })
+  }
+  return windows.sort((a, b) => (a.label === '5시간' ? -1 : b.label === '5시간' ? 1 : 0))
+}
+
+/** agy /usage 출력: "그룹\t한도\t남은 %\t리셋 시각" 줄들 → 쓴 비율로 바꾼다 */
+export function parseAgyUsage(out: string): LimitsSnapshot['agy'] {
+  const groups = new Map<string, LimitWindow[]>()
+  for (const line of out.split('\n')) {
+    const [group, kind, left, reset] = line.split('\t').map(x => x?.trim())
+    const remaining = Number(left?.replace('%', ''))
+    if (!group || !kind || Number.isNaN(remaining) || left === undefined) continue
+    const name = /gemini/i.test(group) ? 'Gemini' : /claude|gpt/i.test(group) ? 'Claude·GPT' : group
+    const label = /five|5/i.test(kind) ? '5시간' : /week/i.test(kind) ? '주간' : kind
+    const list = groups.get(name) ?? []
+    list.push({ label, pct: Math.round(clamp(100 - remaining, 0, 100)), resetsAt: toMs(reset) })
+    groups.set(name, list)
+  }
+  return [...groups.entries()].map(([group, windows]) => ({ group, windows: windows.sort((a, b) => (a.label === '5시간' ? -1 : 1) - (b.label === '5시간' ? -1 : 1)) }))
+}
+
+/** 띠가 보이는 동안: 출처마다 정해 둔 간격이 지났으면 다시 받는다 */
+async function refreshLimits($: EngineInterface) {
+  if (isLimitsRunning || Date.now() - lastBandAt > 120_000) return
+  if ((await read($, limitsLayoutAtom)) === 'off') return
+  isLimitsRunning = true
+  try {
+    const now = Date.now()
+    const patchLimits = (fn: (l: LimitsSnapshot) => LimitsSnapshot) => update($, limitsAtom, l => fn({ ...EMPTY_LIMITS, ...l, at: { ...l.at }, errors: { ...l.errors } }))
+
+    // 엔진이 응답마다 주는 한도와 컨텍스트 (API를 못 받을 때의 Claude 값)
+    const usage = await $.session.usage().catch(() => undefined)
+    if (usage !== undefined) {
+      const fromEngine = usage.rateLimits
+        .filter(r => r.kind === 'five_hour' || r.kind === 'seven_day')
+        .map(r => ({ label: r.kind === 'five_hour' ? '5시간' : '주간', pct: Math.round(r.percentUsed), resetsAt: toMs(r.resetsAt) }))
+      await patchLimits(l => ({ ...l, context: usage.context.percent === undefined ? l.context : Math.round(usage.context.percent), claude: l.at.claude !== undefined && now - l.at.claude < 10 * 60_000 ? l.claude : fromEngine.length > 0 ? fromEngine : l.claude }))
+    }
+
+    if (now >= nextAt.claude) {
+      nextAt.claude = now + CLAUDE_EVERY_MS
+      const auth = await $.session.authorize().catch(() => null)
+      if (auth === null) {
+        nextAt.claude = now + 10 * 60_000
+      } else {
+        const res = await $.http.fetch(CLAUDE_USAGE_URL, { auth: auth.handle, headers: { 'anthropic-beta': 'oauth-2025-04-20', accept: 'application/json' } }).catch((error: unknown) => ({ ok: false, status: 0, text: String(error), headers: {} as Record<string, string> }))
+        if (res.ok) {
+          let parsed: LimitWindow[] = []
+          try {
+            parsed = parseClaudeUsage(JSON.parse(res.text))
+          } catch {
+            // 형식이 바뀌면 엔진 값으로 버틴다
+          }
+          if (parsed.length > 0) await patchLimits(l => ({ ...l, claude: parsed, at: { ...l.at, claude: now }, errors: { ...l.errors, claude: undefined } }))
+        } else {
+          const wait = Number(res.headers['retry-after']) * 1000
+          nextAt.claude = now + (wait > 0 ? wait : res.status === 401 || res.status === 403 ? 10 * 60_000 : SLOW_EVERY_MS)
+          await patchLimits(l => ({ ...l, errors: { ...l.errors, claude: `사용량 API ${res.status || '연결 실패'}` } }))
+        }
+      }
+    }
+
+    if (now >= nextAt.codex) {
+      nextAt.codex = now + SLOW_EVERY_MS
+      const dir = $.plugin.root.replace(/\/\.claude-plugin\/?$/, '')
+      const ran = await $.process.run(['node', `${dir}/bin/codex-limits.mjs`], { timeoutMs: 20_000 }).catch(() => undefined)
+      const windows = ran === undefined ? [] : parseCodexLimits(ran.stdout)
+      if (windows.length > 0) await patchLimits(l => ({ ...l, codex: windows, at: { ...l.at, codex: now }, errors: { ...l.errors, codex: undefined } }))
+      else nextAt.codex = now + 30 * 60_000 // codex가 없거나 로그인 전: 드물게 다시 본다
+    }
+
+    if (now >= nextAt.agy) {
+      nextAt.agy = now + SLOW_EVERY_MS
+      const ran = await $.process.run(['/bin/sh', '-c', AGY_SCRIPT], { timeoutMs: 20_000 }).catch(() => undefined)
+      const groups = ran === undefined || ran.exitCode !== 0 ? [] : parseAgyUsage(ran.stdout)
+      if (groups.length > 0) await patchLimits(l => ({ ...l, agy: groups, at: { ...l.at, agy: now }, errors: { ...l.errors, agy: undefined } }))
+      else nextAt.agy = now + 60 * 60_000
+    }
+  } finally {
+    isLimitsRunning = false
+  }
+}
+
+/** 리셋까지 남은 시간: "44분 후", "3시간 20분 후", "5일 1시간 후" */
+export const untilReset = (resetsAt: number | undefined, now = Date.now()) => {
+  if (resetsAt === undefined) return ''
+  const mins = Math.max(0, Math.round((resetsAt - now) / 60_000))
+  if (mins < 1) return '곧 리셋'
+  const d = Math.floor(mins / 1440)
+  const h = Math.floor((mins % 1440) / 60)
+  const m = mins % 60
+  return d > 0 ? `${d}일${h > 0 ? ` ${h}시간` : ''} 후` : h > 0 ? `${h}시간${m > 0 && h < 3 ? ` ${m}분` : ''} 후` : `${m}분 후`
+}
+const limitColor = (pct: number) => (pct >= 90 ? 'error' : pct >= 70 ? 'warning' : undefined)
+
+/** 입력창 위 사용 한도 줄들 (없으면 빈 배열) */
+async function drawLimits($: EngineInterface, e: RenderInput<'AbovePrompt'>, width: number): Promise<RenderElement[]> {
+  const { Box, Text } = $.ui.resolve(e)
+  lastBandAt = Date.now()
+  startTimers($)
+  const layout = await read($, limitsLayoutAtom)
+  if (layout === 'off') return []
+  const l = await read($, limitsAtom)
+  if (!isLimitsRequested) {
+    isLimitsRequested = true
+    $.clock.after(0, () => void refreshLimits($).catch(() => undefined))
+  }
+  const rows: { name: string; windows: LimitWindow[]; extra?: string }[] = []
+  if (l.claude.length > 0) rows.push({ name: 'Claude', windows: l.claude, extra: l.context === undefined ? undefined : `컨텍스트 ${l.context}%` })
+  if (l.codex.length > 0) rows.push({ name: 'Codex', windows: l.codex })
+  if (l.agy.length > 0) rows.push({ name: 'Antigravity', windows: l.agy.flatMap(g => g.windows.map(w => ({ ...w, label: `${g.group} ${w.label}` }))) })
+  if (rows.length === 0) return []
+  const now = Date.now()
+  if (layout === 'compact') {
+    return [
+      <Box key="limits" flexDirection="row" columnGap={1} height={1} overflow="hidden" width={width}>
+        {rows.flatMap(r => [
+          <Text key={`limit-name:${r.name}`} bold>{` ${r.name}`}</Text>,
+          ...r.windows.map(w => (
+            <Text key={`limit:${r.name}:${w.label}`} color={limitColor(w.pct)}>
+              {w.label} {w.pct}%
+            </Text>
+          )),
+        ])}
+      </Box>,
+    ]
+  }
+  const nameWidth = Math.max(...rows.map(r => r.name.length)) + 1
+  return rows.map(r => (
+    <Box key={`limits:${r.name}`} flexDirection="row" columnGap={3} height={1} overflow="hidden" width={width}>
+      <Text bold>{r.name.padEnd(nameWidth)}</Text>
+      {r.windows.map(w => (
+        <Text key={w.label} color={limitColor(w.pct)} wrap="truncate-end">
+          {w.label} {bar(w.pct / 100, 10)} {String(w.pct).padStart(3)}%{w.resetsAt === undefined ? '' : ` ${untilReset(w.resetsAt, now)}`}
+        </Text>
+      ))}
+      {r.extra !== undefined && <Text dimColor>{r.extra}</Text>}
+    </Box>
+  ))
+}
+
 // ════════════════ 연결 ════════════════
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -1734,6 +1936,7 @@ export const register: Register = on => {
     await $.command.register({ name: 'open', description: 'IDE 창에서 폴더나 파일을 엽니다', argumentHint: '[경로]' }).catch(() => undefined)
     await $.command.register({ name: 'lecture', description: '강의 모드: Claude가 하는 일을 입력창 위에 쉬운 한국어 자막으로', argumentHint: '[on|off]' }).catch(() => undefined)
     await $.command.register({ name: 'handoff', description: '이 세션을 다른 에이전트 세션에 넘깁니다 (세션 ID·대화 기록·요청 목록)', argumentHint: '[세션 이름 또는 ref] [메모]' }).catch(() => undefined)
+    await $.command.register({ name: 'limits', description: '입력창 위 사용 한도 띠 (Claude·Codex·Antigravity)', argumentHint: '[full|compact|off|refresh]' }).catch(() => undefined)
     await $.command.register({ name: 'style-gate', description: '한국어 문체 게이트: 원고의 AI티 지표를 검사 (자동 검사 on/off)', argumentHint: '[파일|on|off]' }).catch(() => undefined)
     await loadRequests($).catch(() => undefined)
     return next(e)
@@ -1765,6 +1968,31 @@ export const register: Register = on => {
     const memo = arg.startsWith(peer.ref) ? arg.slice(peer.ref.length) : arg.slice(peer.name.length)
     const sent = await sendHandoff($, peer, memo)
     return { text: sent.ok ? `핸드오프를 보냈어요 → ${peer.name} [${peer.ref}]` : `못 보냈어요 (${peer.name}): ${sent.reason ?? ''}` }
+  })
+
+  on('command.run', { command: 'limits' }, async ($, e) => {
+    const arg = (e.args ?? '').trim()
+    if (arg === 'full' || arg === 'compact' || arg === 'off') {
+      await update($, limitsLayoutAtom, () => arg)
+      return { text: arg === 'off' ? '사용 한도 띠를 껐어요 (/limits full로 다시 켜기).' : `사용 한도 띠를 ${arg === 'full' ? '출처마다 한 줄로' : '한 줄로'} 보여 줘요.` }
+    }
+    if (arg === 'refresh' || arg === '') {
+      nextAt.claude = 0
+      nextAt.codex = 0
+      nextAt.agy = 0
+      lastBandAt = Date.now()
+      await refreshLimits($).catch(() => undefined)
+    }
+    const l = await read($, limitsAtom)
+    const line = (name: string, windows: LimitWindow[]) => `${name}: ${windows.length === 0 ? '받지 못함' : windows.map(w => `${w.label} ${w.pct}%${w.resetsAt ? ` (${untilReset(w.resetsAt)})` : ''}`).join(' · ')}`
+    return {
+      text: [
+        line('Claude', l.claude) + (l.context === undefined ? '' : ` · 컨텍스트 ${l.context}%`) + (l.errors.claude ? ` [${l.errors.claude}]` : ''),
+        line('Codex', l.codex),
+        l.agy.length === 0 ? 'Antigravity: 받지 못함 (agy 미설치 또는 로그인 전)' : `Antigravity: ${l.agy.map(g => `${g.group} ${g.windows.map(w => `${w.label} ${w.pct}%`).join('·')}`).join(' / ')}`,
+        '사용법: /limits [full|compact|off|refresh]',
+      ].join('\n'),
+    }
   })
 
   on('command.run', { command: 'style-gate' }, async ($, e) => {
@@ -1829,16 +2057,17 @@ export const register: Register = on => {
     const gate = await read($, gateAtom)
     const isGateOpen = await read($, gateOpenAtom)
     const showGate = gate !== null && gate.verdict !== 'pass'
-    if (!isLecture && !showGate) return next(e)
-    const { Box, Text, Button } = $.ui.resolve(e)
     const width = Math.max(10, e.props.bodyColumns)
+    const limits = await drawLimits($, e, width).catch(() => [] as RenderElement[])
+    if (!isLecture && !showGate && limits.length === 0) return next(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
     await read($, tickAtom)
     const below = await next(e)
     const caption = isLecture ? await read($, captionAtom) : undefined
     const running = isLecture ? Object.values(await read($, agentsAtom)).filter(r => r.id !== MAIN && r.phase === 'running').length : 0
 
     return (
-      <Box flexDirection="column" width={width}>
+      <Box flexDirection="column">
         {caption !== undefined && (
           <Box key="lecture" flexDirection="column" borderStyle="round" borderColor="claude" paddingX={1}>
             <Text bold color="warning" wrap="truncate-end">▶ {caption.text || '대기 중'}</Text>
@@ -1858,6 +2087,7 @@ export const register: Register = on => {
           </Box>
         )}
         {below}
+        {limits}
       </Box>
     )
   })
