@@ -1,6 +1,6 @@
 {
   "name": "ide-mod",
-  "version": "0.5.4",
+  "version": "0.6.0",
   "description": "Claude Code 안의 IDE 창: 에이전트 보드 + 파일 트리·탭 에디터 + HWP·HWPX·PDF 뷰어(rhwp·pdf.js) + 요청 기록, 강의 자막과 한국어 문체 게이트",
   "author": {
     "name": "jkf87"

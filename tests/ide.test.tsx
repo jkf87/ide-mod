@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { blockStarts, captionFor, describeCall, fit, handoffNote, isMachineText, parsePeers, personText, pickPeer, requestsAsText, shortModel, styleGate } from '../hooks/register'
+import { blockStarts, captionFor, describeCall, fit, handoffNote, isMachineText, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, styleGate } from '../hooks/register'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
 const ROOT = '/work'
@@ -98,6 +98,7 @@ function fakeWorld(on: On): World {
   on('prompt.submit', ($, e) => ({ text: e.text }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('process.run', ($, e) => {
+    if (e.argv[0] === '/bin/sh') return { value: { exitCode: 0, stdout: SYS_MAC, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     world.rhwpCalls.push(e.argv.slice(2).join(' '))
     world.scripts.push(String(e.argv[1]).split('/').pop() ?? '')
     const page = Number(e.argv[4])
@@ -234,8 +235,8 @@ describe('탐색기', () => {
     const code = await ui.find({ type: 'Code' })
     expect(code?.props.startLine).toBe(1)
     const shown = String(code?.props.source).split('\n').length
-    // 보드(빈 상태 2행) + 구분선 1 + 툴바 1 + 탭 1 + 정보 1 을 뺀 나머지
-    expect(shown).toBe(30 - 2 - 1 - 1 - 2)
+    // 보드(시스템 줄 1 + 머리줄 1 + 빈 보드 안내 1) · 구분선 1 · 툴바 1 · 탭 1 · 파일 정보 1을 뺀 행
+    expect(shown).toBe(30 - 3 - 1 - 1 - 2)
     await ui.unmount()
   })
 
@@ -528,6 +529,63 @@ describe('핸드오프', () => {
     expect(JSON.stringify(out)).toContain('핸드오프를 보냈어요 → 목차작성')
     expect(world.sent[0].to).toBe('목차작성 [ed478e]')
     expect(world.sent[0].text).toContain('메모: 3장 검토 부탁')
+  })
+})
+
+// 2026-10-08 이 Mac(32GB)의 실제 출력에서 필요한 줄만
+const SYS_MAC = `==mem
+34359738368
+2
+total = 22528.00M  used = 21987.12M  free = 540.88M  (encrypted)
+==vm
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages active:                                 290740.
+Pages wired down:                             725770.
+Pages occupied by compressor:                 732822.
+==linux
+==df
+Filesystem   1024-blocks       Used Available Capacity  iused      ifree %iused  Mounted on
+/dev/disk3s5  1948404040 1789869024 109552504    95% 11795201 1095525040    1%   /System/Volumes/Data
+==ps
+2097152 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+1048576 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)
+1572864 /opt/homebrew/bin/node
+524288 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
+`
+
+describe('시스템 상태', () => {
+  test('macOS 출력에서 메모리·압력·스왑·디스크·앱별 메모리를 읽는다', () => {
+    const s = parseSysStat(SYS_MAC, 1)!
+    expect(s.memTotal).toBe(32 * 1024 ** 3)
+    expect(s.memUsed).toBe((290740 + 725770 + 732822) * 16384)
+    expect(s.pressure).toBe(2)
+    expect(Math.round(s.swapUsed / 1024 ** 2)).toBe(21987)
+    expect(s.diskFree).toBe(109552504 * 1024)
+    expect(s.top[0]).toEqual({ name: 'Google Chrome', bytes: 3 * 1024 ** 3 })
+    expect(s.top.map(p => p.name)).toEqual(['Google Chrome', 'node', 'Finder'])
+  })
+
+  test('Linux /proc/meminfo도 읽는다', () => {
+    const s = parseSysStat(`==mem\n==vm\n==linux\nMemTotal:       16000000 kB\nMemAvailable:    1000000 kB\nSwapTotal:       2000000 kB\nSwapFree:        1500000 kB\n==df\n/dev/sda1 100000000 90000000 10000000 90% /\n==ps\n`, 1)!
+    expect(s.memUsed).toBe(15000000 * 1024)
+    expect(s.pressure).toBe(2)
+    expect(s.swapUsed).toBe(500000 * 1024)
+  })
+
+  test('보드 맨 위에 시스템 줄이 뜨고 z로 메모리 많이 쓰는 앱을 펼친다', async ($, on) => {
+    fakeWorld(on)
+    const clock = mock.clock(on)
+    await $.command.run(typed('ide', ''))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(160) })
+    await clock.advance(1_000)
+    const sys = (await ui.findAll({ type: 'Text' })).filter(t => /메모리|스왑|디스크/.test(t.text))
+    expect(sys.find(t => t.text.includes('메모리'))?.text).toContain('26.7GB/32.0GB · 압력 경고')
+    expect(sys.find(t => t.text.includes('메모리'))?.props.color).toBe('warning')
+    expect(sys.find(t => t.text.includes('스왑'))?.props.color).toBe('error')
+    expect(sys.find(t => t.text.includes('디스크'))?.text).toContain('남은 104GB')
+    await ui.press({ key: 'sys-procs' })
+    expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('Google Chrome 3.0GB · node 1.5GB · Finder 0.5GB')
+    await ui.unmount()
   })
 })
 

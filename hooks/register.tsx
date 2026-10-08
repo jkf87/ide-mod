@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Color, EngineInterface, On, Register, RenderElement, RenderInput } from 'claude-code'
 
-import type { AgentPhase, AgentRow, Caption, GateCheck, GateResult, PeerRow, RequestItem, ViewMode } from '../types'
+import type { AgentPhase, AgentRow, Caption, GateCheck, GateResult, PeerRow, RequestItem, SysStat, ViewMode } from '../types'
 
 // ════════════════ 에이전트 보드 ════════════════
 const MAIN = 'main'
@@ -200,6 +200,7 @@ function startTimers($: EngineInterface) {
   if (timersStarted) return
   timersStarted = true
   $.clock.every(RECAP_EVERY_MS, () => void recapStale($).catch(() => undefined))
+  $.clock.every(SYS_EVERY_MS, () => void refreshSys($).catch(() => undefined))
   $.clock.every(5_000, () =>
     void (async () => {
       await reconcile($)
@@ -323,6 +324,118 @@ async function recordToolCall($: EngineInterface, agentId: string | undefined, t
   }))
 }
 
+// ════════════════ 시스템 상태 (메모리·스왑·디스크) ════════════════
+// 보드 맨 위 한 줄. macOS의 sysctl·vm_stat·df·ps 출력을 한 번에 받아 읽는다 (Linux는 /proc/meminfo)
+
+const sysAtom = atom({ plugin: 'ide-mod', key: 'sys' } as const, null as SysStat | null)
+const showProcsAtom = atom({ plugin: 'ide-mod', key: 'showProcs' } as const, false)
+const SYS_EVERY_MS = 10_000
+// 명령은 절대 경로로 부른다: PATH에 /usr/sbin이 없는 환경(데스크톱 앱·SDK)에서도 sysctl을 찾게
+const SYS_SCRIPT = [
+  'echo ==mem; /usr/sbin/sysctl -n hw.memsize kern.memorystatus_vm_pressure_level vm.swapusage 2>/dev/null',
+  'echo ==vm; /usr/bin/vm_stat 2>/dev/null',
+  'echo ==linux; cat /proc/meminfo 2>/dev/null',
+  'echo ==df; /bin/df -k /System/Volumes/Data 2>/dev/null || /bin/df -k /',
+  'echo ==ps; /bin/ps -axo rss=,comm=',
+].join('; ')
+
+const GB = 1024 ** 3
+const gb = (bytes: number) => `${(bytes / GB).toFixed(bytes >= 100 * GB ? 0 : 1)}GB`
+
+/** 위 스크립트의 출력을 읽는다. 읽을 수 없으면 undefined */
+export function parseSysStat(out: string, at = Date.now()): SysStat | undefined {
+  const part = (name: string) => out.split(`==${name}\n`)[1]?.split(/\n==\w+\n/)[0] ?? ''
+  const mem = part('mem').trim().split('\n')
+  let memTotal = Number(mem[0]) || 0
+  let memUsed = 0
+  let pressure = Number(mem[1]) || 1
+  let swapUsed = 0
+  const swap = (mem[2] ?? '').match(/used = ([\d.]+)M/)
+  if (swap) swapUsed = Number(swap[1]) * 1024 ** 2
+  const vm = part('vm')
+  const pageSize = Number(vm.match(/page size of (\d+) bytes/)?.[1]) || 0
+  if (memTotal > 0 && pageSize > 0) {
+    const pages = (label: string) => Number(vm.match(new RegExp(`${label}:\\s+(\\d+)`))?.[1]) || 0
+    // 활성 상태 보기의 "사용된 메모리" = 앱 메모리 + 고정 + 압축 (근사: active + wired + compressor)
+    memUsed = (pages('Pages active') + pages('Pages wired down') + pages('Pages occupied by compressor')) * pageSize
+  } else {
+    const info = part('linux')
+    const kb = (key: string) => Number(info.match(new RegExp(`^${key}:\\s+(\\d+) kB`, 'm'))?.[1]) * 1024 || 0
+    memTotal = kb('MemTotal')
+    memUsed = memTotal - kb('MemAvailable')
+    swapUsed = kb('SwapTotal') - kb('SwapFree')
+    const ratio = memTotal > 0 ? memUsed / memTotal : 0
+    pressure = ratio > 0.95 ? 4 : ratio > 0.85 ? 2 : 1
+  }
+  const df = part('df').trim().split('\n').pop()?.trim().split(/\s+/) ?? []
+  const diskTotal = Number(df[1]) * 1024 || 0
+  const diskFree = Number(df[3]) * 1024 || 0
+  const byName = new Map<string, number>()
+  for (const line of part('ps').split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(.+)$/)
+    if (!m) continue
+    // 앱 번들 안의 도우미는 앱 이름으로 묶는다 (Google Chrome Helper (Renderer) → Google Chrome)
+    const app = m[2].match(/\/([^/]+)\.app\//)?.[1] ?? m[2].split('/').pop() ?? m[2]
+    byName.set(app, (byName.get(app) ?? 0) + Number(m[1]) * 1024)
+  }
+  const top = [...byName.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([name, bytes]) => ({ name, bytes }))
+  if (memTotal === 0 && diskTotal === 0) return undefined
+  return { at, memTotal, memUsed: Math.min(memUsed, memTotal), pressure, swapUsed, diskTotal, diskFree, top }
+}
+
+let isSysRunning = false
+let isSysRequested = false
+async function refreshSys($: EngineInterface) {
+  if (isSysRunning || Date.now() - lastDrawnAt > 30_000) return
+  isSysRunning = true
+  try {
+    const ran = await $.process.run(['/bin/sh', '-c', SYS_SCRIPT], { timeoutMs: 8_000 })
+    const stat = parseSysStat(ran.stdout)
+    if (stat !== undefined) await update($, sysAtom, () => stat)
+  } finally {
+    isSysRunning = false
+  }
+}
+
+const bar = (ratio: number, width = 8) => {
+  const filled = clamp(Math.round(ratio * width), 0, width)
+  return '█'.repeat(filled) + '░'.repeat(width - filled)
+}
+
+/** 보드 맨 위 시스템 줄 (+ z로 펼치는 메모리 많이 쓰는 앱 줄) */
+async function drawSys($: EngineInterface, e: RenderInput<'Pane'>): Promise<RenderElement[]> {
+  const { Box, Text, Button } = $.ui.resolve(e)
+  const stat = await read($, sysAtom)
+  const showProcs = await read($, showProcsAtom)
+  if (stat === null) {
+    // 처음 그릴 때 한 번 바로 읽는다 (그리기 밖에서: 타이머로 넘긴다)
+    if (!isSysRequested) {
+      isSysRequested = true
+      $.clock.after(0, () => void refreshSys($).catch(() => undefined))
+    }
+    return [<Text key="sys-wait" dimColor>시스템 · 메모리와 디스크를 읽는 중…</Text>]
+  }
+  const memRatio = stat.memTotal > 0 ? stat.memUsed / stat.memTotal : 0
+  const memColor = stat.pressure >= 4 ? 'error' : stat.pressure >= 2 ? 'warning' : undefined
+  const pressureLabel = stat.pressure >= 4 ? '위험' : stat.pressure >= 2 ? '경고' : '정상'
+  const swapColor = stat.swapUsed > stat.memTotal * 0.5 ? 'error' : stat.swapUsed > stat.memTotal * 0.15 ? 'warning' : undefined
+  const diskRatio = stat.diskTotal > 0 ? 1 - stat.diskFree / stat.diskTotal : 0
+  const diskColor = diskRatio > 0.95 ? 'error' : diskRatio > 0.9 ? 'warning' : undefined
+  const rows: RenderElement[] = [
+    <Box key="sys" flexDirection="row" columnGap={2} height={1} overflow="hidden">
+      <Text bold>시스템</Text>
+      {stat.memTotal > 0 && <Text color={memColor} wrap="truncate-end">메모리 {bar(memRatio)} {gb(stat.memUsed)}/{gb(stat.memTotal)} · 압력 {pressureLabel}</Text>}
+      {stat.swapUsed > 0 && <Text color={swapColor}>스왑 {gb(stat.swapUsed)}</Text>}
+      {stat.diskTotal > 0 && <Text color={diskColor}>디스크 {bar(diskRatio)} {Math.round(diskRatio * 100)}% · 남은 {gb(stat.diskFree)}</Text>}
+      <Button key="sys-procs" plain hotkey="z" label={showProcs ? '앱 순위 접기' : '메모리 많이 쓰는 앱'} onPress={() => void update($, showProcsAtom, v => !v)} />
+    </Box>,
+  ]
+  if (showProcs && stat.top.length > 0) {
+    rows.push(<Text key="sys-top" dimColor wrap="truncate-end">  {stat.top.map(p => `${p.name} ${gb(p.bytes)}`).join(' · ')}</Text>)
+  }
+  return rows
+}
+
 /**
  * IDE 창 맨 위의 에이전트 보드: 한 줄이 한 행인 요소들을 돌려준다.
  * 아래 탐색기가 남은 행을 정확히 쓰도록 maxRows를 넘기지 않는다.
@@ -364,7 +477,9 @@ async function drawBoard($: EngineInterface, e: RenderInput<'Pane'>, width: numb
       )}
     </Box>
   )
-  if (isFolded || maxRows <= 1) return [header]
+  // 시스템 줄은 접어도 남긴다 (램이 모자랄 때 늘 보이게)
+  const sys = await drawSys($, e).catch(() => [] as RenderElement[])
+  if (isFolded || maxRows <= 1 + sys.length) return [...sys, header]
 
   // 숨길 때도 돌고 있는 에이전트와 그 조상은 남겨 트리가 끊기지 않게 한다
   const visible = new Set<string>([MAIN])
@@ -423,10 +538,10 @@ async function drawBoard($: EngineInterface, e: RenderInput<'Pane'>, width: numb
   if (main !== undefined) draw(main, '', '', 0)
   else (children.get(MAIN) ?? []).forEach((kid, i, kids) => draw(kid, '', i === kids.length - 1 ? '└─ ' : '├─ ', 1))
 
-  const room = maxRows - 1
-  if (lines.length === 0) return [header, <Text key="board-empty" dimColor>프롬프트를 보내면 에이전트가 여기 나타나요.</Text>].slice(0, maxRows)
-  if (lines.length <= room) return [header, ...lines]
-  return [header, ...lines.slice(0, room - 1), <Text key="board-more" dimColor>… {lines.length - room + 1}줄 더 (a로 접기, h로 끝난 것 숨기기)</Text>]
+  const room = maxRows - 1 - sys.length
+  if (lines.length === 0) return [...sys, header, <Text key="board-empty" dimColor>프롬프트를 보내면 에이전트가 여기 나타나요.</Text>].slice(0, maxRows)
+  if (lines.length <= room) return [...sys, header, ...lines]
+  return [...sys, header, ...lines.slice(0, room - 1), <Text key="board-more" dimColor>… {lines.length - room + 1}줄 더 (a로 접기, h로 끝난 것 숨기기)</Text>]
 }
 
 // ════════════════ 탐색기 ════════════════

@@ -31,6 +31,19 @@ export type AgentRow = {
 }
 
 /** 이번 세션에 사람이 보낸 요청 하나 */
+export type SysStat = {
+  at: number
+  memTotal: number
+  memUsed: number
+  /** 1 정상, 2 경고, 4 위험 (macOS 메모리 압력) */
+  pressure: number
+  swapUsed: number
+  diskTotal: number
+  diskFree: number
+  /** 메모리를 많이 쓰는 앱 (이름별로 합침) */
+  top: { name: string; bytes: number }[]
+}
+
 export type PeerRow = {
   name: string
   ref: string
@@ -109,6 +122,12 @@ declare module 'claude-code' {
       requestOffset: number
       /** 오른쪽: all 이번 세션 요청 전부를 이어서, one 고른 요청 하나 */
       requestView: 'all' | 'one'
+
+      // ── 시스템 상태 ──
+      /** 메모리·스왑·디스크 (보드가 떠 있을 때 10초마다) */
+      sys: SysStat | null
+      /** 메모리를 많이 쓰는 앱 줄을 펼쳤는지 */
+      showProcs: boolean
 
       // ── 핸드오프 ──
       /** ListAgents로 받은 다른 세션들 (핸드오프 화면을 열 때·r로 새로 받음) */
