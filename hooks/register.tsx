@@ -1748,7 +1748,7 @@ async function drawHwp(
 
 const EMPTY_LIMITS: LimitsSnapshot = { claude: [], codex: [], agy: [], at: {}, errors: {} }
 const limitsAtom = atom({ plugin: 'ide-mod', key: 'limits' } as const, EMPTY_LIMITS)
-const limitsLayoutAtom = atom({ plugin: 'ide-mod', key: 'limitsLayout' } as const, 'full' as 'full' | 'compact' | 'off')
+const limitsLayoutAtom = atom({ plugin: 'ide-mod', key: 'limitsLayout' } as const, 'line' as string)
 const CLAUDE_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 const CLAUDE_EVERY_MS = 60_000
 const SLOW_EVERY_MS = 5 * 60_000
@@ -1825,7 +1825,7 @@ export function parseAgyUsage(out: string): LimitsSnapshot['agy'] {
 /** 띠가 보이는 동안: 출처마다 정해 둔 간격이 지났으면 다시 받는다 */
 async function refreshLimits($: EngineInterface) {
   if (isLimitsRunning || Date.now() - lastBandAt > 120_000) return
-  if ((await read($, limitsLayoutAtom)) === 'off') return
+  if (normLayout(await read($, limitsLayoutAtom)) === 'off') return
   isLimitsRunning = true
   try {
     const now = Date.now()
@@ -1897,49 +1897,155 @@ export const untilReset = (resetsAt: number | undefined, now = Date.now()) => {
 const limitColor = (pct: number) => (pct >= 90 ? 'error' : pct >= 70 ? 'warning' : undefined)
 
 /** 입력창 위 사용 한도 줄들 (없으면 빈 배열) */
+/** 띠 모양: line 한 줄(도트 게이지), rows 출처마다 한 줄, off 숨김. 예전 이름 compact·full도 받는다 */
+type LimitsLayout = 'line' | 'rows' | 'off'
+export const normLayout = (value: string | undefined): LimitsLayout | undefined =>
+  value === 'line' || value === 'compact' ? 'line' : value === 'rows' || value === 'full' ? 'rows' : value === 'off' ? 'off' : undefined
+
+// ── 도트 게이지: 점자 칸 하나에 점 2열×4줄, 왼쪽부터 채운다 ──
+const DOT_FULL = 0x28ff // ⣿
+const DOT_HALF = 0x2847 // ⡇ 왼쪽 열만
+const DOT_EMPTY = 0x28c0 // ⣀ 바닥 점만: 빈 칸
+const DEFAULT_COLOR = 0x01000000
+const TRACK = 0x5a5a5a
+const GAUGE_CELLS = 4
+const mix = (a: number, b: number, t: number) => {
+  const ch = (shift: number) => Math.round(((a >> shift) & 255) * (1 - t) + ((b >> shift) & 255) * t)
+  return (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+/** 쓴 비율 게이지는 칸 위치마다 초록→노랑→빨강, 좋은 값(캐시 적중) 게이지는 값에 따라 한 색 */
+const RAMP = [0x5fd787, 0xd7d75f, 0xffaf5f, 0xff5f5f]
+const rampAt = (t: number) => {
+  const x = clamp(t, 0, 1) * (RAMP.length - 1)
+  const i = Math.min(Math.floor(x), RAMP.length - 2)
+  return mix(RAMP[i], RAMP[i + 1], x - i)
+}
+export type GaugeKind = 'use' | 'good'
+const goodColor = (pct: number) => (pct >= 80 ? RAMP[0] : pct >= 50 ? RAMP[1] : RAMP[3])
+
+/** 게이지 칸들: [글자, 색] (색 0x00RRGGBB) */
+export function dotGauge(pct: number, kind: GaugeKind, cells = GAUGE_CELLS): [number, number][] {
+  const cols = Math.round((clamp(pct, 0, 100) / 100) * cells * 2)
+  return Array.from({ length: cells }, (_, i) => {
+    const filled = clamp(cols - i * 2, 0, 2)
+    const color = kind === 'good' ? goodColor(pct) : rampAt((i + 0.5) / cells)
+    return filled === 2 ? [DOT_FULL, color] : filled === 1 ? [DOT_HALF, color] : [DOT_EMPTY, TRACK]
+  })
+}
+const gaugeCells = (cells: [number, number][]) => {
+  const words = new Uint32Array(cells.length * 3)
+  cells.forEach(([code, fg], i) => words.set([code, fg, DEFAULT_COLOR], i * 3))
+  const bytes = new Uint8Array(words.buffer)
+  const withBase64 = bytes as unknown as { toBase64?: () => string }
+  return withBase64.toBase64 !== undefined ? withBase64.toBase64() : btoa(String.fromCharCode(...bytes))
+}
+
+/** 한 줄 띠에 올릴 묶음: 출처 이름과 게이지들 */
+type LineItem = { label: string; pct: number; kind: GaugeKind; note?: string }
+type LineGroup = { name: string; color?: Color; items: LineItem[]; tail?: string }
+const shortWindow = (label: string) => label.replace(/^5시간$/, '5h').replace(/^주간$/, '주').replace(/ 5시간$/, ' 5h').replace(/ 주간$/, ' 주')
+/** 리셋까지 남은 시간을 큰 단위 하나로: 2일, 3시간, 44분 */
+const shortReset = (resetsAt: number | undefined, now: number) => untilReset(resetsAt, now).replace(/ 후$/, '').split(' ')[0] ?? ''
+
+export function lineGroups(l: LimitsSnapshot, p: SessionPerf, now = Date.now()): LineGroup[] {
+  const groups: LineGroup[] = []
+  const ctx = p.context ?? l.context
+  const session: LineItem[] = []
+  if (ctx !== undefined) session.push({ label: '컨텍스트', pct: ctx, kind: 'use' })
+  if (p.cacheHit !== undefined) session.push({ label: '캐시', pct: p.cacheHit, kind: 'good' })
+  if (session.length > 0 || p.tokPerSec !== undefined) groups.push({ name: '세션', color: 'claude', items: session, tail: p.tokPerSec === undefined ? undefined : `${p.tokPerSec} tok/s` })
+  // 많이 쓴 창(70% 이상)에만 리셋까지 남은 시간을 붙인다
+  const items = (windows: LimitWindow[], prefix = '') =>
+    windows.map(w => ({ label: shortWindow(`${prefix}${w.label}`), pct: w.pct, kind: 'use' as const, note: w.pct >= 70 && w.resetsAt !== undefined ? shortReset(w.resetsAt, now) : undefined }))
+  if (l.claude.length > 0) groups.push({ name: 'Claude', items: items(l.claude) })
+  if (l.codex.length > 0) groups.push({ name: 'Codex', items: items(l.codex) })
+  for (const g of l.agy) groups.push({ name: g.group === 'Gemini' ? 'Gemini' : `AG ${g.group}`, items: items(g.windows) })
+  return groups
+}
+
+const cols = (text: string) => [...text].reduce((n, ch) => n + ((ch.codePointAt(0) ?? 0) >= 0x1100 && !/[\u2800-\u28ff│·]/.test(ch) ? 2 : 1), 0)
+const itemText = (item: LineItem) => `${item.pct}%${item.note ? ` ${item.note}` : ''}`
+
+/** 줄이 폭을 넘으면 오른쪽 묶음부터 게이지를 빼서(이름·비율은 남기고) 맞춘다. 게이지를 남길 항목 표시를 돌려준다 */
+export function fitLine(groups: LineGroup[], width: number): boolean[][] {
+  const keep = groups.map(g => g.items.map(() => true))
+  const total = () =>
+    groups.reduce(
+      (n, g, gi) =>
+        n + (gi === 0 ? 0 : 2) + cols(g.name) + (g.tail === undefined ? 0 : 1 + cols(g.tail)) +
+        g.items.reduce((m, item, ii) => m + 1 + cols(item.label) + 1 + (keep[gi][ii] ? GAUGE_CELLS + 1 : 0) + cols(itemText(item)), 0),
+      0,
+    )
+  for (let gi = groups.length - 1; gi >= 1 && total() > width; gi--) {
+    for (let ii = groups[gi].items.length - 1; ii >= 0 && total() > width; ii--) keep[gi][ii] = false
+  }
+  return keep
+}
+
+/** 입력창 위 사용 한도 띠 (없으면 빈 배열) */
 async function drawLimits($: EngineInterface, e: RenderInput<'AbovePrompt'>, width: number): Promise<RenderElement[]> {
-  const { Box, Text } = $.ui.resolve(e)
   lastBandAt = Date.now()
   startTimers($)
   if (isAutoOpenPending) {
     isAutoOpenPending = false
     $.clock.after(0, () => void autoOpenIde($).catch(() => undefined))
   }
-  const layout = await read($, limitsLayoutAtom)
+  const layout = normLayout(await read($, limitsLayoutAtom)) ?? 'line'
   if (layout === 'off') return []
   const l = await read($, limitsAtom)
   if (!isLimitsRequested) {
     isLimitsRequested = true
     $.clock.after(0, () => void refreshLimits($).catch(() => undefined))
   }
-  const perf = perfParts(await read($, perfAtom), l.context)
-  const rows: { name: string; windows: LimitWindow[]; extra?: string }[] = []
+  const p = await read($, perfAtom)
+  return layout === 'rows' ? drawLimitRows($, e, width, l, p) : drawLimitLine($, e, width, l, p)
+}
+
+/** 모든 출처를 한 줄에: 이름 · 게이지 · 비율, 묶음 사이는 │. 터미널에서는 게이지를 도트(Raster)로 그린다 */
+function drawLimitLine($: EngineInterface, e: RenderInput<'AbovePrompt'>, width: number, l: LimitsSnapshot, p: SessionPerf): RenderElement[] {
+  const { Box, Text } = $.ui.resolve(e)
+  const groups = lineGroups(l, p)
+  if (groups.length === 0) return []
+  const gauge = (key: string, item: LineItem) => {
+    const cells = dotGauge(item.pct, item.kind)
+    if (e.surface === 'terminal') {
+      const { Raster } = $.ui.resolve(e)
+      return <Raster key={key} columns={cells.length} rows={1} cells={gaugeCells(cells)} />
+    }
+    return <Text key={key} color={item.kind === 'good' ? hitColor(item.pct) : limitColor(item.pct)}>{String.fromCodePoint(...cells.map(c => c[0]))}</Text>
+  }
+  const pctColor = (item: LineItem): Color | undefined => (item.kind === 'good' ? hitColor(item.pct) : limitColor(item.pct))
+  const keep = fitLine(groups, width - 5) // 오른쪽 끝 접기 단추 자리
+  return [
+    <Box key="limits" flexDirection="row" columnGap={1} height={1} overflow="hidden" width={width}>
+      {groups.flatMap((g, gi) => [
+        ...(gi === 0 ? [] : [<Box key={`sep:${g.name}`} flexShrink={0}><Text dimColor>│</Text></Box>]),
+        <Box key={`name:${g.name}`} flexShrink={0}>
+          <Text bold color={g.color}>{g.name}</Text>
+        </Box>,
+        ...g.items.map((item, ii) => (
+          <Box key={`item:${g.name}:${item.label}`} flexDirection="row" columnGap={1} flexShrink={0}>
+            <Text dimColor>{item.label}</Text>
+            {keep[gi][ii] && gauge(`gauge:${g.name}:${item.label}`, item)}
+            <Text bold color={pctColor(item)}>{itemText(item)}</Text>
+          </Box>
+        )),
+        ...(g.tail === undefined ? [] : [<Box key={`tail:${g.name}`} flexShrink={0}><Text bold>{g.tail}</Text></Box>]),
+      ])}
+    </Box>,
+  ]
+}
+
+/** 출처마다 한 줄 (/limits rows) */
+function drawLimitRows($: EngineInterface, e: RenderInput<'AbovePrompt'>, width: number, l: LimitsSnapshot, p: SessionPerf): RenderElement[] {
+  const { Box, Text } = $.ui.resolve(e)
+  const perf = perfParts(p, l.context)
+  const rows: { name: string; windows: LimitWindow[] }[] = []
   if (l.claude.length > 0) rows.push({ name: 'Claude', windows: l.claude })
   if (l.codex.length > 0) rows.push({ name: 'Codex', windows: l.codex })
   if (l.agy.length > 0) rows.push({ name: 'Antigravity', windows: l.agy.flatMap(g => g.windows.map(w => ({ ...w, label: `${g.group} ${w.label}` }))) })
   if (rows.length === 0 && perf.length === 0) return []
   const now = Date.now()
-  if (layout === 'compact') {
-    return [
-      <Box key="limits" flexDirection="row" columnGap={1} height={1} overflow="hidden" width={width}>
-        {perf.map(x => (
-          <Box key={`perf:${x.text.slice(0, 4)}`} flexShrink={0}>
-            <Text color={x.color} bold={x.isBold}>{x.text.replace(/ [█░]+ +/, ' ').replace(/ \d+k\/\S+/, '').replace(/ · 첫 토큰.*$/, '').replace(/ \(누적.*\)$/, '')}</Text>
-          </Box>
-        ))}
-        {rows.flatMap(r => [
-          <Box key={`limit-name:${r.name}`} flexShrink={0}>
-            <Text bold>{` ${r.name}`}</Text>
-          </Box>,
-          ...r.windows.map(w => (
-            <Box key={`limit:${r.name}:${w.label}`} flexShrink={0}>
-              <Text color={limitColor(w.pct)}>{`${w.label} ${w.pct}%`}</Text>
-            </Box>
-          )),
-        ])}
-      </Box>,
-    ]
-  }
   const nameWidth = Math.max(4, ...rows.map(r => r.name.length)) + 1
   const perfRow =
     perf.length === 0
@@ -1962,7 +2068,6 @@ async function drawLimits($: EngineInterface, e: RenderInput<'AbovePrompt'>, wid
           <Text color={limitColor(w.pct)}>{`${w.label} ${bar(w.pct / 100, 10)} ${String(w.pct).padStart(3)}%${w.resetsAt === undefined ? '' : ` ${untilReset(w.resetsAt, now)}`}`}</Text>
         </Box>
       ))}
-      {r.extra !== undefined && <Text dimColor>{r.extra}</Text>}
     </Box>
   ))]
 }
@@ -2104,9 +2209,10 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'limits' }, async ($, e) => {
     const arg = (e.args ?? '').trim()
-    if (arg === 'full' || arg === 'compact' || arg === 'off') {
-      await update($, limitsLayoutAtom, () => arg)
-      return { text: arg === 'off' ? '사용 한도 띠를 껐어요 (/limits full로 다시 켜기).' : `사용 한도 띠를 ${arg === 'full' ? '출처마다 한 줄로' : '한 줄로'} 보여 줘요.` }
+    const layout = normLayout(arg)
+    if (layout !== undefined) {
+      await update($, limitsLayoutAtom, () => layout)
+      return { text: layout === 'off' ? '사용 한도 띠를 껐어요 (/limits line으로 다시 켜기).' : `사용 한도 띠를 ${layout === 'rows' ? '출처마다 한 줄로' : '도트 게이지 한 줄로'} 보여 줘요.` }
     }
     if (arg === 'refresh' || arg === '') {
       nextAt.claude = 0
@@ -2123,7 +2229,7 @@ export const register: Register = (on, options) => {
         line('Claude', l.claude) + (l.errors.claude ? ` [${l.errors.claude}]` : ''),
         line('Codex', l.codex),
         l.agy.length === 0 ? 'Antigravity: 받지 못함 (agy 미설치 또는 로그인 전)' : `Antigravity: ${l.agy.map(g => `${g.group} ${g.windows.map(w => `${w.label} ${w.pct}%`).join('·')}`).join(' / ')}`,
-        '사용법: /limits [full|compact|off|refresh]',
+        '사용법: /limits [line|rows|off|refresh]',
       ].join('\n'),
     }
   })

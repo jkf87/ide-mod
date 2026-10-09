@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { blockStarts, cacheHitOf, captionFor, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
+import { blockStarts, cacheHitOf, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
 const ROOT = '/work'
@@ -622,6 +622,7 @@ describe('사용 한도 띠', () => {
     on('session.authorize', () => ({ value: { handle: 'h', kind: 'bearer' } }))
     on('http.fetch', () => ({ value: { status: 200, ok: true, headers: {}, text: JSON.stringify(CLAUDE_USAGE) } }) as never)
     world.extraRuns = (argv: string[]) => (String(argv[1]).endsWith('codex-limits.mjs') ? CODEX_OUT : argv[0] === '/bin/sh' && String(argv[2]).includes('agy') ? AGY_OUT : undefined)
+    await $.command.run(typed('limits', 'rows'))
     const band = await $.ui.mount({ ...BAND, surface: 'terminal', props: bandProps })
     await clock.advance(1_000)
     const texts = await band.findAll({ type: 'Text' })
@@ -634,9 +635,14 @@ describe('사용 한도 띠', () => {
     expect(texts.find(t => t.text.startsWith('5시간') && t.text.includes('81%'))?.props.color).toBe('warning')
     expect(all).toContain('Antigravity')
     expect(all).toContain('Gemini 5시간')
-    await $.command.run(typed('limits', 'compact'))
+    // 기본: 모든 출처를 한 줄에, 게이지는 도트(Raster)
+    await $.command.run(typed('limits', 'line'))
     await clock.advance(100)
-    expect(textOf(await band.findAll({ type: 'Text' }))).toContain('주간 27%')
+    const line = textOf(await band.findAll({ type: 'Text' }))
+    expect(line).toContain('Codex')
+    expect(line).toContain('Gemini')
+    expect(line).toContain('81% 4일')
+    expect((await band.findAll({ type: 'Raster' })).length).toBeGreaterThan(0)
     await band.unmount()
   })
 })
@@ -662,6 +668,7 @@ describe('이 세션 줄', () => {
       yield { kind: 'stop', stopReason: 'end_turn', usage: { model: 'claude-opus-5-5', input_tokens: 20, cache_read_input_tokens: 400_000, cache_creation_input_tokens: 11_980, output_tokens: 400 }, ref: 2 } as never
       return { turnId: 't1', index: 0, answer: '안녕', toolUses: [], stopReason: 'end_turn', usage: null }
     })
+    await $.command.run(typed('limits', 'rows'))
     const chunks: unknown[] = []
     for await (const c of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 })) chunks.push(c)
     expect(chunks.length).toBe(2)
@@ -676,6 +683,28 @@ describe('이 세션 줄', () => {
     expect(all).toContain('속도 80 tok/s')
     expect(texts.find(t => t.text.startsWith('캐시 적중'))?.props.color).toBe('success')
     await band.unmount()
+  })
+})
+
+describe('도트 게이지', () => {
+  test('점자 칸을 왼쪽부터 채우고, 빈 칸은 바닥 점', () => {
+    const chars = (pct: number, kind: GaugeKind = 'use') => String.fromCodePoint(...dotGauge(pct, kind).map(c => c[0]))
+    expect(chars(0)).toBe('⣀⣀⣀⣀')
+    expect(chars(50)).toBe('⣿⣿⣀⣀')
+    expect(chars(63)).toBe('⣿⣿⡇⣀')
+    expect(chars(100)).toBe('⣿⣿⣿⣿')
+    // 쓴 비율은 칸마다 초록→빨강, 캐시 적중은 값에 따라 한 색
+    const use = dotGauge(100, 'use').map(c => c[1])
+    expect(use[0]).not.toBe(use[3])
+    expect(new Set(dotGauge(100, 'good').map(c => c[1])).size).toBe(1)
+    // 좁으면 오른쪽 묶음부터 게이지를 뺀다
+    const groups = lineGroups({ claude: [{ label: '5시간', pct: 3 }, { label: '주간', pct: 95 }], codex: [{ label: '주간', pct: 78 }], agy: [{ group: 'Gemini', windows: [{ label: '5시간', pct: 5 }] }], at: {}, errors: {} }, { readTokens: 0, inputTokens: 0, context: 4, cacheHit: 76, tokPerSec: 114 })
+    expect(fitLine(groups, 300).flat().every(Boolean)).toBe(true)
+    const narrow = fitLine(groups, 100)
+    expect(narrow[0].every(Boolean)).toBe(true)
+    expect(narrow.at(-1)?.[0]).toBe(false)
+    expect(normLayout('compact')).toBe('line')
+    expect(normLayout('full')).toBe('rows')
   })
 })
 

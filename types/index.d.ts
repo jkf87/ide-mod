@@ -166,7 +166,8 @@ declare module 'claude-code' {
       // ── 사용 한도 띠 (입력창 위) ──
       limits: LimitsSnapshot
       /** full: 출처마다 한 줄, compact: 한 줄, off: 숨김 */
-      limitsLayout: 'full' | 'compact' | 'off'
+      /** line 한 줄(도트 게이지), rows 출처마다 한 줄, off; 예전 값 full·compact도 읽는다 */
+      limitsLayout: string
       perf: SessionPerf
 
       // ── 자동으로 열기 ──
