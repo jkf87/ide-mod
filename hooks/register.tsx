@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { Color, EngineInterface, On, Register, RenderElement, RenderInput } from 'claude-code'
+import type { Color, EngineInterface, ModelUsage, On, Register, RenderElement, RenderInput } from 'claude-code'
 
-import type { AgentPhase, AgentRow, Caption, GateCheck, GateResult, LimitWindow, LimitsSnapshot, PeerRow, RequestItem, SysStat, ViewMode } from '../types'
+import type { AgentPhase, AgentRow, Caption, GateCheck, GateResult, LimitWindow, LimitsSnapshot, PeerRow, RequestItem, SessionPerf, SysStat, ViewMode } from '../types'
 
 // ════════════════ 에이전트 보드 ════════════════
 const MAIN = 'main'
@@ -259,7 +259,20 @@ function registerAgents(on: On) {
         ? undefined
         : { ...row, model: e.model, effort, phase: 'running', updatedAt: Date.now(), endedAt: undefined },
     ).catch(() => undefined)
-    return yield* next(e)
+    // 메인 응답은 첫 조각과 끝(stop) 시각을 재서 속도·캐시 적중을 띠에 올린다. 조각은 손대지 않고 그대로 넘긴다
+    if (e.agentId !== undefined) return yield* next(e)
+    const now = () => $.clock.now().catch(() => Date.now())
+    const sentAt = await now()
+    let firstAt: number | undefined
+    for await (const chunk of next(e)) {
+      if (firstAt === undefined && chunk.kind !== 'engine') firstAt = await now()
+      if (chunk.kind === 'stop' && chunk.usage !== null) {
+        const usage = chunk.usage
+        const endAt = await now()
+        void notePerf($, usage, sentAt, firstAt, endAt).catch(() => undefined)
+      }
+      yield chunk
+    }
   })
 
   on('agent.spawn', async ($, e, next) => {
@@ -1899,40 +1912,121 @@ async function drawLimits($: EngineInterface, e: RenderInput<'AbovePrompt'>, wid
     isLimitsRequested = true
     $.clock.after(0, () => void refreshLimits($).catch(() => undefined))
   }
+  const perf = perfParts(await read($, perfAtom), l.context)
   const rows: { name: string; windows: LimitWindow[]; extra?: string }[] = []
-  if (l.claude.length > 0) rows.push({ name: 'Claude', windows: l.claude, extra: l.context === undefined ? undefined : `컨텍스트 ${l.context}%` })
+  if (l.claude.length > 0) rows.push({ name: 'Claude', windows: l.claude })
   if (l.codex.length > 0) rows.push({ name: 'Codex', windows: l.codex })
   if (l.agy.length > 0) rows.push({ name: 'Antigravity', windows: l.agy.flatMap(g => g.windows.map(w => ({ ...w, label: `${g.group} ${w.label}` }))) })
-  if (rows.length === 0) return []
+  if (rows.length === 0 && perf.length === 0) return []
   const now = Date.now()
   if (layout === 'compact') {
     return [
       <Box key="limits" flexDirection="row" columnGap={1} height={1} overflow="hidden" width={width}>
+        {perf.map(x => (
+          <Box key={`perf:${x.text.slice(0, 4)}`} flexShrink={0}>
+            <Text color={x.color} bold={x.isBold}>{x.text.replace(/ [█░]+ +/, ' ').replace(/ \d+k\/\S+/, '').replace(/ · 첫 토큰.*$/, '').replace(/ \(누적.*\)$/, '')}</Text>
+          </Box>
+        ))}
         {rows.flatMap(r => [
-          <Text key={`limit-name:${r.name}`} bold>{` ${r.name}`}</Text>,
+          <Box key={`limit-name:${r.name}`} flexShrink={0}>
+            <Text bold>{` ${r.name}`}</Text>
+          </Box>,
           ...r.windows.map(w => (
-            <Text key={`limit:${r.name}:${w.label}`} color={limitColor(w.pct)}>
-              {w.label} {w.pct}%
-            </Text>
+            <Box key={`limit:${r.name}:${w.label}`} flexShrink={0}>
+              <Text color={limitColor(w.pct)}>{`${w.label} ${w.pct}%`}</Text>
+            </Box>
           )),
         ])}
       </Box>,
     ]
   }
-  const nameWidth = Math.max(...rows.map(r => r.name.length)) + 1
-  return rows.map(r => (
+  const nameWidth = Math.max(4, ...rows.map(r => r.name.length)) + 1
+  const perfRow =
+    perf.length === 0
+      ? []
+      : [
+          <Box key="limits:perf" flexDirection="row" columnGap={3} height={1} overflow="hidden" width={width}>
+            <Text bold color="claude">{'이 세션'.padEnd(nameWidth - 3)}</Text>
+            {perf.map(x => (
+              <Box key={`perf:${x.text.slice(0, 4)}`} flexShrink={0}>
+                <Text color={x.color} bold={x.isBold}>{x.text}</Text>
+              </Box>
+            ))}
+          </Box>,
+        ]
+  return [...perfRow, ...rows.map(r => (
     <Box key={`limits:${r.name}`} flexDirection="row" columnGap={3} height={1} overflow="hidden" width={width}>
       <Text bold>{r.name.padEnd(nameWidth)}</Text>
       {r.windows.map(w => (
-        <Text key={w.label} color={limitColor(w.pct)} wrap="truncate-end">
-          {w.label} {bar(w.pct / 100, 10)} {String(w.pct).padStart(3)}%{w.resetsAt === undefined ? '' : ` ${untilReset(w.resetsAt, now)}`}
-        </Text>
+        <Box key={w.label} flexShrink={0}>
+          <Text color={limitColor(w.pct)}>{`${w.label} ${bar(w.pct / 100, 10)} ${String(w.pct).padStart(3)}%${w.resetsAt === undefined ? '' : ` ${untilReset(w.resetsAt, now)}`}`}</Text>
+        </Box>
       ))}
       {r.extra !== undefined && <Text dimColor>{r.extra}</Text>}
     </Box>
-  ))
+  ))]
 }
 
+
+// ════════════════ 이 세션: 컨텍스트·캐시 적중·속도 ════════════════
+// 메인 에이전트의 응답이 끝날 때마다(turn.step의 stop 조각) 그 응답의 토큰 수로 계산해 띠 맨 위 줄에 올린다.
+
+const EMPTY_PERF: SessionPerf = { readTokens: 0, inputTokens: 0 }
+const perfAtom = atom({ plugin: 'ide-mod', key: 'perf' } as const, EMPTY_PERF)
+
+/** 캐시 적중률: 입력 토큰 중 캐시에서 읽은 비율(0~100), 입력이 없으면 undefined */
+export const cacheHitOf = (u: Pick<ModelUsage, 'input_tokens' | 'cache_read_input_tokens' | 'cache_creation_input_tokens'>) => {
+  const total = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
+  return total > 0 ? Math.round((u.cache_read_input_tokens / total) * 100) : undefined
+}
+
+/** 출력 속도: 첫 조각부터 끝까지 나온 토큰 수를 초로 나눈다. 너무 짧은 응답은 재지 않는다 */
+export const tokPerSecOf = (outputTokens: number, firstAt: number | undefined, endAt: number) => {
+  if (firstAt === undefined || outputTokens < 20) return undefined
+  const secs = (endAt - firstAt) / 1000
+  return secs < 0.3 ? undefined : Math.round(outputTokens / secs)
+}
+
+async function notePerf($: EngineInterface, usage: ModelUsage, sentAt: number, firstAt: number | undefined, endAt: number) {
+  const usageNow = await $.session.usage().catch(() => undefined)
+  const input = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+  const speed = tokPerSecOf(usage.output_tokens, firstAt, endAt)
+  await update($, perfAtom, p => {
+    const readTokens = (p.readTokens ?? 0) + usage.cache_read_input_tokens
+    const inputTokens = (p.inputTokens ?? 0) + input
+    return {
+      ...p,
+      context: usageNow?.context.percent === undefined ? p.context : Math.round(usageNow.context.percent),
+      contextTokens: usageNow?.context.tokens ?? (input > 0 ? input + usage.output_tokens : p.contextTokens),
+      window: usageNow?.context.window ?? p.window,
+      cacheHit: cacheHitOf(usage) ?? p.cacheHit,
+      readTokens,
+      inputTokens,
+      sessionHit: inputTokens > 0 ? Math.round((readTokens / inputTokens) * 100) : undefined,
+      tokPerSec: speed ?? p.tokPerSec,
+      firstMs: firstAt === undefined ? p.firstMs : firstAt - sentAt,
+      outputTokens: usage.output_tokens,
+      at: endAt,
+    }
+  })
+}
+
+/** 412k, 1M, 950 */
+export const shortTokens = (n: number) => (n >= 1_000_000 ? `${Math.round(n / 100_000) / 10}M`.replace('.0M', 'M') : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
+const hitColor = (pct: number) => (pct >= 80 ? 'success' : pct < 50 ? 'warning' : undefined)
+
+/** 띠 맨 위 "이 세션" 줄의 조각들: [글, 색, 굵게] */
+export function perfParts(p: SessionPerf, context: number | undefined): { text: string; color?: Color; isBold?: boolean }[] {
+  const parts: { text: string; color?: Color; isBold?: boolean }[] = []
+  const ctx = p.context ?? context
+  if (ctx !== undefined) {
+    const amount = p.contextTokens !== undefined && p.window !== undefined ? ` ${shortTokens(p.contextTokens)}/${shortTokens(p.window)}` : ''
+    parts.push({ text: `컨텍스트 ${bar(ctx / 100, 10)} ${String(ctx).padStart(3)}%${amount}`, color: limitColor(ctx) ?? 'claude', isBold: true })
+  }
+  if (p.cacheHit !== undefined) parts.push({ text: `캐시 적중 ${p.cacheHit}%${p.sessionHit !== undefined && p.sessionHit !== p.cacheHit ? ` (누적 ${p.sessionHit}%)` : ''}`, color: hitColor(p.cacheHit), isBold: true })
+  if (p.tokPerSec !== undefined) parts.push({ text: `속도 ${p.tokPerSec} tok/s${p.firstMs !== undefined ? ` · 첫 토큰 ${(p.firstMs / 1000).toFixed(1)}초` : ''}`, isBold: true })
+  return parts
+}
 
 // ════════════════ 세션 시작 때 IDE 창 열기 ════════════════
 const autoOpenedAtom = atom({ plugin: 'ide-mod', key: 'autoOpened' } as const, false)
@@ -2025,7 +2119,8 @@ export const register: Register = (on, options) => {
     const line = (name: string, windows: LimitWindow[]) => `${name}: ${windows.length === 0 ? '받지 못함' : windows.map(w => `${w.label} ${w.pct}%${w.resetsAt ? ` (${untilReset(w.resetsAt)})` : ''}`).join(' · ')}`
     return {
       text: [
-        line('Claude', l.claude) + (l.context === undefined ? '' : ` · 컨텍스트 ${l.context}%`) + (l.errors.claude ? ` [${l.errors.claude}]` : ''),
+        `이 세션: ${perfParts(await read($, perfAtom), l.context).map(x => x.text.replace(/ [█░]+ +/, ' ')).join(' · ') || '아직 응답 없음'}`,
+        line('Claude', l.claude) + (l.errors.claude ? ` [${l.errors.claude}]` : ''),
         line('Codex', l.codex),
         l.agy.length === 0 ? 'Antigravity: 받지 못함 (agy 미설치 또는 로그인 전)' : `Antigravity: ${l.agy.map(g => `${g.group} ${g.windows.map(w => `${w.label} ${w.pct}%`).join('·')}`).join(' / ')}`,
         '사용법: /limits [full|compact|off|refresh]',

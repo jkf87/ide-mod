@@ -37,6 +37,6 @@ child.stdout.on('data', chunk => {
   }
 })
 const send = message => child.stdin.write(`${JSON.stringify(message)}\n`)
-send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'ide-mod', version: '0.7.0' } } })
+send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'ide-mod', version: '0.8.0' } } })
 send({ method: 'initialized', params: {} })
 send({ id: 2, method: 'account/rateLimits/read', params: {} })

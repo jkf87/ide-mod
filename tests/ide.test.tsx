@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { blockStarts, captionFor, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, styleGate, untilReset } from '../hooks/register'
+import { blockStarts, cacheHitOf, captionFor, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
 const ROOT = '/work'
@@ -629,7 +629,7 @@ describe('사용 한도 띠', () => {
     expect(all).toContain('Claude')
     expect(all).toMatch(/5시간 ██▍?░+\s+24%/)
     expect(all).toContain('Fable')
-    expect(all).toContain('컨텍스트 31%')
+    expect(all).toMatch(/컨텍스트 ███░+\s+31%/)
     expect(all).toContain('Codex')
     expect(texts.find(t => t.text.startsWith('5시간') && t.text.includes('81%'))?.props.color).toBe('warning')
     expect(all).toContain('Antigravity')
@@ -637,6 +637,44 @@ describe('사용 한도 띠', () => {
     await $.command.run(typed('limits', 'compact'))
     await clock.advance(100)
     expect(textOf(await band.findAll({ type: 'Text' }))).toContain('주간 27%')
+    await band.unmount()
+  })
+})
+
+describe('이 세션 줄', () => {
+  test('캐시 적중·속도 계산', () => {
+    expect(cacheHitOf({ input_tokens: 10, cache_read_input_tokens: 950, cache_creation_input_tokens: 40 })).toBe(95)
+    expect(cacheHitOf({ input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 })).toBeUndefined()
+    expect(tokPerSecOf(400, 1000, 6000)).toBe(80)
+    expect(tokPerSecOf(5, 1000, 6000)).toBeUndefined()
+    expect(shortTokens(412_345)).toBe('412k')
+    expect(shortTokens(1_000_000)).toBe('1M')
+  })
+
+  test('메인 응답이 끝나면 띠 맨 위에 컨텍스트·캐시 적중·tok/s가 뜬다', async ($, on) => {
+    fakeWorld(on)
+    const clock = mock.clock(on)
+    on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [], context: { window: 1_000_000, tokens: 412_000, percent: 41 } } }) as never)
+    on('session.authorize', () => ({ value: null }) as never)
+    on('turn.step', async function* () {
+      yield { kind: 'text', index: 0, text: '안녕', ref: 1 } as never
+      await clock.advance(5_000)
+      yield { kind: 'stop', stopReason: 'end_turn', usage: { model: 'claude-opus-5-5', input_tokens: 20, cache_read_input_tokens: 400_000, cache_creation_input_tokens: 11_980, output_tokens: 400 }, ref: 2 } as never
+      return { turnId: 't1', index: 0, answer: '안녕', toolUses: [], stopReason: 'end_turn', usage: null }
+    })
+    const chunks: unknown[] = []
+    for await (const c of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 })) chunks.push(c)
+    expect(chunks.length).toBe(2)
+    await clock.advance(10)
+    const band = await $.ui.mount({ ...BAND, surface: 'terminal', props: bandProps })
+    await clock.advance(1_000)
+    const texts = await band.findAll({ type: 'Text' })
+    const all = textOf(texts)
+    expect(all).toContain('이 세션')
+    expect(all).toMatch(/컨텍스트 ████░+\s+41% 412k\/1M/)
+    expect(all).toContain('캐시 적중 97%')
+    expect(all).toContain('속도 80 tok/s')
+    expect(texts.find(t => t.text.startsWith('캐시 적중'))?.props.color).toBe('success')
     await band.unmount()
   })
 })

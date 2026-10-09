@@ -59,6 +59,25 @@ export type LimitsSnapshot = {
   errors: { claude?: string; codex?: string; agy?: string }
 }
 
+/** 이 세션의 메인 에이전트가 받은 마지막 응답: 컨텍스트, 프롬프트 캐시 적중, 생성 속도 */
+export type SessionPerf = {
+  /** 컨텍스트 창 사용률(0~100)과 토큰 수, 창 크기 */
+  context?: number
+  contextTokens?: number
+  window?: number
+  /** 마지막 응답의 입력 중 캐시에서 읽은 비율(0~100) */
+  cacheHit?: number
+  /** 이 세션 메인 응답을 모두 더한 캐시 적중률(0~100)과 그 재료 */
+  sessionHit?: number
+  readTokens: number
+  inputTokens: number
+  /** 마지막 응답의 출력 속도(토큰/초)와 첫 조각까지 걸린 시간 */
+  tokPerSec?: number
+  firstMs?: number
+  outputTokens?: number
+  at?: number
+}
+
 export type PeerRow = {
   name: string
   ref: string
@@ -148,6 +167,7 @@ declare module 'claude-code' {
       limits: LimitsSnapshot
       /** full: 출처마다 한 줄, compact: 한 줄, off: 숨김 */
       limitsLayout: 'full' | 'compact' | 'off'
+      perf: SessionPerf
 
       // ── 자동으로 열기 ──
       /** 이 세션에서 IDE 창을 저절로 한 번 열었는지 (/reload-plugins 뒤에 다시 열지 않게) */
