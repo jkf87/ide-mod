@@ -100,7 +100,7 @@ function fakeWorld(on: On): World {
   on('process.run', ($, e) => {
     const extra = world.extraRuns?.(e.argv.map(String))
     if (extra !== undefined) return { value: { exitCode: 0, stdout: extra, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-    if (e.argv[0] === '/bin/sh' && String(e.argv[2]).includes('agy')) return { value: { exitCode: 127, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (String(e.argv[1]).endsWith('agy-usage.sh')) return { value: { exitCode: 127, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     if (String(e.argv[1]).endsWith('codex-limits.mjs')) return { value: { exitCode: 1, stdout: '{"error":"no codex"}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     if (e.argv[0] === '/bin/sh') return { value: { exitCode: 0, stdout: SYS_MAC, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     world.rhwpCalls.push(e.argv.slice(2).join(' '))
@@ -621,7 +621,7 @@ describe('사용 한도 띠', () => {
     on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [], context: { window: 1_000_000, percent: 31 } } }) as never)
     on('session.authorize', () => ({ value: { handle: 'h', kind: 'bearer' } }))
     on('http.fetch', () => ({ value: { status: 200, ok: true, headers: {}, text: JSON.stringify(CLAUDE_USAGE) } }) as never)
-    world.extraRuns = (argv: string[]) => (String(argv[1]).endsWith('codex-limits.mjs') ? CODEX_OUT : argv[0] === '/bin/sh' && String(argv[2]).includes('agy') ? AGY_OUT : undefined)
+    world.extraRuns = (argv: string[]) => (String(argv[1]).endsWith('codex-limits.mjs') ? CODEX_OUT : String(argv[1]).endsWith('agy-usage.sh') ? AGY_OUT : undefined)
     await $.command.run(typed('limits', 'rows'))
     const band = await $.ui.mount({ ...BAND, surface: 'terminal', props: bandProps })
     await clock.advance(1_000)

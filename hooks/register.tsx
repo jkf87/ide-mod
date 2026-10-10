@@ -1791,11 +1791,14 @@ const limitsLayoutAtom = atom({ plugin: 'ide-mod', key: 'limitsLayout' } as cons
 const CLAUDE_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 const CLAUDE_EVERY_MS = 60_000
 const SLOW_EVERY_MS = 5 * 60_000
-const AGY_SCRIPT = 'for p in "$HOME/.local/bin/agy" /opt/homebrew/bin/agy /usr/local/bin/agy; do [ -x "$p" ] && exec "$p" --print-timeout 8s -p=/usage; done; command -v agy >/dev/null 2>&1 && exec agy --print-timeout 8s -p=/usage; exit 127'
+// agy는 bin/agy-usage.sh로만 부른다: 결과를 모든 세션이 15분 동안 나눠 쓰고, 토큰 갱신 주소의 DNS가 안 풀리면 띄우지 않는다
+// (세션마다 5분마다 agy를 띄우면 갱신이 실패할 때마다 대화형 로그인이 떠서 인증 코드를 물었다)
+const AGY_MAX_AGE_S = 900
 let lastBandAt = 0
 let isLimitsRunning = false
 let isLimitsRequested = false
 const nextAt = { claude: 0, codex: 0, agy: 0 }
+let isAgyForced = false
 
 const windowLabel = (mins: number) => (mins === 300 ? '5시간' : mins === 10080 ? '주간' : mins % 1440 === 0 ? `${mins / 1440}일` : `${Math.round(mins / 60)}시간`)
 const toMs = (value: unknown) => {
@@ -1913,7 +1916,9 @@ async function refreshLimits($: EngineInterface) {
 
     if (now >= nextAt.agy) {
       nextAt.agy = now + SLOW_EVERY_MS
-      const ran = await $.process.run(['/bin/sh', '-c', AGY_SCRIPT], { timeoutMs: 20_000 }).catch(() => undefined)
+      const dir = $.plugin.root.replace(/\/\.claude-plugin\/?$/, '')
+      const ran = await $.process.run(['/bin/sh', `${dir}/bin/agy-usage.sh`, String(isAgyForced ? 60 : AGY_MAX_AGE_S)], { timeoutMs: 25_000 }).catch(() => undefined)
+      isAgyForced = false
       const groups = ran === undefined || ran.exitCode !== 0 ? [] : parseAgyUsage(ran.stdout)
       if (groups.length > 0) await patchLimits(l => ({ ...l, agy: groups, at: { ...l.at, agy: now }, errors: { ...l.errors, agy: undefined } }))
       else nextAt.agy = now + 60 * 60_000
@@ -2257,6 +2262,7 @@ export const register: Register = (on, options) => {
       nextAt.claude = 0
       nextAt.codex = 0
       nextAt.agy = 0
+      isAgyForced = true
       lastBandAt = Date.now()
       await refreshLimits($).catch(() => undefined)
     }
