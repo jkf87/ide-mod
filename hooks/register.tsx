@@ -881,7 +881,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
   const requests = await read($, requestsAtom)
   // 같은 폴더의 지난 세션 요청이 앞에, 이번 세션 요청이 뒤에
   const pastRequests = await read($, pastRequestsAtom)
-  const history = [...pastRequests, ...requests]
+  const history = [...pastRequests, ...requests].sort((a, b) => a.at - b.at)
   const selectedN = await read($, selectedRequestAtom)
   const hwpView = await read($, hwpViewAtom)
   const isRequests = leftMode === 'requests'
@@ -921,6 +921,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
           void (async () => {
             await update($, leftModeAtom, m => (m === 'files' ? 'requests' : 'files'))
             await update($, treeHiddenAtom, () => false)
+            isPastRequested = false // 열 때마다 지난 세션·agy 요청을 다시 읽는다
           })()
         }
       />
@@ -1037,7 +1038,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
                 key={`req:${r.n}`}
                 plain
                 dimColor={(r.status !== 'running' || r.from !== undefined) && !isOn}
-                label={fit(`${r.from === undefined ? `${r.n}.` : '↺'} ${REQUEST_ICON[r.status]} ${r.from === undefined ? clock(r.at) : dayClock(r.at)} ${oneLine(r.text, 200)}`, treeWidth)}
+                label={fit(`${r.from === undefined ? `${r.n}.` : r.from.startsWith('agy ') ? 'agy' : '↺'} ${REQUEST_ICON[r.status]} ${r.from === undefined ? clock(r.at) : dayClock(r.at)} ${oneLine(r.text, 200)}`, treeWidth)}
                 onPress={() =>
                   void (async () => {
                     await update($, selectedRequestAtom, () => r.n)
@@ -1143,7 +1144,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
         let lastFrom: string | undefined | null = null
         for (const r of [...history].reverse()) {
           // 세션이 바뀌는 자리에 구분 줄
-          if (r.from !== lastFrom && r.from !== undefined) segments.push(<Text key={`all-session:${r.n}`} dimColor wrap="truncate-end">── 지난 세션 {r.from} ──</Text>)
+          if (r.from !== lastFrom && r.from !== undefined) segments.push(<Text key={`all-session:${r.n}`} dimColor wrap="truncate-end">── {r.from.startsWith('agy ') ? `agy 대화 ${r.from.slice(4)}` : `지난 세션 ${r.from}`} ──</Text>)
           lastFrom = r.from
           segments.push(
             <Text key={`all-head:${r.n}`} bold wrap="truncate-end">
@@ -1178,7 +1179,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
         const status = requestStatus(selected)
         fileColumn = (
           <Box key="ide-file" flexDirection="column" width={fileWidth} height={mainRows} overflow="hidden">
-            <Text bold wrap="truncate-end">{selected.from === undefined ? `요청 #${selected.n}` : `지난 세션 ${selected.from} 요청`} · {dayClock(selected.at)} · {status}</Text>
+            <Text bold wrap="truncate-end">{selected.from === undefined ? `요청 #${selected.n}` : selected.from.startsWith('agy ') ? `agy 대화 ${selected.from.slice(4)} 요청` : `지난 세션 ${selected.from} 요청`} · {dayClock(selected.at)} · {status}</Text>
             {selected.answer !== '' ? <Text dimColor wrap="truncate-end">Claude 답: {selected.answer}</Text> : <Text dimColor> </Text>}
             <Box flexDirection="column" height={contentRows} overflow="hidden">
               <Text color="success">{lines.slice(offset).join('\n')}</Text>
@@ -1294,6 +1295,7 @@ const dayClock = (ms: number) => {
   return isToday ? clock(ms) : `${d.getMonth() + 1}/${d.getDate()} ${clock(ms)}`
 }
 const requestStatus = (r: RequestItem) => {
+  if (r.from?.startsWith('agy ')) return 'agy에 보냄'
   const took = r.endedAt !== undefined ? ` · ${formatElapsed(r.endedAt - r.at)}` : ''
   return r.status === 'running' ? '진행 중' : r.status === 'done' ? `끝남${took}` : `중단됨${took}`
 }
@@ -1426,6 +1428,33 @@ type SavedRequests = { updatedAt?: number; root?: string; items?: RequestItem[] 
 const cleanSaved = (saved: SavedRequests | undefined) =>
   Array.isArray(saved?.items) ? saved.items.filter(r => !isMachineText(r.text)).map(r => ({ ...r, text: personText(r.text) })) : []
 
+/** agy(Antigravity CLI)가 남기는 입력 기록에서 이 폴더의 프롬프트만 (슬래시 명령·셸 명령은 빼고) */
+export function parseAgyHistory(text: string, root: string, limit = 100): RequestItem[] {
+  const items: RequestItem[] = []
+  for (const line of text.split('\n')) {
+    let row: { display?: unknown; timestamp?: unknown; workspace?: unknown; conversationId?: unknown; type?: unknown }
+    try {
+      row = JSON.parse(line)
+    } catch {
+      continue
+    }
+    const display = typeof row.display === 'string' ? row.display.trim() : ''
+    if (row.workspace !== root || row.type !== undefined || display === '' || display.startsWith('/')) continue
+    const at = Number(row.timestamp)
+    const last = items[items.length - 1]
+    // 같은 글을 연달아 다시 보낸 것은 한 번만
+    if (last !== undefined && last.text === display && Math.abs(last.at - at) < 10 * 60_000) continue
+    items.push({ n: 0, text: display.slice(0, 8000), at: Number.isFinite(at) ? at : 0, status: 'done', answer: '', from: `agy ${String(row.conversationId ?? '').slice(0, 8)}` })
+  }
+  return items.slice(-limit)
+}
+
+async function agyPrompts($: EngineInterface, root: string) {
+  const file = `${(await $.env.get('HOME')) ?? ''}/.gemini/antigravity-cli/history.jsonl`
+  if (!(await $.fs.exists(file).catch(() => false))) return []
+  return parseAgyHistory(String(await $.fs.read(file)), root)
+}
+
 /** 같은 폴더에서 연 지난 세션들의 요청을 모은다. 폴더를 적지 않았던 예전 기록은 대화 기록 파일이 이 폴더 아래 있는지로 가린다 */
 export async function loadPastRequests($: EngineInterface) {
   isPastRequested = true
@@ -1443,7 +1472,8 @@ export async function loadPastRequests($: EngineInterface) {
     if (items.length > 0) sessions.push({ id: other, at: saved?.updatedAt ?? items[items.length - 1].at, items })
   }
   const recent = sessions.sort((a, b) => b.at - a.at).slice(0, PAST_SESSIONS).reverse()
-  const past = recent.flatMap(s => s.items.map(r => ({ ...r, from: s.id.slice(0, 8) }))).slice(-PAST_ITEMS)
+  const agy = await agyPrompts($, root).catch(() => [] as RequestItem[])
+  const past = [...recent.flatMap(s => s.items.map(r => ({ ...r, from: s.id.slice(0, 8) }))), ...agy].sort((a, b) => a.at - b.at).slice(-PAST_ITEMS)
   await update($, pastRequestsAtom, () => past.map((r, i) => ({ ...r, n: i - past.length })))
 }
 

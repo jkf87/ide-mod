@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { blockStarts, cacheHitOf, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
+import { blockStarts, cacheHitOf, parseAgyHistory, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
 const ROOT = '/work'
@@ -767,6 +767,20 @@ describe('지난 세션 요청', () => {
     expect(text).not.toContain('다른 폴더 요청')
     expect((world.store.get('requests:test-session') as { root?: string }).root).toBe(ROOT)
     await ui.unmount()
+  })
+})
+
+describe('agy 프롬프트', () => {
+  test('agy 입력 기록에서 이 폴더 프롬프트만, 슬래시·셸 명령과 연달아 다시 보낸 글은 빼고', () => {
+    const lines = [
+      { display: '그림 그려줘', timestamp: '1000', workspace: '/work', conversationId: 'abcdef123456' },
+      { display: '그림 그려줘', timestamp: '2000', workspace: '/work', conversationId: 'abcdef123456' },
+      { display: '/model', timestamp: '3000', workspace: '/work', conversationId: 'abcdef123456', type: 'slash_command' },
+      { display: 'ls', timestamp: '4000', workspace: '/work', conversationId: 'abcdef123456', type: 'shell' },
+      { display: '다른 폴더', timestamp: '5000', workspace: '/elsewhere', conversationId: 'x' },
+    ].map(r => JSON.stringify(r)).join('\n')
+    const items = parseAgyHistory(lines, '/work')
+    expect(items.map(i => [i.text, i.from])).toEqual([['그림 그려줘', 'agy abcdef12']])
   })
 })
 
