@@ -879,6 +879,9 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
   const rev = await read($, revAtom)
   const leftMode = await read($, leftModeAtom)
   const requests = await read($, requestsAtom)
+  // 같은 폴더의 지난 세션 요청이 앞에, 이번 세션 요청이 뒤에
+  const pastRequests = await read($, pastRequestsAtom)
+  const history = [...pastRequests, ...requests]
   const selectedN = await read($, selectedRequestAtom)
   const hwpView = await read($, hwpViewAtom)
   const isRequests = leftMode === 'requests'
@@ -889,8 +892,9 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
   const sent = isHandoff ? await read($, handoffSentAtom) : null
   // 요청 기록 모드: 기본은 이번 세션 요청 전부를 오른쪽에 이어서 보여 주고, 왼쪽에서 고르면 그 요청 하나만 펼친다
   const requestView = await read($, requestViewAtom)
-  const isAllRequests = isRequests && requestView === 'all' && requests.length > 0
-  const selected = requests.find(r => r.n === selectedN) ?? requests[requests.length - 1]
+  const isAllRequests = isRequests && requestView === 'all' && history.length > 0
+  const selected = history.find(r => r.n === selectedN) ?? history[history.length - 1]
+  if (isRequests && !isPastRequested) $.clock.after(0, () => void loadPastRequests($).catch(() => undefined))
   const rightKey = isHandoff ? 'handoff' : isRequests ? (isAllRequests ? 'requests:all' : selected === undefined ? '' : `request:${selected.n}`) : active
   const isHwp = isFiles && HWP.test(active)
 
@@ -912,7 +916,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
         key="left-mode"
         plain
         hotkey="q"
-        label={isFiles ? `요청 기록 ${requests.length}` : '파일 트리'}
+        label={isFiles ? `요청 기록 ${history.length}` : '파일 트리'}
         onPress={() =>
           void (async () => {
             await update($, leftModeAtom, m => (m === 'files' ? 'requests' : 'files'))
@@ -963,14 +967,14 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
       {isHwp && (
         <Button key="hwp-next" plain hotkey="n" label="뒤쪽 ▶" onPress={() => void update($, hwpPagesAtom, all => ({ ...all, [active]: (all[active] ?? 0) + 1 }))} />
       )}
-      {isRequests && requests.length > 0 && (
+      {isRequests && history.length > 0 && (
         <Button key="request-all" plain hotkey="l" label={isAllRequests ? '하나만 보기' : '모두 보기'} onPress={() => void update($, requestViewAtom, v => (v === 'all' ? 'one' : 'all'))} />
       )}
       {isRequests && !isAllRequests && selected !== undefined && (
         <Button key="request-again" plain hotkey="p" label="입력창에 다시 넣기" onPress={() => void $.prompt.fill({ text: selected.text, mode: 'insert' })} />
       )}
       {isRequests && !isAllRequests && selected !== undefined && <Button key="request-copy" plain hotkey="c" label="복사" onPress={() => void $.ui.copy({ text: selected.text, surface: e.surface })} />}
-      {isAllRequests && <Button key="request-copy-all" plain hotkey="c" label="전부 복사" onPress={() => void $.ui.copy({ text: requestsAsText(requests), surface: e.surface })} />}
+      {isAllRequests && <Button key="request-copy-all" plain hotkey="c" label="전부 복사" onPress={() => void $.ui.copy({ text: requestsAsText(history), surface: e.surface })} />}
       {isHandoff && handoff !== undefined && (
         <Button key="handoff-copy" plain hotkey="c" label="핸드오프 글 복사" onPress={() => void $.ui.copy({ text: handoff.text, surface: e.surface })} />
       )}
@@ -1017,13 +1021,13 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
     )
   } else if (showTree && isRequests) {
     const treeView = Math.max(1, mainRows - 1)
-    const newestFirst = [...requests].reverse()
+    const newestFirst = [...history].reverse()
     const requestOffset = clamp(await read($, requestOffsetAtom), 0, newestFirst.length - treeView)
     Object.assign(layout, { requestRows: newestFirst.length, treeView })
     const shown = newestFirst.slice(requestOffset, requestOffset + treeView)
     treeColumn = (
       <Box key="ide-requests" flexDirection="column" width={treeWidth} height={mainRows} overflow="hidden">
-        <Text bold wrap="truncate-end">요청 기록 {requests.length}개{requests.length > treeView ? ` · ${requestOffset + 1}-${requestOffset + shown.length}` : ''}</Text>
+        <Text bold wrap="truncate-end">요청 기록 {history.length}개{pastRequests.length > 0 ? ` (지난 세션 ${pastRequests.length})` : ''}{history.length > treeView ? ` · ${requestOffset + 1}-${requestOffset + shown.length}` : ''}</Text>
         {shown.length === 0 && <Text dimColor>아직 보낸 요청이 없어요. 이 세션에서 보내는 요청이 여기 쌓여요.</Text>}
         {shown.map(r => {
           const isOn = !isAllRequests && r.n === selected?.n
@@ -1032,8 +1036,8 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
               <Button
                 key={`req:${r.n}`}
                 plain
-                dimColor={r.status !== 'running' && !isOn}
-                label={fit(`${r.n}. ${REQUEST_ICON[r.status]} ${clock(r.at)} ${oneLine(r.text, 200)}`, treeWidth)}
+                dimColor={(r.status !== 'running' || r.from !== undefined) && !isOn}
+                label={fit(`${r.from === undefined ? `${r.n}.` : '↺'} ${REQUEST_ICON[r.status]} ${r.from === undefined ? clock(r.at) : dayClock(r.at)} ${oneLine(r.text, 200)}`, treeWidth)}
                 onPress={() =>
                   void (async () => {
                     await update($, selectedRequestAtom, () => r.n)
@@ -1136,10 +1140,14 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
       if (isAllRequests) {
         // 요청 하나가 머리줄 + 본문 줄들 + 답 한 줄 + 빈 줄. 스크롤은 이 논리 줄 단위로, 넘치는 줄은 창이 자른다
         const segments: RenderElement[] = []
-        for (const r of [...requests].reverse()) {
+        let lastFrom: string | undefined | null = null
+        for (const r of [...history].reverse()) {
+          // 세션이 바뀌는 자리에 구분 줄
+          if (r.from !== lastFrom && r.from !== undefined) segments.push(<Text key={`all-session:${r.n}`} dimColor wrap="truncate-end">── 지난 세션 {r.from} ──</Text>)
+          lastFrom = r.from
           segments.push(
             <Text key={`all-head:${r.n}`} bold wrap="truncate-end">
-              #{r.n} · {dayClock(r.at)} · {REQUEST_ICON[r.status]} {requestStatus(r)}
+              {r.from === undefined ? `#${r.n}` : '↺'} · {dayClock(r.at)} · {REQUEST_ICON[r.status]} {requestStatus(r)}
             </Text>,
           )
           r.text.split('\n').forEach((line, i) => segments.push(<Text key={`all-line:${r.n}:${i}`} color="success">{line === '' ? ' ' : line}</Text>))
@@ -1150,7 +1158,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
         layout.fileMaxOffset = Math.max(0, segments.length - 1)
         fileColumn = (
           <Box key="ide-file" flexDirection="column" width={fileWidth} height={mainRows} overflow="hidden">
-            <Text bold wrap="truncate-end">이번 세션 요청 {requests.length}개 전부 · 최근 것이 위 · 휠로 스크롤</Text>
+            <Text bold wrap="truncate-end">이번 세션 요청 {requests.length}개{pastRequests.length > 0 ? ` + 지난 세션 ${pastRequests.length}개` : ''} 전부 · 최근 것이 위 · 휠로 스크롤</Text>
             <Box flexDirection="column" height={Math.max(1, mainRows - 1)} overflow="hidden">
               {segments.slice(offset)}
             </Box>
@@ -1170,7 +1178,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
         const status = requestStatus(selected)
         fileColumn = (
           <Box key="ide-file" flexDirection="column" width={fileWidth} height={mainRows} overflow="hidden">
-            <Text bold wrap="truncate-end">요청 #{selected.n} · {clock(selected.at)} · {status}</Text>
+            <Text bold wrap="truncate-end">{selected.from === undefined ? `요청 #${selected.n}` : `지난 세션 ${selected.from} 요청`} · {dayClock(selected.at)} · {status}</Text>
             {selected.answer !== '' ? <Text dimColor wrap="truncate-end">Claude 답: {selected.answer}</Text> : <Text dimColor> </Text>}
             <Box flexDirection="column" height={contentRows} overflow="hidden">
               <Text color="success">{lines.slice(offset).join('\n')}</Text>
@@ -1252,6 +1260,8 @@ const requestsAtom = atom({ plugin: 'ide-mod', key: 'requests' } as const, [] as
 const selectedRequestAtom = atom({ plugin: 'ide-mod', key: 'selectedRequest' } as const, 0)
 const requestOffsetAtom = atom({ plugin: 'ide-mod', key: 'requestOffset' } as const, 0)
 const requestViewAtom = atom({ plugin: 'ide-mod', key: 'requestView' } as const, 'all' as 'all' | 'one')
+const pastRequestsAtom = atom({ plugin: 'ide-mod', key: 'pastRequests' } as const, [] as RequestItem[])
+let isPastRequested = false
 const hwpViewAtom = atom({ plugin: 'ide-mod', key: 'hwpView' } as const, 'doc' as 'doc' | 'image')
 const hwpPagesAtom = atom({ plugin: 'ide-mod', key: 'hwpPages' } as const, {} as Record<string, number>)
 const lectureAtom = atom({ plugin: 'ide-mod', key: 'isLecture' } as const, false)
@@ -1267,6 +1277,8 @@ const PROSE = /\.(md|markdown|txt)$/i
 const MAX_REQUESTS = 300
 const STORE_PREFIX = 'requests:'
 const STORE_SESSIONS = 40
+const PAST_SESSIONS = 5
+const PAST_ITEMS = 200
 const REQUEST_ORIGINS = ['composer', 'bridge', 'sdk']
 
 // ── 요청 기록 ──
@@ -1400,11 +1412,39 @@ async function sendHandoff($: EngineInterface, peer: PeerRow, memo = '') {
 
 /** 요청 기록 전체를 붙여 넣기 좋은 글로 (오래된 것부터) */
 export const requestsAsText = (items: RequestItem[]) =>
-  items.map(r => `#${r.n} ${dayClock(r.at)} ${REQUEST_ICON[r.status]}\n${r.text}${r.answer !== '' ? `\n└ Claude: ${r.answer}` : ''}`).join('\n\n')
+  items.map(r => `${r.from === undefined ? `#${r.n}` : `↺ 지난 세션 ${r.from}`} ${dayClock(r.at)} ${REQUEST_ICON[r.status]}\n${r.text}${r.answer !== '' ? `\n└ Claude: ${r.answer}` : ''}`).join('\n\n')
 
 async function saveRequests($: EngineInterface) {
   const id = await $.session.id()
-  await $.store.set(`${STORE_PREFIX}${id}`, { updatedAt: Date.now(), items: await read($, requestsAtom) })
+  const root = await $.session.root().catch(() => '')
+  await $.store.set(`${STORE_PREFIX}${id}`, { updatedAt: Date.now(), root, items: await read($, requestsAtom) })
+}
+
+type SavedRequests = { updatedAt?: number; root?: string; items?: RequestItem[] }
+
+/** 저장된 요청에서 사람이 쓴 것만 (0.5.0까지는 작업 알림·다른 세션 메시지로 시작한 턴도 요청으로 적었다) */
+const cleanSaved = (saved: SavedRequests | undefined) =>
+  Array.isArray(saved?.items) ? saved.items.filter(r => !isMachineText(r.text)).map(r => ({ ...r, text: personText(r.text) })) : []
+
+/** 같은 폴더에서 연 지난 세션들의 요청을 모은다. 폴더를 적지 않았던 예전 기록은 대화 기록 파일이 이 폴더 아래 있는지로 가린다 */
+export async function loadPastRequests($: EngineInterface) {
+  isPastRequested = true
+  const id = await $.session.id()
+  const root = await $.session.root().catch(() => '')
+  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${(await $.env.get('HOME')) ?? ''}/.claude`
+  const projectDir = `${config}/projects/${root.replace(/[^a-zA-Z0-9]/g, '-')}`
+  const keys = (await $.store.keys()).filter(k => k.startsWith(STORE_PREFIX) && k !== `${STORE_PREFIX}${id}`)
+  const sessions: { id: string; at: number; items: RequestItem[] }[] = []
+  for (const key of keys) {
+    const saved = (await $.store.get(key).catch(() => undefined)) as SavedRequests | undefined
+    const other = key.slice(STORE_PREFIX.length)
+    const isHere = saved?.root !== undefined ? saved.root === root : await $.fs.exists(`${projectDir}/${other}.jsonl`).catch(() => false)
+    const items = isHere ? cleanSaved(saved) : []
+    if (items.length > 0) sessions.push({ id: other, at: saved?.updatedAt ?? items[items.length - 1].at, items })
+  }
+  const recent = sessions.sort((a, b) => b.at - a.at).slice(0, PAST_SESSIONS).reverse()
+  const past = recent.flatMap(s => s.items.map(r => ({ ...r, from: s.id.slice(0, 8) }))).slice(-PAST_ITEMS)
+  await update($, pastRequestsAtom, () => past.map((r, i) => ({ ...r, n: i - past.length })))
 }
 
 /** 세션을 이어 열었거나 모드가 다시 로드됐을 때 저장해 둔 요청을 되살리고, 오래된 세션 기록은 정리한다 */
@@ -1423,11 +1463,10 @@ export const isMachineText = (text: string) => {
 async function loadRequests($: EngineInterface) {
   const id = await $.session.id()
   if ((await read($, requestsAtom)).length === 0) {
-    const saved = (await $.store.get(`${STORE_PREFIX}${id}`)) as { items?: RequestItem[] } | undefined
-    // 0.5.0까지는 작업 알림·다른 세션 메시지로 시작한 턴도 요청으로 적었다: 불러올 때 걸러 낸다
-    const items = Array.isArray(saved?.items) ? saved.items.filter(r => !isMachineText(r.text)).map(r => ({ ...r, text: personText(r.text) })) : []
+    const items = cleanSaved((await $.store.get(`${STORE_PREFIX}${id}`)) as SavedRequests | undefined)
     if (items.length > 0) await update($, requestsAtom, () => items)
   }
+  await loadPastRequests($).catch(() => undefined)
   const keys = (await $.store.keys()).filter(k => k.startsWith(STORE_PREFIX))
   if (keys.length <= STORE_SESSIONS) return
   const dated = await Promise.all(keys.map(async k => ({ k, at: ((await $.store.get(k)) as { updatedAt?: number } | undefined)?.updatedAt ?? 0 })))
@@ -2162,7 +2201,7 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'open', description: 'IDE 창에서 폴더나 파일을 엽니다', argumentHint: '[경로]' }).catch(() => undefined)
     await $.command.register({ name: 'lecture', description: '강의 모드: Claude가 하는 일을 입력창 위에 쉬운 한국어 자막으로', argumentHint: '[on|off]' }).catch(() => undefined)
     await $.command.register({ name: 'handoff', description: '이 세션을 다른 에이전트 세션에 넘깁니다 (세션 ID·대화 기록·요청 목록)', argumentHint: '[세션 이름 또는 ref] [메모]' }).catch(() => undefined)
-    await $.command.register({ name: 'limits', description: '입력창 위 사용 한도 띠 (Claude·Codex·Antigravity)', argumentHint: '[full|compact|off|refresh]' }).catch(() => undefined)
+    await $.command.register({ name: 'limits', description: '입력창 위 사용 한도 띠 (세션·Claude·Codex·Antigravity)', argumentHint: '[line|rows|off|refresh]' }).catch(() => undefined)
     await $.command.register({ name: 'style-gate', description: '한국어 문체 게이트: 원고의 AI티 지표를 검사 (자동 검사 on/off)', argumentHint: '[파일|on|off]' }).catch(() => undefined)
     await loadRequests($).catch(() => undefined)
     const started = await next(e)

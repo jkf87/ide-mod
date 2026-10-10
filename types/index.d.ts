@@ -95,6 +95,8 @@ export type RequestItem = {
   /** Claude 답의 첫 줄 */
   answer: string
   endedAt?: number
+  /** 같은 폴더의 지난 세션에서 온 요청이면 그 세션 ID 앞 8자 */
+  from?: string
 }
 
 export type GateCheck = { label: string; count: number; limit: number; isHard: boolean }
@@ -151,6 +153,8 @@ declare module 'claude-code' {
       /** 왼쪽 칸: 파일 트리 또는 요청 기록 */
       leftMode: 'files' | 'requests' | 'handoff'
       requests: RequestItem[]
+      /** 같은 폴더에서 연 지난 세션들의 요청 (오래된 것부터, n은 음수) */
+      pastRequests: RequestItem[]
       /** 오른쪽에 펼친 요청 번호; 0이면 가장 최근 */
       selectedRequest: number
       requestOffset: number

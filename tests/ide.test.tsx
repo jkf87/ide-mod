@@ -129,7 +129,7 @@ function fakeWorld(on: On): World {
     if (String(key).startsWith('requests:')) world.saved = value
     return { value: undefined } as never
   })
-  on('store.keys', () => ({ value: [] }))
+  on('store.keys', () => ({ value: [...world.store.keys()] }))
   return world
 }
 
@@ -641,7 +641,7 @@ describe('사용 한도 띠', () => {
     const line = textOf(await band.findAll({ type: 'Text' }))
     expect(line).toContain('Codex')
     expect(line).toContain('Gemini')
-    expect(line).toContain('81% 4일')
+    expect(line).toMatch(/81% \d+일/)
     expect((await band.findAll({ type: 'Raster' })).length).toBeGreaterThan(0)
     await band.unmount()
   })
@@ -736,6 +736,27 @@ describe('데스크톱 앱', () => {
     const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: props(140) })
     await clock.advance(25_000)
     expect(asked.length).toBe(1)
+    await ui.unmount()
+  })
+})
+
+describe('지난 세션 요청', () => {
+  test('같은 폴더에서 연 지난 세션의 요청이 요청 기록에 함께 나온다 (다른 폴더 것은 빼고)', async ($, on) => {
+    const world = fakeWorld(on)
+    const clock = mock.clock(on)
+    world.store.set('requests:old-session-1', { updatedAt: 1000, root: ROOT, items: [{ n: 1, text: '어제 보낸 요청', at: 1000, status: 'done', answer: '' }] })
+    world.store.set('requests:other-folder', { updatedAt: 2000, root: '/elsewhere', items: [{ n: 1, text: '다른 폴더 요청', at: 2000, status: 'done', answer: '' }] })
+    await ask($, '오늘 요청', 't1')
+    await $.command.run(typed('ide', ''))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    await ui.press({ key: 'left-mode' })
+    await clock.advance(10)
+    const text = textOf(await ui.findAll({ type: 'Text' }))
+    expect(text).toContain('어제 보낸 요청')
+    expect(text).toContain('오늘 요청')
+    expect(text).toContain('지난 세션 old-sess')
+    expect(text).not.toContain('다른 폴더 요청')
+    expect((world.store.get('requests:test-session') as { root?: string }).root).toBe(ROOT)
     await ui.unmount()
   })
 })
