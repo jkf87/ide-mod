@@ -67,6 +67,23 @@ Claude Code 터미널 세션에서 아래 한 줄을 입력하세요.
 - Codex는 Codex CLI의 앱 서버(`codex app-server`)에 5분마다 물어요. Antigravity는 `bin/agy-usage.sh`가 `agy /usage`를 부르는데, 결과를 `~/.cache/ide-mod`에 두고 모든 세션이 15분 동안 나눠 써요. agy 로그인 토큰을 갱신하는 주소의 DNS가 안 풀리면 agy를 띄우지 않고, 실패하면 30분 쉬어요. 세션마다 자주 띄우면 토큰 갱신이 실패할 때마다 agy가 인증 코드를 묻기 때문이에요. 설치돼 있지 않으면 그 묶음은 나오지 않아요.
 - 띠가 화면에 있을 때만 받아요. `/limits rows`로 출처마다 한 줄(막대·리셋 시각), `/limits line`으로 다시 한 줄, `/limits off`로 숨겨요.
 
+### agy(Antigravity CLI) 상태줄
+
+agy에도 같은 도트 게이지 한 줄을 띄울 수 있어요. agy 안에서 한 번 입력하세요.
+
+```
+/statusline node ~/ide-mod/bin/agy-statusline.mjs
+```
+
+```
+Gemini 3.8 Flash 컨텍스트 ⡇⣀⣀⣀ 12% 작업 중 │ Gemini 5h ⣀⣀⣀⣀ 3% 주 ⡇⣀⣀⣀ 13% │ AG Claude·GPT 5h 0% 주 2% │ Claude 5h 3% 주 98% 1일 │ Codex 주 82% 3일
+```
+
+- agy가 상태줄에 넘겨주는 모델·컨텍스트·Antigravity 한도를 그대로 써요. agy를 따로 띄우지 않아요.
+- Claude·Codex 한도는 ide-mod가 `~/.cache/ide-mod/limits.json`에 남긴 값을 읽어요(30분 넘은 값은 안 써요).
+- 거꾸로 agy가 준 Antigravity 한도를 `~/.cache/ide-mod/agy-usage.tsv`에 남겨서, agy를 쓰는 동안에는 ide-mod도 agy를 띄우지 않고 이 값을 써요.
+- 경로는 ide-mod를 받은 폴더에 맞게 바꾸세요. 되돌리려면 `/statusline delete`.
+
 ### 시스템 상태 (보드 맨 위)
 
 - 메모리 사용량과 **메모리 압력**(정상·경고·위험), **스왑** 사용량, **디스크** 사용률과 남은 용량을 한 줄로 보여 줘요. 보드가 떠 있을 때만 10초마다 다시 읽어요.

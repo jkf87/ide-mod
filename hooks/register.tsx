@@ -1923,9 +1923,35 @@ async function refreshLimits($: EngineInterface) {
       if (groups.length > 0) await patchLimits(l => ({ ...l, agy: groups, at: { ...l.at, agy: now }, errors: { ...l.errors, agy: undefined } }))
       else nextAt.agy = now + 60 * 60_000
     }
+    await shareLimits($).catch(() => undefined)
   } finally {
     isLimitsRunning = false
   }
+}
+
+/** Claude·Codex 한도를 ~/.cache/ide-mod/limits.json에 남긴다: agy 상태줄(bin/agy-statusline.mjs)이 읽는다 */
+let lastShared = { body: '', at: 0 }
+async function shareLimits($: EngineInterface) {
+  const l = await read($, limitsAtom)
+  if (l.claude.length === 0 && l.codex.length === 0) return
+  // 값이 바뀌었거나 5분이 지났을 때만 쓴다 (엔진이 준 Claude 값은 at이 없어서 내용으로 비교한다)
+  const body = JSON.stringify({ claude: l.claude, codex: l.codex })
+  const now = Date.now()
+  if (body === lastShared.body && now - lastShared.at < 5 * 60_000) return
+  lastShared = { body, at: now }
+  const base = (await $.env.get('XDG_CACHE_HOME')) || `${(await $.env.get('HOME')) ?? ''}/.cache`
+  const file = `${base}/ide-mod/limits.json`
+  // 세션이 여럿이면 아직 한쪽을 못 받은 세션이 빈 값으로 덮지 않게, 출처마다 받은 것만 고쳐 쓴다
+  let old: Record<string, unknown> = {}
+  try {
+    old = JSON.parse(String(await $.fs.read(file))) as Record<string, unknown>
+  } catch {
+    // 처음이거나 깨진 파일
+  }
+  const next = { ...old, updatedAt: now }
+  if (l.claude.length > 0) Object.assign(next, { claude: l.claude, claudeAt: now })
+  if (l.codex.length > 0) Object.assign(next, { codex: l.codex, codexAt: now })
+  await $.fs.write(file, JSON.stringify(next))
 }
 
 /** 리셋까지 남은 시간: "44분 후", "3시간 20분 후", "5일 1시간 후" */

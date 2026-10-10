@@ -32,7 +32,7 @@ const real = (p: string) => {
   return abs
 }
 
-type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined; store: Map<string, unknown> }
+type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined; store: Map<string, unknown>; written: Map<string, string> }
 
 const LISTING = `This session is 모드에 대해 [634505] — the name other sessions use to message it.
 
@@ -41,7 +41,7 @@ Peer sessions (2):
   목차작성 [ed478e]  ·  interactive  ·  busy  ·  started 3h ago`
 
 function fakeWorld(on: On): World {
-  const world: World = { opened: 0, statuses: [], rhwpCalls: [], scripts: [], sent: [], copied: [], store: new Map() }
+  const world: World = { opened: 0, statuses: [], rhwpCalls: [], scripts: [], sent: [], copied: [], store: new Map(), written: new Map() }
   on('session.cwd', () => ({ value: ROOT }))
   on('env.get', () => ({ value: '/home/me' }))
   on('fs.stat', ($, e) => {
@@ -130,6 +130,11 @@ function fakeWorld(on: On): World {
     return { value: undefined } as never
   })
   on('store.keys', () => ({ value: [...world.store.keys()] }))
+  on('fs.write', ($, e) => {
+    const { path, text } = e as unknown as { path: string; text: string }
+    world.written.set(path, text)
+    return { value: undefined } as never
+  })
   return world
 }
 
@@ -634,6 +639,10 @@ describe('사용 한도 띠', () => {
     expect(all).toContain('Codex')
     expect(texts.find(t => t.text.startsWith('5시간') && t.text.includes('81%'))?.props.color).toBe('warning')
     expect(all).toContain('Antigravity')
+    // agy 상태줄이 읽게 Claude·Codex 한도를 파일로 남긴다
+    const shared = JSON.parse([...world.written].find(([k]) => k.endsWith('/ide-mod/limits.json'))?.[1] ?? '{}')
+    expect(shared.claude[0]).toMatchObject({ label: '5시간', pct: 24 })
+    expect(shared.codex.length).toBe(2)
     expect(all).toContain('Gemini 5시간')
     // 기본: 모든 출처를 한 줄에, 게이지는 도트(Raster)
     await $.command.run(typed('limits', 'line'))
