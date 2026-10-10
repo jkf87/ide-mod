@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { blockStarts, cacheHitOf, parseAgyHistory, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
+import { blockStarts, cacheHitOf, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
 const ROOT = '/work'
@@ -781,6 +781,14 @@ describe('agy 프롬프트', () => {
     ].map(r => JSON.stringify(r)).join('\n')
     const items = parseAgyHistory(lines, '/work')
     expect(items.map(i => [i.text, i.from])).toEqual([['그림 그려줘', 'agy abcdef12']])
+  })
+})
+
+describe('Codex 프롬프트', () => {
+  test('prompts.mjs --json 출력을 Codex 요청으로 읽는다', () => {
+    const out = JSON.stringify([{ tool: 'Codex', text: '일정 잡아줘', at: 1000, dir: '/work', session: '01a11d46-5901' }, { tool: 'Codex', text: ' ', at: 2000 }])
+    expect(parseCodexPrompts(out).map(r => [r.text, r.from])).toEqual([['일정 잡아줘', 'Codex 01a11d46']])
+    expect(parseCodexPrompts('not json')).toEqual([])
   })
 })
 

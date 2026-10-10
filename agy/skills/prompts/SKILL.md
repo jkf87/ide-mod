@@ -1,6 +1,6 @@
 ---
 name: prompts
-description: Shows the prompts the user sent in this folder to Claude Code and agy, oldest first. Use only when the user types /prompts or asks to see their own prompt history ("내가 보낸 프롬프트", "프롬프트 기록", "요청 기록").
+description: Shows the prompts the user sent in this folder to Claude Code, Codex and agy, oldest first. Use only when the user types /prompts or asks to see their own prompt history ("내가 보낸 프롬프트", "프롬프트 기록", "요청 기록").
 ---
 
 # /prompts — 내가 보낸 프롬프트 보기

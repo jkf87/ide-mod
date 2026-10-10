@@ -133,9 +133,9 @@ Gemini 3.8 Flash 컨텍스트 ⡇⣀⣀⣀ 12% 작업 중 │ Gemini 5h ⣀⣀�
 - **모두 보기**(기본): 오른쪽 칸에 이번 세션 요청 전부를 전문 그대로 이어서 보여 줘요. 요청마다 시각·상태·걸린 시간과 Claude 답의 첫 줄이 붙어요. 내가 무슨 말을 했는지 한눈에 훑어볼 때 써요. `c`로 전부 복사해요.
 - 요청을 누르면 그 요청 하나만 펼쳐요. `p`로 입력창에 다시 넣고, `c`로 복사해요. `l`로 모두 보기와 하나만 보기를 오가요.
 - 세션별로 저장돼서 모드를 다시 불러오거나 세션을 이어 열어도 남아요. 최근 40개 세션까지 보관해요.
-- agy(Antigravity CLI)에 보낸 같은 폴더의 프롬프트도 `agy` 표시를 달고 시간순으로 섞여 나와요(agy의 `~/.gemini/antigravity-cli/history.jsonl`을 읽어요).
+- agy(Antigravity CLI)와 Codex에 보낸 같은 폴더의 프롬프트도 `agy`·`Codex` 표시를 달고 시간순으로 섞여 나와요. agy는 `~/.gemini/antigravity-cli/history.jsonl`을, Codex는 스레드 목록(`~/.codex/state_*.sqlite`)에서 사람이 연 CLI·데스크톱 스레드만 골라 대화 파일에서 사람이 보낸 메시지만 읽어요(서브에이전트·`codex exec`는 빼요).
 - agy에서는 **`/prompts`** 명령으로 봐요(`/prompts 100`, `/prompts --all`). 설치: `ln -s ~/ide-mod/agy/skills/prompts ~/.gemini/config/skills/prompts`. agy의 `/` 명령은 스킬이라 모델이 한 번 명령을 실행해 결과를 그대로 보여 줘요. 실행 때마다 묻지 않게 하려면 agy 설정 `permissions.allow`에 `command(node ~/ide-mod/bin/prompts.mjs)`를 넣으세요.
-- agy 안이나 아무 터미널에서 `node ~/ide-mod/bin/prompts.mjs`를 실행하면 이 폴더에서 Claude와 agy에 보낸 프롬프트를 시간순으로 찍어 줘요. agy에서는 `!node ~/ide-mod/bin/prompts.mjs`처럼 `!`를 붙이면 모델을 거치지 않아요. `100`으로 개수, `--all`로 모든 폴더.
+- agy 안이나 아무 터미널에서 `node ~/ide-mod/bin/prompts.mjs`를 실행하면 이 폴더에서 Claude·Codex·agy에 보낸 프롬프트를 시간순으로 찍어 줘요. agy에서는 `!node ~/ide-mod/bin/prompts.mjs`처럼 `!`를 붙이면 모델을 거치지 않아요. `100`으로 개수, `--all`로 모든 폴더, `--only codex,agy`로 도구 고르기.
 - 세션을 껐다가 **새 세션**을 열어도, 같은 폴더에서 연 지난 세션 5개의 요청(최대 200개)이 `↺` 표시와 날짜를 달고 이번 세션 요청 앞에 이어져요. 모두 보기에서는 세션마다 `── 지난 세션 <ID> ──` 줄로 나눠요.
 
 ### 입력창 위: 강의 자막과 문체 게이트

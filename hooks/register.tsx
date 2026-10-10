@@ -1038,7 +1038,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
                 key={`req:${r.n}`}
                 plain
                 dimColor={(r.status !== 'running' || r.from !== undefined) && !isOn}
-                label={fit(`${r.from === undefined ? `${r.n}.` : r.from.startsWith('agy ') ? 'agy' : '↺'} ${REQUEST_ICON[r.status]} ${r.from === undefined ? clock(r.at) : dayClock(r.at)} ${oneLine(r.text, 200)}`, treeWidth)}
+                label={fit(`${r.from === undefined ? `${r.n}.` : (otherTool(r.from) ?? '↺')} ${REQUEST_ICON[r.status]} ${r.from === undefined ? clock(r.at) : dayClock(r.at)} ${oneLine(r.text, 200)}`, treeWidth)}
                 onPress={() =>
                   void (async () => {
                     await update($, selectedRequestAtom, () => r.n)
@@ -1144,7 +1144,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
         let lastFrom: string | undefined | null = null
         for (const r of [...history].reverse()) {
           // 세션이 바뀌는 자리에 구분 줄
-          if (r.from !== lastFrom && r.from !== undefined) segments.push(<Text key={`all-session:${r.n}`} dimColor wrap="truncate-end">── {r.from.startsWith('agy ') ? `agy 대화 ${r.from.slice(4)}` : `지난 세션 ${r.from}`} ──</Text>)
+          if (r.from !== lastFrom && r.from !== undefined) segments.push(<Text key={`all-session:${r.n}`} dimColor wrap="truncate-end">── {otherTool(r.from) !== undefined ? `${r.from.replace(' ', ' 대화 ')}` : `지난 세션 ${r.from}`} ──</Text>)
           lastFrom = r.from
           segments.push(
             <Text key={`all-head:${r.n}`} bold wrap="truncate-end">
@@ -1179,7 +1179,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
         const status = requestStatus(selected)
         fileColumn = (
           <Box key="ide-file" flexDirection="column" width={fileWidth} height={mainRows} overflow="hidden">
-            <Text bold wrap="truncate-end">{selected.from === undefined ? `요청 #${selected.n}` : selected.from.startsWith('agy ') ? `agy 대화 ${selected.from.slice(4)} 요청` : `지난 세션 ${selected.from} 요청`} · {dayClock(selected.at)} · {status}</Text>
+            <Text bold wrap="truncate-end">{selected.from === undefined ? `요청 #${selected.n}` : otherTool(selected.from) !== undefined ? `${selected.from.replace(' ', ' 대화 ')} 요청` : `지난 세션 ${selected.from} 요청`} · {dayClock(selected.at)} · {status}</Text>
             {selected.answer !== '' ? <Text dimColor wrap="truncate-end">Claude 답: {selected.answer}</Text> : <Text dimColor> </Text>}
             <Box flexDirection="column" height={contentRows} overflow="hidden">
               <Text color="success">{lines.slice(offset).join('\n')}</Text>
@@ -1294,8 +1294,11 @@ const dayClock = (ms: number) => {
   const isToday = d.toDateString() === new Date().toDateString()
   return isToday ? clock(ms) : `${d.getMonth() + 1}/${d.getDate()} ${clock(ms)}`
 }
+/** 다른 도구(agy·Codex)에 보낸 요청이면 그 이름: from이 "agy 1a2b3c4d", "Codex 1a2b3c4d" */
+const otherTool = (from: string | undefined) => (from === undefined ? undefined : /^(agy|Codex) /.exec(from)?.[1])
 const requestStatus = (r: RequestItem) => {
-  if (r.from?.startsWith('agy ')) return 'agy에 보냄'
+  const tool = otherTool(r.from)
+  if (tool !== undefined) return `${tool}에 보냄`
   const took = r.endedAt !== undefined ? ` · ${formatElapsed(r.endedAt - r.at)}` : ''
   return r.status === 'running' ? '진행 중' : r.status === 'done' ? `끝남${took}` : `중단됨${took}`
 }
@@ -1449,6 +1452,28 @@ export function parseAgyHistory(text: string, root: string, limit = 100): Reques
   return items.slice(-limit)
 }
 
+/** Codex: bin/prompts.mjs가 Codex 스레드 목록과 대화 파일에서 사람이 보낸 메시지만 뽑아 준다 */
+export function parseCodexPrompts(out: string): RequestItem[] {
+  let rows: { text?: unknown; at?: unknown; session?: unknown }[] = []
+  try {
+    rows = JSON.parse(out)
+  } catch {
+    return []
+  }
+  if (!Array.isArray(rows)) return []
+  return rows.flatMap(r =>
+    typeof r.text === 'string' && r.text.trim() !== '' && typeof r.at === 'number'
+      ? [{ n: 0, text: r.text.trim().slice(0, 8000), at: r.at, status: 'done' as const, answer: '', from: `Codex ${String(r.session ?? '').slice(0, 8)}` }]
+      : [],
+  )
+}
+
+async function codexPrompts($: EngineInterface, root: string) {
+  const dir = $.plugin.root.replace(/\/\.claude-plugin\/?$/, '')
+  const ran = await $.process.run(['node', `${dir}/bin/prompts.mjs`, '--json', '--only', 'codex', '--cwd', root, '100'], { timeoutMs: 15_000 })
+  return ran.exitCode === 0 ? parseCodexPrompts(ran.stdout) : []
+}
+
 async function agyPrompts($: EngineInterface, root: string) {
   const file = `${(await $.env.get('HOME')) ?? ''}/.gemini/antigravity-cli/history.jsonl`
   if (!(await $.fs.exists(file).catch(() => false))) return []
@@ -1473,7 +1498,8 @@ export async function loadPastRequests($: EngineInterface) {
   }
   const recent = sessions.sort((a, b) => b.at - a.at).slice(0, PAST_SESSIONS).reverse()
   const agy = await agyPrompts($, root).catch(() => [] as RequestItem[])
-  const past = [...recent.flatMap(s => s.items.map(r => ({ ...r, from: s.id.slice(0, 8) }))), ...agy].sort((a, b) => a.at - b.at).slice(-PAST_ITEMS)
+  const codex = await codexPrompts($, root).catch(() => [] as RequestItem[])
+  const past = [...recent.flatMap(s => s.items.map(r => ({ ...r, from: s.id.slice(0, 8) }))), ...agy, ...codex].sort((a, b) => a.at - b.at).slice(-PAST_ITEMS)
   await update($, pastRequestsAtom, () => past.map((r, i) => ({ ...r, n: i - past.length })))
 }
 
