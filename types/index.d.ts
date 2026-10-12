@@ -75,7 +75,15 @@ export type SessionPerf = {
   tokPerSec?: number
   firstMs?: number
   outputTokens?: number
+  /** 마지막 메인 응답이 끝난 시각 ($.clock.now) */
   at?: number
+  /** 캐시 유지: 알아낸 캐시 수명(ms), 마지막으로 유지 요청을 보낸 시각과 횟수, 그때 캐시에서 읽은 토큰 */
+  ttlMs?: number
+  keptAt?: number
+  pings?: number
+  keptRead?: number
+  /** 띠의 남은 시간을 다시 그리게 하는 분 단위 시계 */
+  minute?: number
 }
 
 export type PeerRow = {

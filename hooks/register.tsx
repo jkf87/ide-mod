@@ -202,6 +202,7 @@ function startTimers($: EngineInterface) {
   if (timersStarted) return
   timersStarted = true
   $.clock.every(RECAP_EVERY_MS, () => void recapStale($).catch(() => undefined))
+  $.clock.every(30_000, () => void keepCacheWarm($).catch(() => undefined))
   $.clock.every(SYS_EVERY_MS, () => void refreshSys($).catch(() => undefined))
   $.clock.every(30_000, () => void refreshLimits($).catch(() => undefined))
   $.clock.every(5_000, () =>
@@ -225,6 +226,7 @@ function registerAgents(on: On) {
 
   // 사람이 프롬프트를 보내면 메인 에이전트의 작업이 새로 정해진다 (서브에이전트는 turn.start가 없다)
   on('turn.start', async ($, e, next) => {
+    isMainBusy = true // 메인이 일하는 동안에는 캐시 유지 요청을 보내지 않는다
     // 사람이 보낸 요청으로 시작한 턴만 메인 작업을 바꾼다. 백그라운드 작업 알림·다른 세션 메시지로 시작한 턴은
     // 작업 줄은 두고 "지금 하는 일"만 바꾼다 (그 글은 사람이 쓴 게 아니라서 요청 기록에도 넣지 않는다)
     const own = personText(e.text)
@@ -302,6 +304,7 @@ function registerAgents(on: On) {
   }).catch(($, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined) isMainBusy = false
     const id = e.agentId ?? MAIN
     const isFailed = e.reason !== 'answer'
     await patch($, id, row => {
@@ -2070,6 +2073,14 @@ const gaugeCells = (cells: [number, number][]) => {
 type LineItem = { label: string; pct: number; kind: GaugeKind; note?: string }
 type LineGroup = { name: string; color?: Color; items: LineItem[]; tail?: string }
 const shortWindow = (label: string) => label.replace(/^5시간$/, '5h').replace(/^주간$/, '주').replace(/ 5시간$/, ' 5h').replace(/ 주간$/, ' 주')
+/** 캐시가 사라지기까지 남은 시간: "52분", "만료" (응답이 아직 없으면 없음) */
+export function cacheNote(p: SessionPerf, l: LimitsSnapshot, now: number) {
+  const ttl = p.ttlMs ?? (l.claude.length > 0 ? HOUR : 5 * 60_000)
+  const left = cacheLeftMs(p, ttl, now)
+  if (left === undefined) return undefined
+  return left <= 0 ? '만료' : `${Math.max(1, Math.ceil(left / 60_000))}분`
+}
+
 /** 리셋까지 남은 시간을 큰 단위 하나로: 2일, 3시간, 44분 */
 const shortReset = (resetsAt: number | undefined, now: number) => untilReset(resetsAt, now).replace(/ 후$/, '').split(' ')[0] ?? ''
 
@@ -2078,7 +2089,7 @@ export function lineGroups(l: LimitsSnapshot, p: SessionPerf, now = Date.now()):
   const ctx = p.context ?? l.context
   const session: LineItem[] = []
   if (ctx !== undefined) session.push({ label: '컨텍스트', pct: ctx, kind: 'use' })
-  if (p.cacheHit !== undefined) session.push({ label: '캐시', pct: p.cacheHit, kind: 'good' })
+  if (p.cacheHit !== undefined) session.push({ label: '캐시', pct: p.cacheHit, kind: 'good', note: cacheNote(p, l, now) })
   if (session.length > 0 || p.tokPerSec !== undefined) groups.push({ name: '세션', color: 'claude', items: session, tail: p.tokPerSec === undefined ? undefined : `${p.tokPerSec} tok/s` })
   // 많이 쓴 창(70% 이상)에만 리셋까지 남은 시간을 붙인다
   const items = (windows: LimitWindow[], prefix = '') =>
@@ -2140,7 +2151,7 @@ function drawLimitLine($: EngineInterface, e: RenderInput<'AbovePrompt'>, width:
     }
     return <Text key={key} color={item.kind === 'good' ? hitColor(item.pct) : limitColor(item.pct)}>{String.fromCodePoint(...cells.map(c => c[0]))}</Text>
   }
-  const pctColor = (item: LineItem): Color | undefined => (item.kind === 'good' ? hitColor(item.pct) : limitColor(item.pct))
+  const pctColor = (item: LineItem): Color | undefined => (item.note === '만료' ? 'warning' : item.kind === 'good' ? hitColor(item.pct) : limitColor(item.pct))
   const keep = fitLine(groups, width - 5) // 오른쪽 끝 접기 단추 자리
   return [
     <Box key="limits" flexDirection="row" columnGap={1} height={1} overflow="hidden" width={width}>
@@ -2223,6 +2234,10 @@ async function notePerf($: EngineInterface, usage: ModelUsage, sentAt: number, f
   const input = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
   const speed = tokPerSecOf(usage.output_tokens, firstAt, endAt)
   await update($, perfAtom, p => {
+    // 쉬었다 보낸 요청이 캐시에서 읽혔는지로 캐시 수명을 알아낸다
+    const gap = p.at === undefined ? 0 : sentAt - Math.max(p.at, p.keptAt ?? 0)
+    const hit = cacheHitOf(usage) ?? 0
+    const ttlMs = gap > 6 * 60_000 && hit >= 80 ? HOUR : gap > 6 * 60_000 && gap < 55 * 60_000 && hit < 30 && input > KEEP_MIN_TOKENS ? 5 * 60_000 : p.ttlMs
     const readTokens = (p.readTokens ?? 0) + usage.cache_read_input_tokens
     const inputTokens = (p.inputTokens ?? 0) + input
     return {
@@ -2238,8 +2253,68 @@ async function notePerf($: EngineInterface, usage: ModelUsage, sentAt: number, f
       firstMs: firstAt === undefined ? p.firstMs : firstAt - sentAt,
       outputTokens: usage.output_tokens,
       at: endAt,
+      ttlMs,
+      keptAt: undefined,
+      pings: 0,
     }
   })
+}
+
+// ── 캐시 유지 ──
+// 프롬프트 캐시는 마지막 요청 뒤 수명(구독은 보통 1시간, API 키는 5분)이 지나면 사라지고, 다음 요청이 대화 전체를
+// 다시 써야 한다. 쉬는 동안 수명이 다하기 직전에 $.model.fork로 메인 대화의 마지막 요청을 그대로 한 번 더 보내면
+// 캐시에서 읽히면서 수명이 다시 시작된다. 정해 둔 시간(기본 2시간)까지만 유지하고, 작은 대화는 건드리지 않는다.
+const KEEP_KEY = 'cacheKeepMinutes'
+const KEEP_DEFAULT_MIN = 120
+const KEEP_MIN_TOKENS = 20_000
+const KEEP_PROMPT = '(prompt-cache keep-alive ping from the ide-mod plugin. Do nothing. Reply with exactly: ok)'
+const HOUR = 60 * 60_000
+let isMainBusy = false
+let isKeeping = false
+
+async function keepMinutes($: EngineInterface) {
+  const saved = await $.store.get(KEEP_KEY).catch(() => undefined)
+  return typeof saved === 'number' && saved >= 0 ? saved : KEEP_DEFAULT_MIN
+}
+
+/** 캐시 수명: 실제로 알아낸 값, 없으면 구독(사용 한도가 보이면)은 1시간, 아니면 5분 */
+async function cacheTtl($: EngineInterface, p: SessionPerf) {
+  if (p.ttlMs !== undefined) return p.ttlMs
+  return (await read($, limitsAtom)).claude.length > 0 ? HOUR : 5 * 60_000
+}
+
+/** 캐시가 사라지기까지 남은 시간(ms); 음수면 이미 사라졌다 */
+export const cacheLeftMs = (p: SessionPerf, ttlMs: number, now: number) => (p.at === undefined ? undefined : Math.max(p.at, p.keptAt ?? 0) + ttlMs - now)
+
+/** 수명 끝나기 직전(1시간이면 5분 전, 5분이면 1분 전)인지, 유지할 대상인지 */
+export function shouldKeepWarm(p: SessionPerf, ttlMs: number, keepMin: number, now: number) {
+  if (keepMin <= 0 || p.at === undefined || (p.contextTokens ?? 0) < KEEP_MIN_TOKENS) return false
+  if (now - p.at > keepMin * 60_000) return false
+  const left = cacheLeftMs(p, ttlMs, now) ?? -1
+  const margin = ttlMs >= HOUR ? 5 * 60_000 : 60_000
+  return left > 0 && left <= margin
+}
+
+async function keepCacheWarm($: EngineInterface) {
+  const now = await $.clock.now().catch(() => Date.now())
+  const p = await read($, perfAtom)
+  // 띠의 남은 시간이 분마다 바뀌게
+  const minute = Math.floor(now / 60_000)
+  if (p.at !== undefined && p.minute !== minute) await update($, perfAtom, q => ({ ...q, minute }))
+  if (isMainBusy || isKeeping) return
+  const ttl = await cacheTtl($, p)
+  if (!shouldKeepWarm(p, ttl, await keepMinutes($), now)) return
+  isKeeping = true
+  try {
+    const r = await $.model.fork({ prompt: KEEP_PROMPT })
+    if (!r.isAnswered && r.reason === 'nothing-to-fork') return
+    if (!r.isAnswered && r.reason !== 'empty-reply') return
+    // 캐시에서 읽었든(유지) 다시 썼든(이미 사라진 뒤) 이제부터 수명이 다시 시작된다
+    const keptRead = 'usage' in r && r.usage !== undefined ? r.usage.cache_read_input_tokens : 0
+    await update($, perfAtom, q => ({ ...q, keptAt: now, pings: (q.pings ?? 0) + 1, keptRead }))
+  } finally {
+    isKeeping = false
+  }
 }
 
 /** 412k, 1M, 950 */
@@ -2254,7 +2329,7 @@ export function perfParts(p: SessionPerf, context: number | undefined): { text: 
     const amount = p.contextTokens !== undefined && p.window !== undefined ? ` ${shortTokens(p.contextTokens)}/${shortTokens(p.window)}` : ''
     parts.push({ text: `컨텍스트 ${bar(ctx / 100, 10)} ${String(ctx).padStart(3)}%${amount}`, color: limitColor(ctx) ?? 'claude', isBold: true })
   }
-  if (p.cacheHit !== undefined) parts.push({ text: `캐시 적중 ${p.cacheHit}%${p.sessionHit !== undefined && p.sessionHit !== p.cacheHit ? ` (누적 ${p.sessionHit}%)` : ''}`, color: hitColor(p.cacheHit), isBold: true })
+  if (p.cacheHit !== undefined) parts.push({ text: `캐시 적중 ${p.cacheHit}%${p.sessionHit !== undefined && p.sessionHit !== p.cacheHit ? ` (누적 ${p.sessionHit}%)` : ''}${p.at !== undefined ? ` · 남은 수명 ${cacheNote(p, EMPTY_LIMITS, Date.now()) ?? ''}` : ''}`, color: hitColor(p.cacheHit), isBold: true })
   if (p.tokPerSec !== undefined) parts.push({ text: `속도 ${p.tokPerSec} tok/s${p.firstMs !== undefined ? ` · 첫 토큰 ${(p.firstMs / 1000).toFixed(1)}초` : ''}`, isBold: true })
   return parts
 }
@@ -2288,6 +2363,7 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'open', description: 'IDE 창에서 폴더나 파일을 엽니다', argumentHint: '[경로]' }).catch(() => undefined)
     await $.command.register({ name: 'lecture', description: '강의 모드: Claude가 하는 일을 입력창 위에 쉬운 한국어 자막으로', argumentHint: '[on|off]' }).catch(() => undefined)
     await $.command.register({ name: 'handoff', description: '이 세션을 다른 에이전트 세션에 넘깁니다 (세션 ID·대화 기록·요청 목록)', argumentHint: '[세션 이름 또는 ref] [메모]' }).catch(() => undefined)
+    await $.command.register({ name: 'cache', description: '프롬프트 캐시 유지: 쉬는 동안 캐시가 사라지기 직전에 한 번씩 다시 읽어 살려 둡니다', argumentHint: '[now|keep 2h|90m|off]' }).catch(() => undefined)
     await $.command.register({ name: 'limits', description: '입력창 위 사용 한도 띠 (세션·Claude·Codex·Antigravity)', argumentHint: '[line|rows|off|refresh]' }).catch(() => undefined)
     await $.command.register({ name: 'style-gate', description: '한국어 문체 게이트: 원고의 AI티 지표를 검사 (자동 검사 on/off)', argumentHint: '[파일|on|off]' }).catch(() => undefined)
     await loadRequests($).catch(() => undefined)
@@ -2331,6 +2407,38 @@ export const register: Register = (on, options) => {
     const memo = arg.startsWith(peer.ref) ? arg.slice(peer.ref.length) : arg.slice(peer.name.length)
     const sent = await sendHandoff($, peer, memo)
     return { text: sent.ok ? `핸드오프를 보냈어요 → ${peer.name} [${peer.ref}]` : `못 보냈어요 (${peer.name}): ${sent.reason ?? ''}` }
+  })
+
+  on('command.run', { command: 'cache' }, async ($, e) => {
+    const arg = (e.args ?? '').trim()
+    if (arg === 'now') {
+      const now = await $.clock.now().catch(() => Date.now())
+      const r = await $.model.fork({ prompt: KEEP_PROMPT })
+      if (!r.isAnswered && r.reason === 'nothing-to-fork') return { text: '아직 응답이 없어서 살릴 캐시가 없어요.' }
+      const u = 'usage' in r ? r.usage : undefined
+      if (u !== undefined) await update($, perfAtom, q => ({ ...q, keptAt: now, keptRead: u.cache_read_input_tokens }))
+      return { text: u === undefined ? `유지 요청 실패: ${'reason' in r ? r.reason : ''}` : `캐시에서 ${shortTokens(u.cache_read_input_tokens)} 토큰을 읽었고 ${shortTokens(u.cache_creation_input_tokens)} 토큰을 새로 썼어요. 수명이 지금부터 다시 시작돼요.` }
+    }
+    const set = /^keep\s+(off|0|(\d+)\s*(h|m|시간|분)?)$/i.exec(arg)
+    if (set) {
+      const minutes = set[1].toLowerCase() === 'off' || set[1] === '0' ? 0 : Number(set[2]) * (/^(h|시간)$/i.test(set[3] ?? 'm') ? 60 : 1)
+      await $.store.set(KEEP_KEY, minutes)
+      return { text: minutes === 0 ? '캐시 유지를 껐어요.' : `쉬기 시작한 뒤 ${minutes >= 60 && minutes % 60 === 0 ? `${minutes / 60}시간` : `${minutes}분`}까지 캐시를 살려 둬요.` }
+    }
+    const p = await read($, perfAtom)
+    const ttl = await cacheTtl($, p)
+    const now = await $.clock.now().catch(() => Date.now())
+    const left = cacheLeftMs(p, ttl, now)
+    const keep = await keepMinutes($)
+    const lines = [
+      `캐시 수명: ${ttl >= HOUR ? '1시간' : '5분'}${p.ttlMs === undefined ? ' (추정)' : ' (실제 응답으로 확인)'}`,
+      left === undefined ? '아직 응답이 없어요.' : left > 0 ? `남은 시간: ${Math.ceil(left / 60_000)}분` : '캐시가 이미 사라졌어요. 다음 요청이 대화를 다시 캐시에 써요.',
+      `캐시 유지: ${keep === 0 ? '꺼짐' : `켜짐 · 쉬기 시작한 뒤 ${keep >= 60 && keep % 60 === 0 ? `${keep / 60}시간` : `${keep}분`}까지`}${(p.contextTokens ?? 0) < KEEP_MIN_TOKENS ? ` (대화가 ${shortTokens(KEEP_MIN_TOKENS)} 토큰 밑이라 지금은 유지하지 않아요)` : ''}`,
+      `이번 휴식에 보낸 유지 요청: ${p.pings ?? 0}번${p.keptRead !== undefined && (p.pings ?? 0) > 0 ? ` · 마지막에 캐시에서 ${shortTokens(p.keptRead)} 토큰 읽음` : ''}`,
+      '유지 요청 한 번은 대화 전체를 캐시에서 한 번 읽는 값(입력 단가의 약 10%)과 짧은 답 몇 토큰이 들어요.',
+      '사용법: /cache now (지금 한 번 살리기) · /cache keep 2h | 90m | off',
+    ]
+    return { text: lines.join('\n') }
   })
 
   on('command.run', { command: 'limits' }, async ($, e) => {

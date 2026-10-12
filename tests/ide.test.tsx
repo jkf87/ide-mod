@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { blockStarts, cacheHitOf, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
+import { blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
 const ROOT = '/work'
@@ -691,6 +691,52 @@ describe('이 세션 줄', () => {
     expect(all).toContain('캐시 적중 97%')
     expect(all).toContain('속도 80 tok/s')
     expect(texts.find(t => t.text.startsWith('캐시 적중'))?.props.color).toBe('success')
+    await band.unmount()
+  })
+})
+
+describe('캐시 유지', () => {
+  test('수명이 끝나기 직전에만, 정해 둔 시간까지만, 큰 대화만', () => {
+    const p = { readTokens: 0, inputTokens: 0, at: 0, contextTokens: 400_000 }
+    const H = 60 * 60_000
+    expect(shouldKeepWarm(p, H, 120, 50 * 60_000)).toBe(false) // 아직 10분 남음
+    expect(shouldKeepWarm(p, H, 120, 56 * 60_000)).toBe(true) // 4분 남음
+    expect(shouldKeepWarm(p, H, 120, 61 * 60_000)).toBe(false) // 이미 사라짐
+    expect(shouldKeepWarm({ ...p, keptAt: 56 * 60_000 }, H, 120, 112 * 60_000)).toBe(true) // 한 번 살린 뒤 다음 차례
+    expect(shouldKeepWarm({ ...p, keptAt: 116 * 60_000 }, H, 120, 172 * 60_000)).toBe(false) // 2시간 넘게 쉼
+    expect(shouldKeepWarm({ ...p, contextTokens: 5_000 }, H, 120, 56 * 60_000)).toBe(false) // 작은 대화
+    expect(shouldKeepWarm(p, H, 0, 56 * 60_000)).toBe(false) // 꺼짐
+    expect(shouldKeepWarm(p, 5 * 60_000, 120, 4.5 * 60_000)).toBe(true) // 5분 수명이면 1분 전
+    expect(cacheNote({ ...p, ttlMs: H }, { claude: [], codex: [], agy: [], at: {}, errors: {} }, 8 * 60_000)).toBe('52분')
+    expect(cacheNote({ ...p, ttlMs: H }, { claude: [], codex: [], agy: [], at: {}, errors: {} }, 2 * H)).toBe('만료')
+  })
+
+  test('쉬는 동안 수명 끝나기 직전에 fork로 한 번씩 살리고, /cache keep off면 멈춘다', async ($, on) => {
+    fakeWorld(on)
+    const clock = mock.clock(on)
+    const forks: string[] = []
+    on('model.fork', ($, e) => {
+      forks.push((e as unknown as { prompt: string }).prompt)
+      return { value: { isAnswered: true, text: 'ok', usage: { input_tokens: 5, output_tokens: 2, cache_read_input_tokens: 400_000, cache_creation_input_tokens: 0 } } } as never
+    })
+    on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [], context: { window: 1_000_000, tokens: 400_000, percent: 40 } } }) as never)
+    on('turn.step', async function* () {
+      yield { kind: 'stop', stopReason: 'end_turn', usage: { model: 'm', input_tokens: 10, cache_read_input_tokens: 390_000, cache_creation_input_tokens: 9_990, output_tokens: 300 }, ref: 1 } as never
+      return { turnId: 't1', index: 0, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
+    })
+    const band = await $.ui.mount({ ...BAND, surface: 'terminal', props: bandProps })
+    for await (const c of $.turn.step({ turnId: 't1', index: 0, model: 'm', messageCount: 1 })) void c
+    await clock.advance(3 * 60_000)
+    expect(forks.length).toBe(0)
+    await clock.advance(90_000) // 5분 수명의 1분 전 안쪽
+    expect(forks.length).toBe(1)
+    expect(forks[0]).toContain('keep-alive')
+    await clock.advance(4 * 60_000 + 30_000)
+    expect(forks.length).toBe(2)
+    await $.command.run(typed('cache', 'keep off'))
+    await clock.advance(5 * 60_000)
+    expect(forks.length).toBe(2)
+    expect(JSON.stringify(await $.command.run(typed('cache', '')))).toContain('꺼짐')
     await band.unmount()
   })
 })
