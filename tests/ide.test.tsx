@@ -627,7 +627,7 @@ describe('다른 사람에게 핸드오프', () => {
     expect(savedPathOf('kept /tmp/a/handoff.json.bak', 'handoff.json')).toBeUndefined()
   })
 
-  test('/handoff share로 쓰고, publish로 스크래치패드에서 게시하고, receive로 입력창에 넣는다', async ($, on) => {
+  test('/handoff share 한 번으로 스크래치패드에서 게시해 링크를 내고, receive로 입력창에 넣는다', async ($, on) => {
     const written = new Map<string, string>()
     const artifactCalls: Record<string, unknown>[] = []
     const forks: string[] = []
@@ -675,14 +675,17 @@ describe('다른 사람에게 핸드오프', () => {
     on('ui.toast', () => ({ value: undefined }) as never)
 
     expect(JSON.stringify(await $.command.run(typed('handoff', 'publish')))).toContain('먼저 /handoff share')
-    const shared = JSON.stringify(await $.command.run(typed('handoff', 'share 3장만 봐 주세요')))
+    // share 한 번으로 쓰고 게시까지: 링크가 첫 줄에 나온다
+    const shared = (await $.command.run(typed('handoff', 'share 3장만 봐 주세요'))).text ?? ''
     expect(forks[0]).toContain('보내는 사람 메모(인수인계서에 반영하세요): 3장만 봐 주세요')
+    expect(shared.split('\n')[0]).toBe('핸드오프 링크: https://claude.ai/code/artifact/handoff-1')
+    expect(shared).toContain('/handoff receive https://claude.ai/code/artifact/handoff-1')
     expect(shared).toContain('로그인 고치기')
-    expect(shared).toContain('아직 게시하지 않았어요')
     expect(shared).not.toContain('ghp_')
+    expect(artifactCalls.filter(c => c.action === 'publish').length).toBe(1)
 
-    const published = JSON.stringify(await $.command.run(typed('handoff', 'publish')))
-    expect(published).toContain('https://claude.ai/code/artifact/handoff-1')
+    // 같은 인수인계서를 다시 게시할 수도 있다
+    expect(JSON.stringify(await $.command.run(typed('handoff', 'publish')))).toContain('https://claude.ai/code/artifact/handoff-1')
     const publish = artifactCalls.find(c => c.action === 'publish')
     expect(String(publish?.file_path)).toMatch(/^\/tmp\/claude\/-work\/test-session\/scratchpad\/ide-mod-handoff-\d{8}-\d{6}\/index\.html$/)
     expect(Object.keys(publish?.files as object)).toEqual(['handoff.json'])

@@ -983,12 +983,26 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
       )}
       {isRequests && !isAllRequests && selected !== undefined && <Button key="request-copy" plain hotkey="c" label="복사" onPress={() => void $.ui.copy({ text: selected.text, surface: e.surface })} />}
       {isAllRequests && <Button key="request-copy-all" plain hotkey="c" label="전부 복사" onPress={() => void $.ui.copy({ text: requestsAsText(history), surface: e.surface })} />}
-      {isHandoff && <Button key="handoff-view" plain hotkey="f" label={isShare ? '이 PC 세션에게' : '다른 사람에게'} onPress={() => void update($, handoffViewAtom, v => (v === 'share' ? 'local' : 'share'))} />}
+      {isHandoff && (
+        <Button
+          key="handoff-view"
+          plain
+          hotkey="f"
+          label={isShare ? '이 PC 세션에게' : '다른 사람에게'}
+          onPress={() =>
+            void (async () => {
+              // 다른 사람에게 넘길 때는 처음 한 번 바로 써서 게시하고 링크를 낸다
+              const view = await update($, handoffViewAtom, v => (v === 'share' ? 'local' : 'share'))
+              if (view === 'share' && (await read($, shareAtom)).phase === 'idle') await shareNow($, '', e.surface)
+            })()
+          }
+        />
+      )}
       {isShare && share !== undefined && share.phase !== 'writing' && share.phase !== 'publishing' && (
-        <Button key="share-write" plain hotkey="w" label={share.doc === undefined ? '인수인계서 쓰기' : '다시 쓰기'} onPress={() => void prepareShare($)} />
+        <Button key="share-write" plain hotkey="w" label={share.doc === undefined ? '쓰고 링크 만들기' : '다시 쓰고 새 링크'} onPress={() => void shareNow($, '', e.surface)} />
       )}
       {isShare && share?.doc !== undefined && (share.phase === 'ready' || share.phase === 'error') && (
-        <Button key="share-publish" plain hotkey="o" label="게시" onPress={() => void publishShare($, e.surface)} />
+        <Button key="share-publish" plain hotkey="o" label="다시 게시" onPress={() => void publishShare($, e.surface)} />
       )}
       {isShare && share?.doc !== undefined && (
         <Button
@@ -1153,22 +1167,29 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
       layout.fileMaxOffset = Math.max(0, lines.length - 1)
       const status =
         share.phase === 'idle'
-          ? 'w를 누르면 이 대화를 다시 읽고 다른 사람용 인수인계서를 써요.'
+          ? 'w를 누르면 이 대화로 인수인계서를 쓰고 바로 링크를 만들어요.'
           : share.phase === 'writing'
-            ? '인수인계서를 쓰는 중이에요… 이 대화를 다시 읽어요.'
+            ? '인수인계서를 쓰는 중이에요… 끝나면 바로 게시하고 링크를 보여 드려요.'
             : share.phase === 'ready'
-              ? '내용을 확인하고 o를 누르면 비공개 Artifact로 게시하고 링크를 복사해요.'
+              ? 'o를 누르면 게시하고 링크를 만들어요.'
               : share.phase === 'publishing'
                 ? '게시하는 중이에요…'
                 : share.phase === 'published'
-                  ? `게시했어요: ${share.url ?? ''}`
-                  : `실패: ${share.error ?? ''}`
+                  ? '링크를 복사했어요. 공유하기 전에는 나만 열 수 있어요. claude.ai 페이지의 공유 메뉴에서 받을 사람과 공유하세요.'
+                  : `실패: ${share.error ?? ''}${share.doc !== undefined ? ' · o로 다시 게시' : ' · w로 다시 시도'}`
       const color: Color | undefined = share.phase === 'published' ? 'success' : share.phase === 'error' ? 'error' : undefined
+      // 링크는 자르지 않고 한 줄을 따로 준다: 좁은 창에서도 끝까지 보이게
+      const linkRows = share.url === undefined ? 0 : Math.ceil(`링크 ${share.url}`.length / Math.max(1, fileWidth))
       fileColumn = (
         <Box key="ide-file" flexDirection="column" width={fileWidth} height={mainRows} overflow="hidden">
           <Text bold wrap="truncate-end">다른 사람에게 · {share.doc?.title ?? '인수인계서'}</Text>
+          {share.url !== undefined && (
+            <Text bold color="success">
+              링크 {share.url}
+            </Text>
+          )}
           <Text dimColor={color === undefined} color={color} wrap="truncate-end">{status}</Text>
-          <Box flexDirection="column" height={Math.max(1, mainRows - 2)} overflow="hidden">
+          <Box flexDirection="column" height={Math.max(1, mainRows - 2 - linkRows)} overflow="hidden">
             {lines.slice(offset).map((line, i) => (
               <Text key={`share-line:${offset + i}`} bold={line.startsWith('#')} color={line.includes('[비공개]') ? 'warning' : undefined}>
                 {line === '' ? ' ' : line}
@@ -1551,7 +1572,16 @@ async function prepareShare($: EngineInterface, memo = '') {
   return read($, shareAtom)
 }
 
-/** 미리보기한 인수인계서를 비공개 Artifact로 게시하고 링크를 복사한다 */
+/**
+ * 다른 사람에게 넘길 때 한 번에: 인수인계서를 쓰고 곧바로 게시해 링크를 낸다.
+ * 게시물은 비공개로 시작하니, 공유하기 전에 페이지에서 내용을 확인할 수 있다.
+ */
+async function shareNow($: EngineInterface, memo = '', surface?: RenderSurface) {
+  const written = await prepareShare($, memo)
+  return written.phase === 'ready' ? publishShare($, surface) : written
+}
+
+/** 쓴 인수인계서를 비공개 Artifact로 게시하고 링크를 복사한다 */
 async function publishShare($: EngineInterface, surface?: RenderSurface) {
   const before = await read($, shareAtom)
   const doc = before.doc
@@ -1577,7 +1607,7 @@ async function publishShare($: EngineInterface, surface?: RenderSurface) {
     if (url === undefined) throw new Error('게시했지만 링크를 찾지 못했어요. claude.ai의 Artifact 목록에서 확인하세요.')
     await update($, shareAtom, (s): ShareState => ({ ...s, phase: 'published', url, at: Date.now() }))
     const copied = await $.ui.copy({ text: url, surface }).catch(() => ({ isCopied: false }))
-    $.ui.toast(copied.isCopied ? '게시하고 링크를 복사했어요. claude.ai에서 받을 사람과 공유하세요.' : '게시했어요. 링크를 받을 사람과 공유하세요.', { timeoutMs: 8000 })
+    $.ui.toast(copied.isCopied ? `링크를 복사했어요: ${url}` : `링크: ${url}`, { timeoutMs: 10_000 })
   } catch (err) {
     await update($, shareAtom, (s): ShareState => ({ ...s, phase: 'error', error: errorText(err), at: Date.now() }))
   }
@@ -1622,10 +1652,8 @@ async function receiveShare($: EngineInterface, url: string): Promise<string> {
 /** 핸드오프 미리보기의 왼쪽 안내 */
 function shareGuide(share: ShareState): string[] {
   const steps = [
-    `1. w ${share.doc === undefined ? '인수인계서 쓰기' : '다시 쓰기'}: 이 대화를 다시 읽고 비밀은 가려요`,
-    '2. 오른쪽 내용을 확인해요',
-    '3. o 게시: 비공개 Artifact로 올리고 링크를 복사해요',
-    '4. claude.ai에서 받을 사람과 공유해요',
+    `1. w ${share.doc === undefined ? '쓰고 링크 만들기' : '다시 쓰고 새 링크'}: 이 대화로 인수인계서를 쓰고(비밀은 가려요) 비공개 Artifact로 올려 링크를 복사해요`,
+    '2. 링크는 공유하기 전까지 나만 열 수 있어요. claude.ai 페이지의 공유 메뉴에서 받을 사람과 공유해요',
     '',
     '받는 사람: /handoff receive <링크>',
     'ide-mod가 없으면 페이지의 "받기 프롬프트 복사"',
@@ -2622,9 +2650,13 @@ export const register: Register = (on, options) => {
     if (sub !== null && sub[1] === 'share') {
       await update($, leftModeAtom, () => 'handoff')
       await update($, handoffViewAtom, () => 'share')
-      const s = await prepareShare($, sub[2] ?? '')
+      const s = await shareNow($, sub[2] ?? '')
       if (s.doc === undefined) return { text: s.error ?? '인수인계서를 쓰지 못했어요.' }
-      return { text: `${s.doc.note}\n\n${gitNotes(s.doc.git).join('\n')}\n\n(아직 게시하지 않았어요. 내용을 확인하고 /ide 창에서 o를 누르거나 /handoff publish 로 게시하세요.)` }
+      const notes = gitNotes(s.doc.git).join('\n')
+      if (s.phase !== 'published' || s.url === undefined) return { text: `인수인계서는 썼지만 게시하지 못했어요: ${s.error ?? ''}\n/handoff publish 로 다시 게시하세요.\n\n${notes}\n\n${s.doc.note}` }
+      return {
+        text: `핸드오프 링크: ${s.url}\n공유하기 전에는 나만 열 수 있어요. claude.ai 페이지의 공유 메뉴에서 받을 사람과 공유하세요. 받는 사람은 /handoff receive ${s.url}\n\n${notes}\n\n${s.doc.note}`,
+      }
     }
     if (sub !== null && sub[1] === 'publish') {
       if ((await read($, shareAtom)).doc === undefined) return { text: '먼저 /handoff share [메모]로 인수인계서를 쓰세요.' }
