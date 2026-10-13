@@ -93,6 +93,41 @@ export type PeerRow = {
   detail: string
 }
 
+/** 다른 사람이 같은 코드를 찾아가는 데 필요한 git 위치 */
+export type GitInfo = {
+  /** 저장소 최상위 폴더 이름 */
+  name: string
+  /** 원격 주소; 계정·토큰은 뺀다 */
+  remote?: string
+  branch: string
+  head: string
+  /** 원격에 올리지 않은 커밋 수; 원격 브랜치가 없으면 없음 */
+  unpushed?: number
+  /** 최근 커밋 "해시 제목" (최신부터) */
+  recent: string[]
+  /** 커밋하지 않은 변경 파일 (최대 30개); 내용은 넘기지 않는다 */
+  dirty: string[]
+}
+
+/** 다른 사람에게 넘기는 핸드오프: Artifact 페이지와 handoff.json 에 그대로 실린다 */
+export type ShareDoc = {
+  format: 'ide-mod/handoff@1'
+  title: string
+  /** 대화를 보고 쓴 인수인계서 (마크다운, 비밀을 가린 뒤) */
+  note: string
+  memo: string
+  git?: GitInfo
+  createdAt: number
+}
+
+export type ShareState = {
+  phase: 'idle' | 'writing' | 'ready' | 'publishing' | 'published' | 'error'
+  doc?: ShareDoc
+  url?: string
+  error?: string
+  at?: number
+}
+
 export type RequestItem = {
   n: number
   text: string
@@ -193,6 +228,10 @@ declare module 'claude-code' {
       selfName: string
       /** 마지막으로 보낸 핸드오프 결과 */
       handoffSent: { to: string; at: number; ok: boolean; reason?: string } | null
+      /** 핸드오프 화면 오른쪽: local 이 PC의 다른 세션에게, share 다른 사람에게(Artifact) */
+      handoffView: 'local' | 'share'
+      /** 다른 사람에게 넘길 인수인계서와 게시 상태 */
+      share: ShareState
 
       // ── HWP 뷰어 ──
       /** doc: 쪽을 글자 격자로(기본), image: rhwp가 그린 쪽 그림 */
