@@ -742,7 +742,7 @@ describe('시스템 상태', () => {
 
 // 2026-10-08 실제 응답에서 뽑은 모양
 const CLAUDE_USAGE = { five_hour: { utilization: 24.0, resets_at: '2026-10-08T15:00:00Z' }, seven_day: { utilization: 20.0, resets_at: '2026-10-13T14:00:00Z' }, limits: [{ kind: 'weekly_scoped', percent: 2, resets_at: '2026-10-13T14:00:00Z', scope: { model: { display_name: 'Fable' } } }, { kind: 'five_hour' }] }
-const CODEX_OUT = '{"primary":{"usedPercent":27,"windowDurationMins":10080,"resetsAt":1791948528},"secondary":{"usedPercent":81,"windowDurationMins":300,"resetsAt":1791900000}}'
+const CODEX_OUT = '{"primary":{"usedPercent":27,"windowDurationMins":10080,"resetsAt":2791948528},"secondary":{"usedPercent":81,"windowDurationMins":300,"resetsAt":2791900000}}'
 const AGY_OUT = 'Gemini Models\tWeekly Limit Remaining\t94%\t2026-10-14T03:39:45Z\nGemini Models\tFive Hour Limit Remaining\t97%\t2026-10-08T17:01:49Z\nClaude and GPT models\tWeekly Limit Remaining\t100%\t2026-10-15T14:04:10Z\nClaude and GPT models\tFive Hour Limit Remaining\t100%\t2026-10-08T19:04:10Z'
 
 describe('사용 한도 띠', () => {

@@ -604,6 +604,10 @@ const layout = {
   fileMaxOffset: 0,
   leftMode: 'files' as 'files' | 'requests' | 'handoff',
   requestRows: 0,
+  /** 엔진이 창을 내려 둔 행 수(창 안 트리가 창보다 길 때만 0이 아니다) */
+  engineOffset: 0,
+  surface: '' as string,
+  placement: '' as string,
 }
 // 스크롤할 때마다 디스크를 다시 읽지 않도록: 트리는 (뿌리·펼친 폴더·세대)로, 파일은 수정 시각으로 재사용한다
 let treeEpoch = 0
@@ -839,34 +843,85 @@ async function noteEdit($: EngineInterface, tool: string, input: Record<string, 
 }
 
 function registerExplorerScroll(on: On) {
-  // 휠은 포인터가 있는 쪽(트리/파일)을, 키보드는 열린 파일을(없으면 트리를) 스크롤한다
-  on('ui.scroll', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    if (e.pointer !== undefined && e.pointer.row < layout.topRows) return {}
-    const isOverTree = layout.showTree && (!layout.showFile || layout.active === '' || (e.pointer !== undefined && e.pointer.column < layout.treeWidth))
-    if (isOverTree && layout.leftMode === 'requests') {
-      await update($, requestOffsetAtom, n => clamp(n + e.by, 0, layout.requestRows - layout.treeView))
-    } else if (isOverTree) {
-      await update($, treeOffsetAtom, n => clamp(n + e.by, 0, layout.treeRows - layout.treeView))
-    } else if (layout.active !== '' && hwpNow.path === layout.active && HWP.test(layout.active) && (await read($, hwpViewAtom)) === 'doc') {
-      // 문서 보기: 쪽 안에서 움직이다 끝에 닿으면 다음(앞) 쪽으로 넘긴다
-      const { path, page, pages } = hwpNow
-      const key = hwpOffsetKey(path, page)
-      const now = (await read($, offsetsAtom))[key] ?? 0
-      if (e.by > 0 && now >= layout.fileMaxOffset && page < pages - 1) {
-        await update($, offsetsAtom, all => ({ ...all, [hwpOffsetKey(path, page + 1)]: 0 }))
-        await update($, hwpPagesAtom, all => ({ ...all, [path]: page + 1 }))
-      } else if (e.by < 0 && now <= 0 && page > 0) {
-        await update($, offsetsAtom, all => ({ ...all, [hwpOffsetKey(path, page - 1)]: 100_000 }))
-        await update($, hwpPagesAtom, all => ({ ...all, [path]: page - 1 }))
-      } else {
-        await update($, offsetsAtom, all => ({ ...all, [key]: clamp(now + e.by, 0, layout.fileMaxOffset) }))
-      }
-    } else if (layout.active !== '') {
-      const path = layout.active
-      await update($, offsetsAtom, all => ({ ...all, [path]: clamp((all[path] ?? 0) + e.by, 0, layout.fileMaxOffset) }))
-    }
-    return {}
+  // 휠은 포인터가 있는 쪽(트리/파일)을, 키보드는 열린 파일을(없으면 트리를) 스크롤한다.
+  // 이 창 안에서 움직일 게 없으면(끝에 닿음·보드 위·빈 칸) 휠을 엔진에 돌려준다. 삼키면 데스크톱 앱에서
+  // 대화를 올렸다가 내릴 때 창이 포인터 밑에 오는 순간 대화가 더 안 내려간다.
+  on('ui.scroll', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    const moved = await scrollExplorer($, e).catch(() => false)
+    await noteScroll($, e, moved).catch(() => undefined)
+    return moved ? {} : next(e)
   }).catch(($, e, next) => next(e))
+}
+
+/** 탐색기의 자기 스크롤을 움직인다. 실제로 움직였으면 true */
+async function scrollExplorer($: EngineInterface, e: { by: number; pointer?: { row: number; column: number } }): Promise<boolean> {
+  // 포인터 행은 엔진 창 기준이라, 엔진이 창을 내려 두었으면 그만큼 더해야 우리 트리의 행이다
+  const row = e.pointer === undefined ? undefined : e.pointer.row + layout.engineOffset
+  if (row !== undefined && row < layout.topRows) return false
+  const isOverTree = layout.showTree && (!layout.showFile || layout.active === '' || (e.pointer !== undefined && e.pointer.column < layout.treeWidth))
+  if (isOverTree && layout.leftMode === 'requests') {
+    const last = layout.requestRows - layout.treeView
+    const now = clamp(await read($, requestOffsetAtom), 0, last)
+    const after = clamp(now + e.by, 0, last)
+    if (after === now) return false
+    await update($, requestOffsetAtom, () => after)
+    return true
+  }
+  if (isOverTree && layout.leftMode === 'files') {
+    const last = layout.treeRows - layout.treeView
+    const now = clamp(await read($, treeOffsetAtom), 0, last)
+    const after = clamp(now + e.by, 0, last)
+    if (after === now) return false
+    await update($, treeOffsetAtom, () => after)
+    return true
+  }
+  if (isOverTree || layout.active === '') return false
+  if (hwpNow.path === layout.active && HWP.test(layout.active) && (await read($, hwpViewAtom)) === 'doc') {
+    // 문서 보기: 쪽 안에서 움직이다 끝에 닿으면 다음(앞) 쪽으로 넘긴다
+    const { path, page, pages } = hwpNow
+    const key = hwpOffsetKey(path, page)
+    const now = clamp((await read($, offsetsAtom))[key] ?? 0, 0, layout.fileMaxOffset)
+    if (e.by > 0 && now >= layout.fileMaxOffset) {
+      if (page >= pages - 1) return false
+      await update($, offsetsAtom, all => ({ ...all, [hwpOffsetKey(path, page + 1)]: 0 }))
+      await update($, hwpPagesAtom, all => ({ ...all, [path]: page + 1 }))
+      return true
+    }
+    if (e.by < 0 && now <= 0) {
+      if (page <= 0) return false
+      await update($, offsetsAtom, all => ({ ...all, [hwpOffsetKey(path, page - 1)]: 100_000 }))
+      await update($, hwpPagesAtom, all => ({ ...all, [path]: page - 1 }))
+      return true
+    }
+    const after = clamp(now + e.by, 0, layout.fileMaxOffset)
+    await update($, offsetsAtom, all => ({ ...all, [key]: after }))
+    return after !== now
+  }
+  const path = layout.active
+  const now = clamp((await read($, offsetsAtom))[path] ?? 0, 0, layout.fileMaxOffset)
+  const after = clamp(now + e.by, 0, layout.fileMaxOffset)
+  if (after === now) return false
+  await update($, offsetsAtom, all => ({ ...all, [path]: after }))
+  return true
+}
+
+// 스크롤 진단: 최근 휠 40개를 ~/.cache/ide-mod/scroll.log에 남긴다 (데스크톱 앱처럼 직접 못 보는 화면용)
+const scrollLog: string[] = []
+let scrollLogTimer = false
+async function noteScroll($: EngineInterface, e: { by: number; offset: number; bodyRows: number; contentRows: number; pointer?: { row: number; column: number }; origin: unknown }, moved: boolean) {
+  const at = new Date(await $.clock.now()).toISOString().slice(11, 23)
+  const pointer = e.pointer === undefined ? '-' : `${e.pointer.row},${e.pointer.column}`
+  scrollLog.push(`${at} by=${e.by} offset=${e.offset} body=${e.bodyRows} content=${e.contentRows} pointer=${pointer} engine=${layout.engineOffset} top=${layout.topRows} mode=${layout.leftMode} surface=${layout.surface} place=${layout.placement} origin=${JSON.stringify(e.origin)} → ${moved ? 'mine' : 'pass'}`)
+  scrollLog.splice(0, Math.max(0, scrollLog.length - 40))
+  if (scrollLogTimer) return
+  scrollLogTimer = true
+  $.clock.after(500, () => {
+    scrollLogTimer = false
+    void (async () => {
+      const home = (await $.env.get('HOME')) ?? ''
+      if (home !== '') await $.fs.write(`${home}/.cache/ide-mod/scroll.log`, scrollLog.join('\n') + '\n')
+    })().catch(() => undefined)
+  })
 }
 
 /** 탐색기 부분: 툴바 한 줄 + 트리 | 탭 에디터. 정확히 rows 행을 쓴다 */
@@ -969,6 +1024,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
       {isHwp && (
         <Button key="hwp-open" plain hotkey="o" label="미리보기로 열기" onPress={() => void openHwpPreview($, active, hwpNow.path === active ? hwpNow.page : 0)} />
       )}
+      {isHwp && !isPdf(active) && <Button key="hwp-edit" plain hotkey="e" label="편집" onPress={() => void openHwpEditor($, active)} />}
       {isHwp && (
         <Button key="hwp-prev" plain hotkey="b" label="◀ 앞쪽" onPress={() => void update($, hwpPagesAtom, all => ({ ...all, [active]: Math.max(0, (all[active] ?? 0) - 1) }))} />
       )}
@@ -1990,6 +2046,19 @@ async function openHwpPreview($: EngineInterface, path: string, page: number) {
   await $.process.run(['open', shot.pngPath], { timeoutMs: 10_000 }).catch(() => undefined)
 }
 
+/** 편집 창: rhwp 편집기를 이 컴퓨터 안의 서버로 띄워 브라우저 앱 창에 연다. 저장하면 원래 파일에 쓰고, 보기는 수정 시각으로 다시 읽는다 */
+async function openHwpEditor($: EngineInterface, path: string) {
+  const dir = $.plugin.root.replace(/\/\.claude-plugin\/?$/, '')
+  const ran = await $.process.run(['node', `${dir}/bin/rhwp-edit.mjs`, path], { timeoutMs: 20_000 }).catch(error => ({ exitCode: 127, stdout: '', stderr: String(error) }))
+  let out: { url?: string; error?: string } = {}
+  try {
+    out = JSON.parse(ran.stdout.slice(ran.stdout.indexOf('{'), ran.stdout.lastIndexOf('}') + 1)) as typeof out
+  } catch {
+    out = { error: oneLine(ran.stderr.trim(), 160) || `exit ${ran.exitCode}` }
+  }
+  $.ui.toast(out.url !== undefined ? `편집 창을 열었어요: ${baseName(path)} (저장하면 원래 파일에 써요)` : `편집 창을 열지 못했어요: ${out.error ?? ''}`)
+}
+
 /** HWP를 그린다: 문서 보기(쪽을 글자 격자로) 또는 그림 보기(rhwp가 그린 쪽 그림) */
 async function drawHwp(
   $: EngineInterface,
@@ -2837,6 +2906,7 @@ export const register: Register = (on, options) => {
     const { Box, Text } = $.ui.resolve(e)
     const width = Math.max(10, e.props.bodyColumns)
     const bodyRows = Math.max(4, e.props.scroll.bodyRows)
+    Object.assign(layout, { engineOffset: e.props.scroll.offset, surface: e.surface, placement: e.props.placement })
     const board = await drawBoard($, e, width, clamp(Math.round(bodyRows * 0.35), 2, 12))
     const explorerRows = Math.max(2, bodyRows - board.length - 1)
     const explorer = await drawExplorer($, e, width, explorerRows, board.length + 2)
