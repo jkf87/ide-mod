@@ -230,6 +230,36 @@ describe('탐색기', () => {
     await ui.unmount()
   })
 
+  test('트리 줄을 두 번 누르면 기본 앱(폴더는 Finder)으로 열고, f·g로도 연다', async ($, on) => {
+    const runs: string[][] = []
+    const world = fakeWorld(on)
+    world.extraRuns = argv => {
+      if (argv[0] !== 'open') return undefined
+      runs.push(argv)
+      return ''
+    }
+    await $.command.run(typed('open', '/work'))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    await ui.press({ key: 'tree:/work/README.md' })
+    expect(runs).toEqual([])
+    await ui.press({ key: 'tree:/work/README.md' })
+    expect(runs).toEqual([['open', '/work/README.md']])
+    // 폴더를 두 번 누르면 펼침은 그대로 두고 Finder로 연다
+    await ui.press({ key: 'tree:/work/src' })
+    await ui.press({ key: 'tree:/work/src' })
+    expect(runs.at(-1)).toEqual(['open', '/work/src'])
+    expect(await ui.find({ key: 'tree:/work/src/app.ts' })).toBeUndefined()
+    // f는 마지막으로 고른 폴더, 파일을 고르면 그 파일을 Finder에서 보여준다
+    await ui.press({ key: 'open-folder' })
+    expect(runs.at(-1)).toEqual(['open', '/work/src'])
+    await ui.press({ key: 'tree:/work/README.md' })
+    await ui.press({ key: 'open-folder' })
+    expect(runs.at(-1)).toEqual(['open', '-R', '/work/README.md'])
+    await ui.press({ key: 'open-app' })
+    expect(runs.at(-1)).toEqual(['open', '/work/README.md'])
+    await ui.unmount()
+  })
+
   test('심볼릭 링크 폴더도 펼쳐진다', async ($, on) => {
     fakeWorld(on)
     await $.command.run(typed('open', '/work'))

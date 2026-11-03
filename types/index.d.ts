@@ -183,6 +183,8 @@ declare module 'claude-code' {
       touched: string[]
       /** 트리를 접었는지 (좁은 화면에서는 파일만 보기) */
       isTreeHidden: boolean
+      /** 트리에서 마지막으로 누른 폴더 (f가 Finder로 여는 곳); 파일을 누르면 비운다 */
+      pickedDir: string
 
       // ── 에이전트 보드 ──
       agents: Record<string, AgentRow>

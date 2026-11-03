@@ -576,6 +576,8 @@ const modeAtom = atom({ plugin: 'ide-mod', key: 'mode' } as const, 'code' as Vie
 const revAtom = atom({ plugin: 'ide-mod', key: 'rev' } as const, 0)
 const touchedAtom = atom({ plugin: 'ide-mod', key: 'touched' } as const, [] as string[])
 const treeHiddenAtom = atom({ plugin: 'ide-mod', key: 'isTreeHidden' } as const, false)
+/** 트리에서 마지막으로 누른 폴더: f(폴더 열기)가 여는 곳. 파일을 누르면 비운다 */
+const pickedDirAtom = atom({ plugin: 'ide-mod', key: 'pickedDir' } as const, '')
 
 const MAX_BYTES = 4 * 1024 * 1024
 const MAX_TREE_ROWS = 3000
@@ -752,12 +754,42 @@ async function closeTab($: EngineInterface, path: string) {
 }
 
 async function pressEntry($: EngineInterface, row: TreeRow) {
+  await update($, pickedDirAtom, () => (row.isDir ? row.path : ''))
   if (row.isDir) {
     if (row.isLoop) return
     await update($, expandedAtom, list => (list.includes(row.path) ? list.filter(p => p !== row.path) : [...list, row.path]))
   } else {
     await openFile($, row.path)
   }
+}
+
+/** Mod API에는 더블클릭이 없어서, 같은 줄을 짧게 두 번 누르면 더블클릭으로 본다 */
+const DOUBLE_PRESS_MS = 450
+let lastTreePress = { path: '', at: 0 }
+
+async function pressTreeRow($: EngineInterface, row: TreeRow) {
+  const now = Date.now()
+  const isDouble = lastTreePress.path === row.path && now - lastTreePress.at < DOUBLE_PRESS_MS
+  lastTreePress = isDouble ? { path: '', at: 0 } : { path: row.path, at: now }
+  if (!isDouble) return pressEntry($, row)
+  // 폴더는 첫 번째 누름이 펼침을 바꿨으니 되돌려 놓고 연다
+  if (row.isDir && !row.isLoop) await update($, expandedAtom, list => (list.includes(row.path) ? list.filter(p => p !== row.path) : [...list, row.path]))
+  await openOutside($, row.path)
+}
+
+/** 운영체제 기본 앱으로 연다: 파일은 연결된 앱, 폴더는 Finder(탐색기). reveal이면 Finder에서 그 파일을 골라 보여준다 */
+async function openOutside($: EngineInterface, path: string, reveal = false) {
+  const isWindowsPath = /^[A-Za-z]:|\\/.test(path)
+  const tries = isWindowsPath
+    ? [reveal ? ['explorer', `/select,${path}`] : ['explorer', path]]
+    : [reveal ? ['open', '-R', path] : ['open', path], ['xdg-open', reveal ? parentOf(path) : path]]
+  for (const argv of tries) {
+    const ran = await $.process.run(argv, { timeoutMs: 10_000 }).catch(() => undefined)
+    // explorer는 성공해도 1을 돌려준다
+    if (ran !== undefined && (ran.exitCode === 0 || argv[0] === 'explorer')) return true
+  }
+  $.ui.toast(`열지 못했어요: ${baseName(path) || path}`)
+  return false
 }
 
 async function buildTree($: EngineInterface, root: string, expanded: Set<string>) {
@@ -935,6 +967,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
   const mode = await read($, modeAtom)
   const touched = new Set(await read($, touchedAtom))
   const isTreeHidden = await read($, treeHiddenAtom)
+  const pickedDir = await read($, pickedDirAtom)
   const rev = await read($, revAtom)
   const leftMode = await read($, leftModeAtom)
   const requests = await read($, requestsAtom)
@@ -959,6 +992,8 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
   if (isRequests && !isPastRequested) $.clock.after(0, () => void loadPastRequests($).catch(() => undefined))
   const rightKey = isHandoff ? (isShare ? 'handoff:share' : 'handoff') : isRequests ? (isAllRequests ? 'requests:all' : selected === undefined ? '' : `request:${selected.n}`) : active
   const isHwp = isFiles && HWP.test(active)
+  // f가 여는 폴더: 트리에서 고른 폴더, 아니면 지금 파일이 든 폴더(Finder에서 그 파일을 골라 보인다), 아니면 트리 뿌리
+  const folderTarget = pickedDir !== '' ? pickedDir : active !== '' ? parentOf(active) : root
 
   const isWide = width >= SPLIT_MIN_COLUMNS
   const showTree = isWide ? !isTreeHidden || rightKey === '' : !(isTreeHidden && rightKey !== '')
@@ -1088,6 +1123,8 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
       {isFiles && active !== '' && <Button key="mention" plain hotkey="p" label="@프롬프트" onPress={() => void $.prompt.fill({ text: `@${active} `, mode: 'insert' })} />}
       {isFiles && active !== '' && <Button key="copy" plain hotkey="c" label="경로 복사" onPress={() => void $.ui.copy({ text: active, surface: e.surface })} />}
       {isFiles && active !== '' && <Button key="close" plain hotkey="w" label="탭 닫기" onPress={() => void closeTab($, active)} />}
+      {isFiles && active !== '' && <Button key="open-app" plain hotkey="g" label="앱으로 열기" onPress={() => void openOutside($, active)} />}
+      {isFiles && <Button key="open-folder" plain hotkey="f" label={`폴더 열기(${fit(baseName(folderTarget) || '/', 16)})`} onPress={() => void (pickedDir === '' && active !== '' ? openOutside($, active, true) : openOutside($, folderTarget))} />}
     </Box>
   )
 
@@ -1180,8 +1217,8 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
           const icon = row.isDir ? (row.isLoop ? '↻ ' : row.isOpen ? '▾ ' : '▸ ') : '  '
           const label = fit(`${'  '.repeat(row.depth)}${icon}${row.name}${row.isDir ? '/' : ''}`, treeWidth - (isTouched ? 2 : 0))
           return (
-            <Box key={`row:${row.path}`} flexDirection="row" height={1} overflow="hidden" backgroundColor={isActive ? 'promptBorder' : undefined}>
-              <Button key={`tree:${row.path}`} plain dimColor={row.name.startsWith('.') && !isActive} label={label} onPress={() => void pressEntry($, row)} />
+            <Box key={`row:${row.path}`} flexDirection="row" height={1} overflow="hidden" backgroundColor={isActive || row.path === pickedDir ? 'promptBorder' : undefined}>
+              <Button key={`tree:${row.path}`} plain dimColor={row.name.startsWith('.') && !isActive} label={label} onPress={() => void pressTreeRow($, row)} />
               {isTouched && <Text color="warning"> ●</Text>}
             </Box>
           )
