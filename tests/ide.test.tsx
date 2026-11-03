@@ -33,7 +33,7 @@ const real = (p: string) => {
   return abs
 }
 
-type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined; store: Map<string, unknown>; written: Map<string, string> }
+type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined; taskSeq?: number; store: Map<string, unknown>; written: Map<string, string> }
 
 const LISTING = `This session is 모드에 대해 [634505] — the name other sessions use to message it.
 
@@ -82,6 +82,7 @@ function fakeWorld(on: On): World {
   })
   on('tool.call', ($, e) => {
     if (String(e.tool) === 'ListAgents') return { result: { listing: LISTING } } as never
+    if (String(e.tool) === 'TaskCreate') return { result: { task: { id: `t${(world.taskSeq = (world.taskSeq ?? 0) + 1)}`, subject: '' } } } as never
     return String(e.tool) === 'Write' && (e as unknown as { content?: string }).content === 'DENY' ? { deny: 'no' } : ({ result: 'ok' } as never)
   })
   on('session.root', () => ({ value: ROOT }))
@@ -982,6 +983,50 @@ describe('지난 세션 요청', () => {
     expect(text).toContain('지난 세션 old-sess')
     expect(text).not.toContain('다른 폴더 요청')
     expect((world.store.get('requests:test-session') as { root?: string }).root).toBe(ROOT)
+    // v: 이 세션만 보면 지난 세션 요청은 빠진다
+    await ui.press({ key: 'request-scope' })
+    const only = textOf(await ui.findAll({ type: 'Text' }))
+    expect(only).toContain('오늘 요청')
+    expect(only).not.toContain('어제 보낸 요청')
+    expect(only).toContain('이 세션 요청 1개')
+    await ui.press({ key: 'request-scope' })
+    expect(textOf(await ui.findAll({ type: 'Text' }))).toContain('어제 보낸 요청')
+    await ui.unmount()
+  })
+})
+
+describe('작업 진행', () => {
+  test('TaskCreate·TaskUpdate로 적은 할 일을 창 맨 아래 진행률과 목록으로 보여 준다', async ($, on) => {
+    fakeWorld(on)
+    await $.command.run(typed('open', '/work'))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140, 40) })
+    expect(textOf(await ui.findAll({ type: 'Text' }))).not.toContain('작업 진행')
+    for (const subject of ['엑셀 불러오기', '요약 문장 만들기', '그래프 그리기']) await $.tool.call({ tool: 'TaskCreate', subject, description: '' } as never)
+    await $.tool.call({ tool: 'TaskUpdate', taskId: 't1', status: 'completed' } as never)
+    await $.tool.call({ tool: 'TaskUpdate', taskId: 't2', status: 'in_progress' } as never)
+    const text = textOf(await ui.findAll({ type: 'Text' }))
+    expect(text).toContain('작업 진행')
+    expect(text).toContain('33%')
+    expect(text).toContain('완료 1 · 진행 중 1 · 대기 1')
+    // 진행 중이 맨 위
+    expect(text.indexOf('요약 문장 만들기')).toBeLessThan(text.indexOf('그래프 그리기'))
+    await $.tool.call({ tool: 'TaskUpdate', taskId: 't3', status: 'deleted' } as never)
+    expect(textOf(await ui.findAll({ type: 'Text' }))).not.toContain('그래프 그리기')
+    // TodoWrite는 목록을 통째로 바꾼다
+    await $.tool.call({ tool: 'TodoWrite', todos: [{ content: '하나', status: 'completed', activeForm: '' }, { content: '둘', status: 'completed', activeForm: '' }] } as never)
+    const after = textOf(await ui.findAll({ type: 'Text' }))
+    expect(after).toContain('100%')
+    expect(after).not.toContain('엑셀 불러오기')
+    await ui.unmount()
+  })
+
+  test('데스크톱에서는 버튼 줄을 한 행에 가두지 않고 감싼다', async ($, on) => {
+    fakeWorld(on)
+    await $.command.run(typed('open', '/work'))
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: props(60) })
+    const bar = await ui.find({ key: 'ide-toolbar' })
+    expect(bar?.props.flexWrap).toBe('wrap')
+    expect(bar?.props.height).toBeUndefined()
     await ui.unmount()
   })
 })

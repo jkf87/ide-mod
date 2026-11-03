@@ -417,6 +417,15 @@ async function refreshSys($: EngineInterface) {
   }
 }
 
+/**
+ * 버튼이 여럿 든 한 줄. 터미널은 한 행에서 자르고, 데스크톱은 네이티브 버튼이 글자 칸보다 넓어
+ * 한 행에 가두면 글이 겹쳐 보이니(11-04 화면) 높이를 풀고 다음 줄로 감싼다.
+ */
+const barRow = (surface: string, gap = 2) =>
+  surface === 'desktop'
+    ? ({ flexDirection: 'row', columnGap: gap, flexWrap: 'wrap' } as const)
+    : ({ flexDirection: 'row', columnGap: gap, height: 1, overflow: 'hidden' } as const)
+
 const bar = (ratio: number, width = 8) => {
   const filled = clamp(Math.round(ratio * width), 0, width)
   return '█'.repeat(filled) + '░'.repeat(width - filled)
@@ -442,7 +451,7 @@ async function drawSys($: EngineInterface, e: RenderInput<'Pane'>): Promise<Rend
   const diskRatio = stat.diskTotal > 0 ? 1 - stat.diskFree / stat.diskTotal : 0
   const diskColor = diskRatio > 0.95 ? 'error' : diskRatio > 0.9 ? 'warning' : undefined
   const rows: RenderElement[] = [
-    <Box key="sys" flexDirection="row" columnGap={2} height={1} overflow="hidden">
+    <Box key="sys" {...barRow(e.surface)}>
       <Text bold>시스템</Text>
       {stat.memTotal > 0 && <Text color={memColor} wrap="truncate-end">메모리 {bar(memRatio)} {gb(stat.memUsed)}/{gb(stat.memTotal)} · 압력 {pressureLabel}</Text>}
       {stat.swapUsed > 0 && <Text color={swapColor}>스왑 {gb(stat.swapUsed)}</Text>}
@@ -479,7 +488,7 @@ async function drawBoard($: EngineInterface, e: RenderInput<'Pane'>, width: numb
 
   const sessionId = await $.session.id().catch(() => '')
   const header = (
-    <Box key="board-header" flexDirection="row" columnGap={2} height={1} overflow="hidden">
+    <Box key="board-header" {...barRow(e.surface)}>
       <Text bold wrap="truncate-end">{summary}</Text>
       {sessionId !== '' && <Text dimColor wrap="truncate-end">세션 {sessionId.slice(0, 8)}</Text>}
       <Button key="board-handoff" plain hotkey="i" label="핸드오프" onPress={() => void openHandoff($)} />
@@ -965,6 +974,70 @@ async function noteScroll($: EngineInterface, e: { by: number; offset: number; b
   })
 }
 
+// ════════════════ 작업 진행 (창 맨 아래) ════════════════
+// Claude가 작업 목록 도구(TaskCreate·TaskUpdate·TodoWrite)로 적는 할 일을 진행률 한 줄 + 할 일 몇 줄로 보여 준다.
+
+type TaskStatus = 'pending' | 'in_progress' | 'completed'
+type TaskItem = { id: string; subject: string; status: TaskStatus }
+const tasksAtom = atom({ plugin: 'ide-mod', key: 'tasks' } as const, [] as TaskItem[])
+const TASK_LABEL: Record<TaskStatus, string> = { pending: '대기', in_progress: '진행 중', completed: '완료' }
+const TASK_ICON: Record<TaskStatus, string> = { pending: '○', in_progress: '◐', completed: '✓' }
+const isTaskStatus = (v: unknown): v is TaskStatus => v === 'pending' || v === 'in_progress' || v === 'completed'
+
+async function noteTasks($: EngineInterface, agentId: string | undefined, tool: string, input: Record<string, unknown>, ran: unknown) {
+  const out = ran as { deny?: string; isError?: true; result?: unknown }
+  if (out.deny !== undefined || out.isError === true) return
+  if (tool === 'TodoWrite') {
+    // 서브에이전트의 할 일 목록은 메인 목록을 덮지 않는다
+    if (agentId !== undefined || !Array.isArray(input.todos)) return
+    const todos = input.todos as { content?: unknown; status?: unknown }[]
+    await update($, tasksAtom, () => todos.map((t, i) => ({ id: `todo:${i}`, subject: oneLine(String(t.content ?? ''), 200), status: isTaskStatus(t.status) ? t.status : 'pending' })))
+  } else if (tool === 'TaskCreate') {
+    const id = (out.result as { task?: { id?: unknown } } | undefined)?.task?.id
+    if (typeof id !== 'string') return
+    await update($, tasksAtom, list => [...list.filter(t => t.id !== id), { id, subject: oneLine(String(input.subject ?? ''), 200), status: 'pending' as const }])
+  } else if (tool === 'TaskUpdate') {
+    const id = String(input.taskId ?? '')
+    if (id === '') return
+    await update($, tasksAtom, list =>
+      input.status === 'deleted'
+        ? list.filter(t => t.id !== id)
+        : list.map(t => (t.id !== id ? t : { ...t, subject: typeof input.subject === 'string' ? oneLine(input.subject, 200) : t.subject, status: isTaskStatus(input.status) ? input.status : t.status }) as TaskItem),
+    )
+  }
+}
+
+/** 창 맨 아래 작업 진행: 할 일이 없으면 아무것도 그리지 않는다. maxRows를 넘기지 않는다 */
+async function drawTasks($: EngineInterface, e: RenderInput<'Pane'>, maxRows: number): Promise<RenderElement[]> {
+  const tasks = await read($, tasksAtom)
+  if (tasks.length === 0 || maxRows < 1) return []
+  const { Box, Text } = $.ui.resolve(e)
+  const count = (st: TaskStatus) => tasks.filter(t => t.status === st).length
+  const done = count('completed')
+  const ratio = done / tasks.length
+  const head = (
+    <Box key="tasks-head" {...barRow(e.surface)}>
+      <Text bold>작업 진행</Text>
+      <Text color={ratio === 1 ? 'success' : 'claude'}>{bar(ratio, 10)} {Math.round(ratio * 100)}%</Text>
+      <Text dimColor wrap="truncate-end">완료 {done} · 진행 중 {count('in_progress')} · 대기 {count('pending')}</Text>
+    </Box>
+  )
+  // 진행 중 → 대기 → 방금 끝난 것 순서로, 남는 줄만큼만
+  const order = [...tasks.filter(t => t.status === 'in_progress'), ...tasks.filter(t => t.status === 'pending'), ...tasks.filter(t => t.status === 'completed').reverse()]
+  const room = Math.min(TASK_ROWS, maxRows - 1)
+  const isCut = order.length > room
+  const shown = order.slice(0, isCut ? Math.max(0, room - 1) : room)
+  const rows = shown.map(t => (
+    <Text key={`task:${t.id}`} wrap="truncate-end" dimColor={t.status !== 'in_progress'}>
+      <Text color={t.status === 'in_progress' ? 'warning' : t.status === 'completed' ? 'success' : undefined}>{TASK_ICON[t.status]} {TASK_LABEL[t.status]}</Text>
+      <Text>  {t.subject}</Text>
+    </Text>
+  ))
+  if (isCut && room > 0) rows.push(<Text key="tasks-more" dimColor>  … 외 {order.length - shown.length}개</Text>)
+  return [head, ...rows]
+}
+const TASK_ROWS = 5
+
 /** 트리 누름·바깥 앱 열기 기록: ~/.cache/ide-mod/press.log (더블클릭이 안 먹을 때 본다) */
 const pressLog: string[] = []
 let pressLogTimer = false
@@ -999,7 +1072,9 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
   const requests = await read($, requestsAtom)
   // 같은 폴더의 지난 세션 요청이 앞에, 이번 세션 요청이 뒤에
   const pastRequests = await read($, pastRequestsAtom)
-  const history = [...pastRequests, ...requests].sort((a, b) => a.at - b.at)
+  // 전체 세션: 같은 폴더의 지난 세션·agy·Codex 요청까지, 이 세션: 지금 세션에서 보낸 것만
+  const isSessionScope = (await read($, requestScopeAtom)) === 'session'
+  const history = (isSessionScope ? [...requests] : [...pastRequests, ...requests]).sort((a, b) => a.at - b.at)
   const selectedN = await read($, selectedRequestAtom)
   const hwpView = await read($, hwpViewAtom)
   const isRequests = leftMode === 'requests'
@@ -1033,7 +1108,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
 
   // ── 툴바 ──
   const toolbar = (
-    <Box key="ide-toolbar" flexDirection="row" columnGap={2} height={1} overflow="hidden">
+    <Box key="ide-toolbar" {...barRow(e.surface)}>
       {/* 바깥 앱으로 여는 두 버튼은 맨 앞: 툴바 뒤쪽은 좁은 창에서 잘린다 */}
       {isFiles && active !== '' && <Button key="open-app" plain hotkey="g" label="앱으로 열기" onPress={() => void openOutside($, active)} />}
       {isFiles && <Button key="open-folder" plain hotkey="f" label={`폴더 열기(${fit(baseName(folderTarget) || '/', 12)})`} onPress={() => void (pickedDir === '' && active !== '' ? openOutside($, active, true) : openOutside($, folderTarget))} />}
@@ -1094,6 +1169,20 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
       )}
       {isHwp && (
         <Button key="hwp-next" plain hotkey="n" label="뒤쪽 ▶" onPress={() => void update($, hwpPagesAtom, all => ({ ...all, [active]: (all[active] ?? 0) + 1 }))} />
+      )}
+      {isRequests && (
+        <Button
+          key="request-scope"
+          plain
+          hotkey="v"
+          label={isSessionScope ? '전체 세션 보기' : '이 세션만 보기'}
+          onPress={() =>
+            void (async () => {
+              await update($, requestScopeAtom, v => (v === 'session' ? 'all' : 'session'))
+              await update($, requestOffsetAtom, () => 0)
+            })()
+          }
+        />
       )}
       {isRequests && history.length > 0 && (
         <Button key="request-all" plain hotkey="l" label={isAllRequests ? '하나만 보기' : '모두 보기'} onPress={() => void update($, requestViewAtom, v => (v === 'all' ? 'one' : 'all'))} />
@@ -1196,7 +1285,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
     const shown = newestFirst.slice(requestOffset, requestOffset + treeView)
     treeColumn = (
       <Box key="ide-requests" flexDirection="column" width={treeWidth} height={mainRows} overflow="hidden">
-        <Text bold wrap="truncate-end">요청 기록 {history.length}개{pastRequests.length > 0 ? ` (지난 세션 ${pastRequests.length})` : ''}{history.length > treeView ? ` · ${requestOffset + 1}-${requestOffset + shown.length}` : ''}</Text>
+        <Text bold wrap="truncate-end">{isSessionScope ? '이 세션' : '전체 세션'} 요청 {history.length}개{!isSessionScope && pastRequests.length > 0 ? ` (지난 세션·다른 도구 ${pastRequests.length})` : ''}{history.length > treeView ? ` · ${requestOffset + 1}-${requestOffset + shown.length}` : ''}</Text>
         {shown.length === 0 && <Text dimColor>아직 보낸 요청이 없어요. 이 세션에서 보내는 요청이 여기 쌓여요.</Text>}
         {shown.map(r => {
           const isOn = !isAllRequests && r.n === selected?.n
@@ -1231,7 +1320,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
 
     treeColumn = (
       <Box key="ide-tree" flexDirection="column" width={treeWidth} height={mainRows} overflow="hidden">
-        <Box flexDirection="row" height={1} overflow="hidden">
+        <Box {...barRow(e.surface, 0)}>
           <Text bold wrap="truncate-end">{fit(baseName(root) || '/', Math.max(4, treeWidth - position.length - 6))}</Text>
           <Text dimColor>{position} </Text>
           <Button key="tree-up" plain hotkey="k" label="▲" onPress={() => void update($, treeOffsetAtom, n => clamp(n - page, 0, tree.rows.length - treeView))} />
@@ -1259,7 +1348,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
   if (showFile) {
     const contentRows = Math.max(1, mainRows - 2)
     const tabRow = (
-      <Box flexDirection="row" columnGap={1} height={1} overflow="hidden">
+      <Box {...barRow(e.surface, 1)}>
         {tabs.length === 0 && <Text dimColor>열린 파일 없음</Text>}
         {tabs.map(tab => (
           <Button
@@ -1466,6 +1555,8 @@ const requestsAtom = atom({ plugin: 'ide-mod', key: 'requests' } as const, [] as
 const selectedRequestAtom = atom({ plugin: 'ide-mod', key: 'selectedRequest' } as const, 0)
 const requestOffsetAtom = atom({ plugin: 'ide-mod', key: 'requestOffset' } as const, 0)
 const requestViewAtom = atom({ plugin: 'ide-mod', key: 'requestView' } as const, 'all' as 'all' | 'one')
+/** 요청 기록 범위: all = 같은 폴더의 지난 세션·agy·Codex까지, session = 이 세션만 */
+const requestScopeAtom = atom({ plugin: 'ide-mod', key: 'requestScope' } as const, 'all' as 'all' | 'session')
 const pastRequestsAtom = atom({ plugin: 'ide-mod', key: 'pastRequests' } as const, [] as RequestItem[])
 let isPastRequested = false
 const hwpViewAtom = atom({ plugin: 'ide-mod', key: 'hwpView' } as const, 'doc' as 'doc' | 'image')
@@ -2916,6 +3007,7 @@ export const register: Register = (on, options) => {
     const ran = await next(e)
     const outcome = ran as { deny?: string; isError?: true }
     await noteEdit($, tool, input, outcome).catch(() => undefined)
+    await noteTasks($, e.agentId, tool, input, ran).catch(() => undefined)
     // Claude가 한국어 원고를 쓰거나 고치면 문체 게이트를 돌린다
     const written = typeof input.file_path === 'string' ? input.file_path : undefined
     if (EDIT_TOOLS.includes(tool) && written !== undefined && PROSE.test(written) && outcome.deny === undefined && outcome.isError !== true && (await read($, gateOnAtom))) {
@@ -2972,7 +3064,11 @@ export const register: Register = (on, options) => {
     const bodyRows = Math.max(4, e.props.scroll.bodyRows)
     Object.assign(layout, { engineOffset: e.props.scroll.offset, surface: e.surface, placement: e.props.placement })
     const board = await drawBoard($, e, width, clamp(Math.round(bodyRows * 0.35), 2, 12))
-    const explorerRows = Math.max(2, bodyRows - board.length - 1)
+    // 맨 아래 작업 진행: 탐색기가 10행은 남게
+    const tasks = await drawTasks($, e, Math.max(0, bodyRows - board.length - 1 - 10 - 1)).catch(() => [] as RenderElement[])
+    // 데스크톱은 버튼 줄이 감싸져 행이 늘어난다: 그만큼 탐색기를 줄여 창 밖으로 밀리지 않게
+    const slack = e.surface === 'desktop' ? 4 : 0
+    const explorerRows = Math.max(2, bodyRows - board.length - 1 - (tasks.length > 0 ? tasks.length + 1 : 0) - slack)
     const explorer = await drawExplorer($, e, width, explorerRows, board.length + 2)
 
     return (
@@ -2980,6 +3076,8 @@ export const register: Register = (on, options) => {
         {board}
         <Text key="board-rule" dimColor>{'─'.repeat(width)}</Text>
         {explorer}
+        {tasks.length > 0 && <Text key="tasks-rule" dimColor>{'─'.repeat(width)}</Text>}
+        {tasks}
       </Box>
     )
   })

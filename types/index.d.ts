@@ -205,6 +205,8 @@ declare module 'claude-code' {
       requestOffset: number
       /** 오른쪽: all 이번 세션 요청 전부를 이어서, one 고른 요청 하나 */
       requestView: 'all' | 'one'
+      /** 요청 기록 범위: all = 같은 폴더의 지난 세션·agy·Codex까지, session = 이 세션만 */
+      requestScope: 'all' | 'session'
 
       // ── 시스템 상태 ──
       /** 메모리·스왑·디스크 (보드가 떠 있을 때 10초마다) */
@@ -246,6 +248,10 @@ declare module 'claude-code' {
       gate: GateResult | null
       isGateOn: boolean
       isGateOpen: boolean
+
+      // ── 작업 진행 (창 맨 아래) ──
+      /** Claude가 TaskCreate·TaskUpdate·TodoWrite로 적은 할 일 */
+      tasks: { id: string; subject: string; status: 'pending' | 'in_progress' | 'completed' }[]
     }
   }
 }
