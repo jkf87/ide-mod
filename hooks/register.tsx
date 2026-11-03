@@ -763,13 +763,18 @@ async function pressEntry($: EngineInterface, row: TreeRow) {
   }
 }
 
-/** Mod API에는 더블클릭이 없어서, 같은 줄을 짧게 두 번 누르면 더블클릭으로 본다 */
-const DOUBLE_PRESS_MS = 450
+/**
+ * Mod API에는 더블클릭이 없어서, 같은 줄을 1.2초 안에 두 번 누르면 더블클릭으로 본다.
+ * 전체 화면 터미널은 빠른 더블클릭을 단어 선택·복사로 먹어서 누름이 한 번만 온다(press.log 실측: 간격 0.75~0.97초로 두 번).
+ */
+const DOUBLE_PRESS_MS = 1200
 let lastTreePress = { path: '', at: 0 }
 
 async function pressTreeRow($: EngineInterface, row: TreeRow) {
   const now = Date.now()
-  const isDouble = lastTreePress.path === row.path && now - lastTreePress.at < DOUBLE_PRESS_MS
+  const gap = lastTreePress.path === row.path ? now - lastTreePress.at : -1
+  const isDouble = gap >= 0 && gap < DOUBLE_PRESS_MS
+  notePress($, `press ${row.path} gap=${gap} → ${isDouble ? 'double' : 'single'}`)
   lastTreePress = isDouble ? { path: '', at: 0 } : { path: row.path, at: now }
   if (!isDouble) return pressEntry($, row)
   // 폴더는 첫 번째 누름이 펼침을 바꿨으니 되돌려 놓고 연다
@@ -784,7 +789,11 @@ async function openOutside($: EngineInterface, path: string, reveal = false) {
     ? [reveal ? ['explorer', `/select,${path}`] : ['explorer', path]]
     : [reveal ? ['open', '-R', path] : ['open', path], ['xdg-open', reveal ? parentOf(path) : path]]
   for (const argv of tries) {
-    const ran = await $.process.run(argv, { timeoutMs: 10_000 }).catch(() => undefined)
+    const ran = await $.process.run(argv, { timeoutMs: 10_000 }).catch(error => {
+      notePress($, `run ${argv.join(' ')} threw ${oneLine(String(error), 200)}`)
+      return undefined
+    })
+    if (ran !== undefined) notePress($, `run ${argv.join(' ')} exit=${ran.exitCode} ${oneLine(ran.stderr, 200)}`)
     // explorer는 성공해도 1을 돌려준다
     if (ran !== undefined && (ran.exitCode === 0 || argv[0] === 'explorer')) return true
   }
@@ -956,6 +965,23 @@ async function noteScroll($: EngineInterface, e: { by: number; offset: number; b
   })
 }
 
+/** 트리 누름·바깥 앱 열기 기록: ~/.cache/ide-mod/press.log (더블클릭이 안 먹을 때 본다) */
+const pressLog: string[] = []
+let pressLogTimer = false
+function notePress($: EngineInterface, line: string) {
+  pressLog.push(`${new Date().toISOString().slice(11, 23)} ${line}`)
+  pressLog.splice(0, Math.max(0, pressLog.length - 60))
+  if (pressLogTimer) return
+  pressLogTimer = true
+  $.clock.after(300, () => {
+    pressLogTimer = false
+    void (async () => {
+      const home = (await $.env.get('HOME')) ?? ''
+      if (home !== '') await $.fs.write(`${home}/.cache/ide-mod/press.log`, pressLog.join('\n') + '\n')
+    })().catch(() => undefined)
+  })
+}
+
 /** 탐색기 부분: 툴바 한 줄 + 트리 | 탭 에디터. 정확히 rows 행을 쓴다 */
 async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: number, rows: number, topRows: number): Promise<RenderElement> {
   const { Box, Text, Button, Code, Markdown } = $.ui.resolve(e)
@@ -1008,6 +1034,9 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
   // ── 툴바 ──
   const toolbar = (
     <Box key="ide-toolbar" flexDirection="row" columnGap={2} height={1} overflow="hidden">
+      {/* 바깥 앱으로 여는 두 버튼은 맨 앞: 툴바 뒤쪽은 좁은 창에서 잘린다 */}
+      {isFiles && active !== '' && <Button key="open-app" plain hotkey="g" label="앱으로 열기" onPress={() => void openOutside($, active)} />}
+      {isFiles && <Button key="open-folder" plain hotkey="f" label={`폴더 열기(${fit(baseName(folderTarget) || '/', 12)})`} onPress={() => void (pickedDir === '' && active !== '' ? openOutside($, active, true) : openOutside($, folderTarget))} />}
       <Button key="tree" plain hotkey="t" label={showTree && showFile ? '트리 접기' : '트리'} onPress={() => void update($, treeHiddenAtom, v => (rightKey === '' ? false : !v))} />
       <Button
         key="left-mode"
@@ -1123,8 +1152,6 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
       {isFiles && active !== '' && <Button key="mention" plain hotkey="p" label="@프롬프트" onPress={() => void $.prompt.fill({ text: `@${active} `, mode: 'insert' })} />}
       {isFiles && active !== '' && <Button key="copy" plain hotkey="c" label="경로 복사" onPress={() => void $.ui.copy({ text: active, surface: e.surface })} />}
       {isFiles && active !== '' && <Button key="close" plain hotkey="w" label="탭 닫기" onPress={() => void closeTab($, active)} />}
-      {isFiles && active !== '' && <Button key="open-app" plain hotkey="g" label="앱으로 열기" onPress={() => void openOutside($, active)} />}
-      {isFiles && <Button key="open-folder" plain hotkey="f" label={`폴더 열기(${fit(baseName(folderTarget) || '/', 16)})`} onPress={() => void (pickedDir === '' && active !== '' ? openOutside($, active, true) : openOutside($, folderTarget))} />}
     </Box>
   )
 
