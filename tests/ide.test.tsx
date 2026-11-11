@@ -1020,6 +1020,49 @@ describe('작업 진행', () => {
     await ui.unmount()
   })
 
+  test('턴이 끝나면 끝남 소리, 권한을 물으면 부름 소리, d로 소리→읽기→끔', async ($, on) => {
+    const world = fakeWorld(on)
+    const played: string[] = []
+    const spoken: string[] = []
+    on('audio.play', ($, e) => {
+      played.push(String((e as unknown as { clip: { asset?: string } }).clip.asset))
+      return { value: undefined } as never
+    })
+    on('audio.speak', ($, e) => {
+      spoken.push(String((e as unknown as { text: string }).text))
+      return { value: { via: 'system' } } as never
+    })
+    on('tool.check', () => ({ decision: 'ask' }) as never)
+    await ask($, '고쳐줘', 't1')
+    await $.turn.complete({ answer: '고쳤어요', durationMs: 45_000, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+    expect(played).toEqual(['sounds/done.wav'])
+    expect(spoken).toEqual([])
+    // 멈춘 턴은 소리 없음
+    await ask($, '또', 't2')
+    await $.turn.complete({ answer: '', durationMs: 45_000, isAborted: true, turnId: 't2', reason: 'answer' } as never)
+    expect(played.length).toBe(1)
+    await $.tool.check({ tool: 'Bash', input: { command: 'rm -rf x' }, tool_use_id: 'u1', approver: 'person' } as never)
+    expect(played).toEqual(['sounds/done.wav', 'sounds/ask.wav'])
+    // 버튼으로 소리+읽기 → 30초 넘은 턴은 걸린 시간을 읽는다
+    await $.command.run(typed('open', '/work'))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140, 40) })
+    expect((await ui.find({ key: 'board-alert' }))?.props.label).toBe('알림 소리')
+    await ui.press({ key: 'board-alert' })
+    expect((await ui.find({ key: 'board-alert' }))?.props.label).toBe('알림 소리+읽기')
+    expect(world.store.get('alert')).toBe('voice')
+    spoken.length = 0
+    await ask($, '하나 더', 't3')
+    await $.turn.complete({ answer: '됐어요', durationMs: 135_000, isAborted: false, turnId: 't3', reason: 'answer' } as never)
+    expect(spoken).toEqual(['요청 끝났어요. 2분 15초 걸렸어요.'])
+    await ui.press({ key: 'board-alert' })
+    expect(world.store.get('alert')).toBe('off')
+    const before = played.length
+    await ask($, '마지막', 't4')
+    await $.turn.complete({ answer: '끝', durationMs: 5_000, isAborted: false, turnId: 't4', reason: 'answer' } as never)
+    expect(played.length).toBe(before)
+    await ui.unmount()
+  })
+
   test('데스크톱에서는 버튼 줄을 한 행에 가두지 않고 감싼다', async ($, on) => {
     fakeWorld(on)
     await $.command.run(typed('open', '/work'))

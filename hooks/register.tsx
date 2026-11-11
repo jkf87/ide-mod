@@ -324,6 +324,8 @@ function registerAgents(on: On) {
     })
     if (id === MAIN) {
       await requestTurnEnded($, e.turnId, e.answer, e.isAborted || e.reason !== 'answer').catch(() => undefined)
+      // 끝까지 답한 턴만 "끝남" 소리 (멈춤·오류는 끝남처럼 들리면 안 된다)
+      if (!e.isAborted && e.reason === 'answer') await alertDone($, e.durationMs).catch(() => undefined)
       await setCaption($, e.isAborted ? '작업을 멈췄어요' : '답을 다 썼어요. 다음 요청을 기다려요').catch(() => undefined)
     }
     return next(e)
@@ -477,6 +479,7 @@ async function drawBoard($: EngineInterface, e: RenderInput<'Pane'>, width: numb
   const isFolded = await read($, foldedAtom)
   const hideDone = await read($, hideDoneAtom)
   const isRecapOn = await read($, recapOnAtom)
+  const alert = await read($, alertAtom)
   await read($, tickAtom)
   const now = Date.now()
 
@@ -492,6 +495,7 @@ async function drawBoard($: EngineInterface, e: RenderInput<'Pane'>, width: numb
       <Text bold wrap="truncate-end">{summary}</Text>
       {sessionId !== '' && <Text dimColor wrap="truncate-end">세션 {sessionId.slice(0, 8)}</Text>}
       <Button key="board-handoff" plain hotkey="i" label="핸드오프" onPress={() => void openHandoff($)} />
+      <Button key="board-alert" plain hotkey="d" label={ALERT_LABEL[alert]} onPress={() => void cycleAlert($)} />
       <Button key="board-fold" plain hotkey="a" label={isFolded ? '보드 펼치기' : '보드 접기'} onPress={() => void update($, foldedAtom, v => !v)} />
       {!isFolded && <Button key="board-hide" plain hotkey="h" label={hideDone ? '끝난 것 보이기' : '끝난 것 숨기기'} onPress={() => void update($, hideDoneAtom, v => !v)} />}
       {!isFolded && <Button key="board-recap" plain hotkey="s" label={isRecapOn ? `요약 끄기(${RECAP_MODEL})` : '요약 켜기'} onPress={() => { recapFailures = 0; void update($, recapOnAtom, v => !v) }} />}
@@ -2801,6 +2805,75 @@ export function perfParts(p: SessionPerf, context: number | undefined): { text: 
   return parts
 }
 
+// ════════════════ 알림 소리 ════════════════
+// lemo-mod(lemomo-ai/lemo-mod, MIT)의 lemo-sound·lemo-voice에서 가져온 생각:
+// 메인 턴이 끝나면 "끝남" 소리, 내 확인(권한·질문)을 기다리면 "부름" 소리. 다른 창에 가 있어도 돌아올 때를 안다.
+// 소리 파일(sounds/*.wav)은 이 저장소에서 직접 합성한 것이다
+type AlertMode = 'sound' | 'voice' | 'off'
+const ALERT_KEY = 'alert'
+const ALERT_MODES: readonly AlertMode[] = ['sound', 'voice', 'off']
+const ALERT_NEXT: Record<AlertMode, AlertMode> = { sound: 'voice', voice: 'off', off: 'sound' }
+const ALERT_LABEL: Record<AlertMode, string> = { sound: '알림 소리', voice: '알림 소리+읽기', off: '알림 끔' }
+const alertAtom = atom({ plugin: 'ide-mod', key: 'alert' } as const, 'sound' as AlertMode)
+/** 이보다 오래 걸린 턴만 소리 내어 읽는다 (짧은 턴마다 말하면 시끄럽다) */
+const SPEAK_AFTER_MS = 30_000
+/** 권한 창이 연달아 뜰 때 부름 소리는 이 간격에 한 번만 */
+const ASK_GAP_MS = 2_000
+const KO_VOICE = 'Yuna'
+let lastAskSoundAt = 0
+
+const isAlertMode = (v: unknown): v is AlertMode => typeof v === 'string' && (ALERT_MODES as readonly string[]).includes(v)
+
+async function loadAlert($: EngineInterface) {
+  const saved = await $.store.get(ALERT_KEY).catch(() => undefined)
+  if (isAlertMode(saved)) await update($, alertAtom, () => saved)
+}
+
+/** 걸린 시간을 읽기 좋게: 45초, 2분 15초, 1시간 3분 */
+export function spokenKo(ms: number): string {
+  const all = Math.max(1, Math.round(ms / 1000))
+  const h = Math.floor(all / 3600)
+  const m = Math.floor((all % 3600) / 60)
+  const s = all % 60
+  if (h > 0) return m > 0 ? `${h}시간 ${m}분` : `${h}시간`
+  if (m > 0) return s > 0 ? `${m}분 ${s}초` : `${m}분`
+  return `${s}초`
+}
+
+function playSound($: EngineInterface, kind: 'done' | 'ask') {
+  void $.audio.play({ asset: `sounds/${kind}.wav` }, { gain: kind === 'ask' ? 1.2 : 1 }).catch(() => undefined)
+}
+
+/** 한국어 목소리(유나)로 읽고, 없으면 기본 목소리로 */
+function speakKo($: EngineInterface, text: string) {
+  void $.audio.speak(text, { voice: KO_VOICE }).catch(() => $.audio.speak(text).catch(() => undefined))
+}
+
+async function alertDone($: EngineInterface, durationMs: number) {
+  const mode = await read($, alertAtom)
+  if (mode === 'off') return
+  playSound($, 'done')
+  if (mode === 'voice' && durationMs >= SPEAK_AFTER_MS) speakKo($, `요청 끝났어요. ${spokenKo(durationMs)} 걸렸어요.`)
+}
+
+async function alertAsk($: EngineInterface) {
+  const mode = await read($, alertAtom)
+  if (mode === 'off') return
+  const now = Date.now()
+  if (now - lastAskSoundAt < ASK_GAP_MS) return
+  lastAskSoundAt = now
+  playSound($, 'ask')
+}
+
+/** 버튼(d): 소리 → 소리+읽기 → 끔 → 소리. 바꾸면 바로 들려 준다 */
+async function cycleAlert($: EngineInterface) {
+  const next = ALERT_NEXT[await read($, alertAtom)]
+  await update($, alertAtom, () => next)
+  await $.store.set(ALERT_KEY, next).catch(() => undefined)
+  if (next === 'sound') playSound($, 'done')
+  if (next === 'voice') speakKo($, '요청 끝났어요. 2분 15초 걸렸어요.')
+}
+
 // ════════════════ 세션 시작 때 IDE 창 열기 ════════════════
 const autoOpenedAtom = atom({ plugin: 'ide-mod', key: 'autoOpened' } as const, false)
 const AUTO_OPEN_KEY = 'autoOpen'
@@ -2834,6 +2907,7 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'limits', description: '입력창 위 사용 한도 띠 (세션·Claude·Codex·Antigravity)', argumentHint: '[line|rows|off|refresh]' }).catch(() => undefined)
     await $.command.register({ name: 'style-gate', description: '한국어 문체 게이트: 원고의 AI티 지표를 검사 (자동 검사 on/off)', argumentHint: '[파일|on|off]' }).catch(() => undefined)
     await loadRequests($).catch(() => undefined)
+    await loadAlert($).catch(() => undefined)
     const started = await next(e)
     if (e.isInteractive) await autoOpenIde($).catch(() => undefined)
     else isAutoOpenPending = true
@@ -2994,6 +3068,13 @@ export const register: Register = (on, options) => {
 
   registerAgents(on)
   registerExplorerScroll(on)
+
+  // 권한 창·질문처럼 사람이 답해야 하는 호출이면 "부름" 소리. 판정은 그대로 돌려준다
+  on('tool.check', async ($, e, next) => {
+    const verdict = await next(e)
+    if (verdict.decision === 'ask' && e.approver === 'person' && e.tool_use_id !== undefined) await alertAsk($).catch(() => undefined)
+    return verdict
+  }).catch(($, e, next) => next(e))
 
   // 도구 호출 하나를 보드에는 "지금 하는 일"로, 탐색기에는 "고친 파일"로 남긴다
   on('tool.call', async ($, e, next) => {

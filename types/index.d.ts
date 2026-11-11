@@ -208,6 +208,10 @@ declare module 'claude-code' {
       /** 요청 기록 범위: all = 같은 폴더의 지난 세션·agy·Codex까지, session = 이 세션만 */
       requestScope: 'all' | 'session'
 
+      // ── 알림 소리 ──
+      /** sound 끝남·부름 소리, voice 소리 + 30초 넘은 턴은 걸린 시간 읽기, off 끔 */
+      alert: 'sound' | 'voice' | 'off'
+
       // ── 시스템 상태 ──
       /** 메모리·스왑·디스크 (보드가 떠 있을 때 10초마다) */
       sys: SysStat | null
