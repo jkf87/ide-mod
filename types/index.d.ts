@@ -212,6 +212,12 @@ declare module 'claude-code' {
       /** sound 끝남·부름 소리, voice 소리 + 30초 넘은 턴은 걸린 시간 읽기, off 끔 */
       alert: 'sound' | 'voice' | 'off'
 
+      // ── 시간 예산 ──
+      /** 요청마다 거는 예산(분, 0이면 꺼짐)과 넘기면 도구를 막을지 */
+      budget: { minutes: number; isHard: boolean }
+      /** 지금 도는 요청의 예산 시계: 시작 시각, 사람 기다린 시간, 보낸 알림 단계, 거절 횟수 */
+      budgetRun: { turnId: string; startAt: number; pausedMs: number; sent: number; denials: number } | null
+
       // ── 시스템 상태 ──
       /** 메모리·스왑·디스크 (보드가 떠 있을 때 10초마다) */
       sys: SysStat | null

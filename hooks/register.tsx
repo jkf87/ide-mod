@@ -236,6 +236,7 @@ function registerAgents(on: On) {
       await patch($, MAIN, row => ({ ...row, role: 'main', phase: 'running', activity: '알림·메시지 처리 중', updatedAt: Date.now(), endedAt: undefined }))
     }
     if (isPersonTurn) {
+      await startBudget($, e.turnId).catch(() => undefined)
       await patch($, MAIN, row => ({
         ...row,
         role: 'main',
@@ -324,6 +325,7 @@ function registerAgents(on: On) {
     })
     if (id === MAIN) {
       await requestTurnEnded($, e.turnId, e.answer, e.isAborted || e.reason !== 'answer').catch(() => undefined)
+      await update($, budgetRunAtom, () => null).catch(() => undefined)
       // 끝까지 답한 턴만 "끝남" 소리 (멈춤·오류는 끝남처럼 들리면 안 된다)
       if (!e.isAborted && e.reason === 'answer') await alertDone($, e.durationMs).catch(() => undefined)
       await setCaption($, e.isAborted ? '작업을 멈췄어요' : '답을 다 썼어요. 다음 요청을 기다려요').catch(() => undefined)
@@ -480,6 +482,7 @@ async function drawBoard($: EngineInterface, e: RenderInput<'Pane'>, width: numb
   const hideDone = await read($, hideDoneAtom)
   const isRecapOn = await read($, recapOnAtom)
   const alert = await read($, alertAtom)
+  const badge = await budgetBadge($).catch(() => undefined)
   await read($, tickAtom)
   const now = Date.now()
 
@@ -494,6 +497,7 @@ async function drawBoard($: EngineInterface, e: RenderInput<'Pane'>, width: numb
     <Box key="board-header" {...barRow(e.surface)}>
       <Text bold wrap="truncate-end">{summary}</Text>
       {sessionId !== '' && <Text dimColor wrap="truncate-end">세션 {sessionId.slice(0, 8)}</Text>}
+      {badge !== undefined && <Text color={badge.color} dimColor={badge.color === undefined} wrap="truncate-end">{badge.text}</Text>}
       <Button key="board-handoff" plain hotkey="i" label="핸드오프" onPress={() => void openHandoff($)} />
       <Button key="board-alert" plain hotkey="d" label={ALERT_LABEL[alert]} onPress={() => void cycleAlert($)} />
       <Button key="board-fold" plain hotkey="a" label={isFolded ? '보드 펼치기' : '보드 접기'} onPress={() => void update($, foldedAtom, v => !v)} />
@@ -2874,6 +2878,123 @@ async function cycleAlert($: EngineInterface) {
   if (next === 'voice') speakKo($, '요청 끝났어요. 2분 15초 걸렸어요.')
 }
 
+// ════════════════ 시간 예산 ════════════════
+// 사람이 보낸 요청마다 시간 예산을 걸어 에이전트가 그 안에서 계획하고 마무리하게 한다.
+// 1) 요청을 보낼 때 예산을 모델만 읽는 context로 붙이고
+// 2) 50%·80%·100%를 넘을 때 메인 에이전트의 도구 결과 뒤에 남은 시간을 붙이고
+// 3) (hard) 예산 + 유예를 넘기면 도구 호출을 거절해 정리하고 답하게 한다. 거절 뒤에도 계속 부르면 턴을 멈춘다.
+// 권한 창·질문에 사람이 답하는 동안은 시계에서 뺀다
+type BudgetSetting = { minutes: number; isHard: boolean }
+type BudgetRun = { turnId: string; startAt: number; pausedMs: number; sent: number; denials: number }
+const BUDGET_KEY = 'budget'
+const BUDGET_STEPS = [0.5, 0.8, 1] as const
+/** 거절한 뒤에도 이만큼 더 부르면 턴을 멈춘다 */
+const BUDGET_MAX_DENIALS = 5
+/** 사람에게 묻는 도구: 호출 시간 전체가 사람을 기다린 시간이다 */
+const PERSON_TOOLS = ['AskUserQuestion', 'ExitPlanMode']
+const budgetAtom = atom({ plugin: 'ide-mod', key: 'budget' } as const, { minutes: 0, isHard: true } as BudgetSetting)
+const budgetRunAtom = atom({ plugin: 'ide-mod', key: 'budgetRun' } as const, null as BudgetRun | null)
+/** tool_use_id → 사람에게 물은 시각 */
+const askedAt = new Map<string, number>()
+
+const nowOf = ($: EngineInterface) => $.clock.now().catch(() => Date.now())
+const minutesText = (ms: number) => `${Math.max(0, Math.round(ms / 60_000))}분`
+/** 예산을 넘긴 뒤 도구를 막기 전까지 주는 유예: 예산의 10%, 최소 2분 */
+export const budgetGraceMs = (minutes: number) => Math.max(120_000, minutes * 6_000)
+
+/** "20m" "20분" "1h" "90" "off" "20m soft" → 설정. 못 읽으면 undefined */
+export function parseBudget(args: string): BudgetSetting | undefined {
+  const words = args.trim().toLowerCase().split(/\s+/).filter(w => w !== '')
+  const first = words[0]
+  if (first === undefined) return undefined
+  if (['off', '끔', '0'].includes(first)) return { minutes: 0, isHard: true }
+  const m = /^(\d+(?:\.\d+)?)\s*(m|min|분|h|시간)?$/.exec(first)
+  if (m === null) return undefined
+  const minutes = Math.round(Number(m[1]) * (m[2] === 'h' || m[2] === '시간' ? 60 : 1))
+  if (minutes <= 0 || minutes > 24 * 60) return undefined
+  return { minutes, isHard: !words.slice(1).some(w => w === 'soft' || w === '부드럽게') }
+}
+
+async function loadBudget($: EngineInterface) {
+  const saved = (await $.store.get(BUDGET_KEY).catch(() => undefined)) as Partial<BudgetSetting> | undefined
+  if (typeof saved?.minutes === 'number') await update($, budgetAtom, () => ({ minutes: saved.minutes ?? 0, isHard: saved.isHard !== false }))
+}
+
+/** 요청을 보낼 때 모델이 읽는 예산 안내 */
+export function budgetBrief(b: BudgetSetting) {
+  const grace = minutesText(budgetGraceMs(b.minutes))
+  return [
+    `[시간 예산 · ide-mod] 이 요청의 시간 예산은 ${b.minutes}분입니다(사람이 권한·질문에 답하는 시간은 빼고 잽니다).`,
+    '- 시작할 때 예산 안에 끝낼 수 있는 범위로 계획하고, 계획을 말할 때 예상 시간을 함께 적으세요.',
+    '- 예산이 모자라 보이면 처음부터 범위를 줄이고, 줄인 범위와 뺀 일을 분명히 말하세요.',
+    '- 50%·80%·100% 지점에서 남은 시간을 알려 드립니다. 80%를 넘으면 새 일을 벌이지 말고 검증과 정리로 넘어가세요.',
+    b.isHard
+      ? `- 예산을 넘기고 ${grace}이 더 지나면 도구 호출이 거절됩니다. 그 전에 한 일·남은 일·다음 할 일을 정리해 답하세요.`
+      : '- 예산을 넘기면 하던 일만 마치고 한 일·남은 일·다음 할 일을 정리해 답하세요.',
+  ].join('\n')
+}
+
+/** 지금까지 쓴 시간(사람 기다린 시간 제외) */
+async function budgetUsed($: EngineInterface, run: BudgetRun) {
+  return (await nowOf($)) - run.startAt - run.pausedMs
+}
+
+async function startBudget($: EngineInterface, turnId: string) {
+  const b = await read($, budgetAtom)
+  askedAt.clear()
+  const startAt = await nowOf($)
+  await update($, budgetRunAtom, () => (b.minutes > 0 ? { turnId, startAt, pausedMs: 0, sent: 0, denials: 0 } : null))
+}
+
+async function pauseBudget($: EngineInterface, ms: number) {
+  if (ms > 0) await update($, budgetRunAtom, run => (run === null ? run : { ...run, pausedMs: run.pausedMs + ms }))
+}
+
+/** 도구 호출 전: 예산 + 유예를 넘겼으면 거절 사유를 돌려준다 (hard일 때만) */
+async function budgetDenial($: EngineInterface): Promise<string | undefined> {
+  const run = await read($, budgetRunAtom)
+  const b = await read($, budgetAtom)
+  if (run === null || b.minutes <= 0 || !b.isHard) return undefined
+  const used = await budgetUsed($, run)
+  if (used < b.minutes * 60_000 + budgetGraceMs(b.minutes)) return undefined
+  await update($, budgetRunAtom, r => (r === null ? r : { ...r, denials: r.denials + 1 }))
+  if (run.denials + 1 > BUDGET_MAX_DENIALS) await $.turn.abort({ turnId: run.turnId }).catch(() => undefined)
+  return `시간 예산 ${b.minutes}분을 넘겨(지금 ${minutesText(used)}) ide-mod가 도구 호출을 막았어요. 도구를 더 부르지 말고, 지금까지 한 일·남은 일·다음에 할 일을 정리해 바로 답하세요.`
+}
+
+/** 도구 호출 뒤: 새로 넘은 지점이 있으면 모델에게 붙일 알림 */
+async function budgetNote($: EngineInterface): Promise<string | undefined> {
+  const run = await read($, budgetRunAtom)
+  const b = await read($, budgetAtom)
+  if (run === null || b.minutes <= 0) return undefined
+  const used = await budgetUsed($, run)
+  const ratio = used / (b.minutes * 60_000)
+  let step = run.sent
+  while (step < BUDGET_STEPS.length && ratio >= (BUDGET_STEPS[step] ?? Infinity)) step += 1
+  if (step === run.sent) return undefined
+  await update($, budgetRunAtom, r => (r === null ? r : { ...r, sent: step }))
+  const head = `[시간 예산 · ide-mod] ${minutesText(used)} 지남 / 예산 ${b.minutes}분 (${Math.round(ratio * 100)}%).`
+  const left = minutesText(b.minutes * 60_000 - used)
+  if (step >= 3) {
+    return b.isHard
+      ? `${head} 예산을 다 썼어요. 하던 것만 마치고 정리해 답하세요. ${minutesText(budgetGraceMs(b.minutes))} 뒤부터 도구 호출이 거절됩니다.`
+      : `${head} 예산을 다 썼어요. 하던 것만 마치고 한 일·남은 일·다음 할 일을 정리해 답하세요.`
+  }
+  if (step === 2) return `${head} 남은 ${left}: 새 일을 벌이지 말고 검증과 정리로 넘어가세요.`
+  return `${head} 남은 ${left}: 남은 일이 이 안에 끝나는지 확인하고, 아니면 지금 범위를 줄이세요.`
+}
+
+/** 보드 머리에 붙는 "예산 12/20분" (색: 80% 노랑, 100% 빨강) */
+async function budgetBadge($: EngineInterface): Promise<{ text: string; color?: Color } | undefined> {
+  const b = await read($, budgetAtom)
+  if (b.minutes <= 0) return undefined
+  const run = await read($, budgetRunAtom)
+  if (run === null) return { text: `예산 ${b.minutes}분${b.isHard ? '' : ' (soft)'}` }
+  const used = await budgetUsed($, run)
+  const ratio = used / (b.minutes * 60_000)
+  return { text: `예산 ${Math.floor(Math.max(0, used) / 60_000)}/${b.minutes}분`, color: ratio >= 1 ? 'error' : ratio >= 0.8 ? 'warning' : undefined }
+}
+
 // ════════════════ 세션 시작 때 IDE 창 열기 ════════════════
 const autoOpenedAtom = atom({ plugin: 'ide-mod', key: 'autoOpened' } as const, false)
 const AUTO_OPEN_KEY = 'autoOpen'
@@ -2908,6 +3029,8 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'style-gate', description: '한국어 문체 게이트: 원고의 AI티 지표를 검사 (자동 검사 on/off)', argumentHint: '[파일|on|off]' }).catch(() => undefined)
     await loadRequests($).catch(() => undefined)
     await loadAlert($).catch(() => undefined)
+    await loadBudget($).catch(() => undefined)
+    await $.command.register({ name: 'budget', description: '시간 예산: 요청마다 N분 안에 계획·마무리하게 하고, 넘기면 도구 호출을 막습니다 (soft면 막지 않음)', argumentHint: '[20m|1h|off] [soft]' }).catch(() => undefined)
     const started = await next(e)
     if (e.isInteractive) await autoOpenIde($).catch(() => undefined)
     else isAutoOpenPending = true
@@ -3006,6 +3129,21 @@ export const register: Register = (on, options) => {
     return { text: lines.join('\n') }
   })
 
+  on('command.run', { command: 'budget' }, async ($, e) => {
+    const args = (e.args ?? '').trim()
+    if (args !== '') {
+      const next = parseBudget(args)
+      if (next === undefined) return { text: '쓰는 법: /budget 20m · /budget 1h · /budget 30m soft · /budget off' }
+      await update($, budgetAtom, () => next)
+      await $.store.set(BUDGET_KEY, next).catch(() => undefined)
+      // 지금 돌고 있는 요청에는 걸지 않는다: 다음 요청부터
+      if (next.minutes <= 0) await update($, budgetRunAtom, () => null)
+    }
+    const b = await read($, budgetAtom)
+    if (b.minutes <= 0) return { text: '시간 예산: 꺼짐. /budget 20m 처럼 켜요.' }
+    return { text: `시간 예산: 요청마다 ${b.minutes}분 · ${b.isHard ? `넘기고 ${minutesText(budgetGraceMs(b.minutes))} 뒤 도구 호출을 막아요` : '막지 않고 알리기만 해요(soft)'}. 다음 요청부터 적용돼요.` }
+  })
+
   on('command.run', { command: 'limits' }, async ($, e) => {
     const arg = (e.args ?? '').trim()
     const layout = normLayout(arg)
@@ -3059,7 +3197,11 @@ export const register: Register = (on, options) => {
   on('prompt.submit', async ($, e, next) => {
     try {
       const text = personText(e.text)
-      if (REQUEST_ORIGINS.includes(e.origin.kind) && text !== '' && !isMachineText(text) && !/^\/[\w:.-]+$/.test(text)) await addRequest($, text, e.turnId)
+      const isRequest = REQUEST_ORIGINS.includes(e.origin.kind) && text !== '' && !isMachineText(text) && !/^\/[\w:.-]+$/.test(text)
+      if (isRequest) await addRequest($, text, e.turnId)
+      // 쉬는 중에 보낸 새 요청에만 시간 예산을 붙인다 (일하는 중에 끼워 넣은 말은 같은 예산 안이다)
+      const budget = await read($, budgetAtom)
+      if (isRequest && e.turnId === undefined && budget.minutes > 0) return next({ ...e, context: [...(e.context ?? []), budgetBrief(budget)] })
     } catch {
       // 기록은 덤이라 실패해도 프롬프트는 그대로 간다
     }
@@ -3072,7 +3214,10 @@ export const register: Register = (on, options) => {
   // 권한 창·질문처럼 사람이 답해야 하는 호출이면 "부름" 소리. 판정은 그대로 돌려준다
   on('tool.check', async ($, e, next) => {
     const verdict = await next(e)
-    if (verdict.decision === 'ask' && e.approver === 'person' && e.tool_use_id !== undefined) await alertAsk($).catch(() => undefined)
+    if (verdict.decision === 'ask' && e.approver === 'person' && e.tool_use_id !== undefined) {
+      askedAt.set(e.tool_use_id, await nowOf($))
+      await alertAsk($).catch(() => undefined)
+    }
     return verdict
   }).catch(($, e, next) => next(e))
 
@@ -3081,6 +3226,13 @@ export const register: Register = (on, options) => {
     const tool = String(e.tool)
     // 핸드오프 화면이 세션 목록을 받으려고 부른 ListAgents는 보드·자막에 올리지 않는다
     if (tool === 'ListAgents' && e.agentId === undefined) return next(e)
+    // 시간 예산: 넘겼으면 막고, 사람이 권한 창에 답하던 시간은 시계에서 뺀다
+    const denial = await budgetDenial($).catch(() => undefined)
+    if (denial !== undefined) return { deny: denial }
+    const callAt = await nowOf($)
+    const askAt = e.tool_use_id === undefined ? undefined : askedAt.get(e.tool_use_id)
+    if (e.tool_use_id !== undefined) askedAt.delete(e.tool_use_id)
+    if (askAt !== undefined && !PERSON_TOOLS.includes(tool)) await pauseBudget($, callAt - askAt).catch(() => undefined)
     const input = e as unknown as Record<string, unknown>
     await recordToolCall($, e.agentId, tool, input).catch(() => undefined)
     const role = e.agentId === undefined ? undefined : (await read($, agentsAtom))[e.agentId]?.role
@@ -3089,11 +3241,17 @@ export const register: Register = (on, options) => {
     const outcome = ran as { deny?: string; isError?: true }
     await noteEdit($, tool, input, outcome).catch(() => undefined)
     await noteTasks($, e.agentId, tool, input, ran).catch(() => undefined)
+    if (PERSON_TOOLS.includes(tool)) await pauseBudget($, (await nowOf($)) - (askAt ?? callAt)).catch(() => undefined)
     // Claude가 한국어 원고를 쓰거나 고치면 문체 게이트를 돌린다
     const written = typeof input.file_path === 'string' ? input.file_path : undefined
     if (EDIT_TOOLS.includes(tool) && written !== undefined && PROSE.test(written) && outcome.deny === undefined && outcome.isError !== true && (await read($, gateOnAtom))) {
       const real = (await $.fs.stat(written, { resolve: true }).catch(() => undefined))?.realPath
       if (real !== undefined) await runGate($, real).catch(() => undefined)
+    }
+    // 메인 에이전트에게만 남은 시간을 도구 결과 뒤에 붙인다
+    if (e.agentId === undefined && outcome.deny === undefined) {
+      const note = await budgetNote($).catch(() => undefined)
+      if (note !== undefined) return { ...ran, context: [...((ran as { context?: readonly string[] }).context ?? []), note] } as typeof ran
     }
     return ran
   }).catch(($, e, next) => next(e))

@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
+import { budgetBrief, parseBudget, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
 import { artifactUrlOf, gitInfoFrom, gitNotes, handoffFromText, handoffPage, receivePrompt, redactSecrets, savedPathOf, shareDoc, webUrlOf } from '../hooks/share'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
@@ -33,7 +33,7 @@ const real = (p: string) => {
   return abs
 }
 
-type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined; taskSeq?: number; store: Map<string, unknown>; written: Map<string, string> }
+type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined; taskSeq?: number; contexts: string[]; store: Map<string, unknown>; written: Map<string, string> }
 
 const LISTING = `This session is 모드에 대해 [634505] — the name other sessions use to message it.
 
@@ -42,7 +42,7 @@ Peer sessions (2):
   목차작성 [ed478e]  ·  interactive  ·  busy  ·  started 3h ago`
 
 function fakeWorld(on: On): World {
-  const world: World = { opened: 0, statuses: [], rhwpCalls: [], scripts: [], sent: [], copied: [], store: new Map(), written: new Map() }
+  const world: World = { opened: 0, statuses: [], rhwpCalls: [], scripts: [], sent: [], copied: [], contexts: [], store: new Map(), written: new Map() }
   on('session.cwd', () => ({ value: ROOT }))
   on('env.get', () => ({ value: '/home/me' }))
   on('fs.stat', ($, e) => {
@@ -97,7 +97,10 @@ function fakeWorld(on: On): World {
   })
   on('ui.toast', () => ({ value: undefined }) as never)
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
-  on('prompt.submit', ($, e) => ({ text: e.text }))
+  on('prompt.submit', ($, e) => {
+    world.contexts.push(...((e as unknown as { context?: string[] }).context ?? []))
+    return { text: e.text }
+  })
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('process.run', ($, e) => {
     const extra = world.extraRuns?.(e.argv.map(String))
@@ -1061,6 +1064,53 @@ describe('작업 진행', () => {
     await $.turn.complete({ answer: '끝', durationMs: 5_000, isAborted: false, turnId: 't4', reason: 'answer' } as never)
     expect(played.length).toBe(before)
     await ui.unmount()
+  })
+
+  test('시간 예산: 요청에 예산을 붙이고, 50·80·100%에 남은 시간을 알리고, 유예까지 넘기면 도구를 막는다', async ($, on) => {
+    const world = fakeWorld(on)
+    const clock = mock.clock(on)
+    on('tool.check', () => ({ decision: 'ask' }) as never)
+    expect(JSON.stringify(await $.command.run(typed('budget', '10m')))).toContain('요청마다 10분')
+    expect(world.store.get('budget')).toEqual({ minutes: 10, isHard: true })
+    await ask($, '리팩터링 해줘', 't1')
+    expect(world.contexts.join('\n')).toContain('시간 예산은 10분')
+    const call = async () => (await $.tool.call({ tool: 'Read', file_path: '/work/src/app.ts' } as never)) as { context?: string[]; deny?: string }
+    expect((await call()).context).toBeUndefined()
+    await clock.advance(5.5 * 60_000)
+    expect((await call()).context?.join('')).toContain('(55%)')
+    // 같은 단계는 한 번만
+    expect((await call()).context).toBeUndefined()
+    // 권한 창에 3분 답하던 시간은 빼고 잰다
+    await $.tool.check({ tool: 'Bash', input: { command: 'npm test' }, tool_use_id: 'u9', approver: 'person' } as never)
+    await clock.advance(3 * 60_000)
+    expect(((await $.tool.call({ tool: 'Bash', command: 'npm test', tool_use_id: 'u9' } as never)) as { context?: string[] }).context).toBeUndefined()
+    await clock.advance(3 * 60_000)
+    expect((await call()).context?.join('')).toContain('검증과 정리')
+    await clock.advance(2 * 60_000)
+    expect((await call()).context?.join('')).toContain('예산을 다 썼어요')
+    await clock.advance(2.5 * 60_000)
+    expect((await call()).deny).toContain('시간 예산 10분을 넘겨')
+    // 보드 머리에 빨간 예산 표시
+    await $.command.run(typed('open', '/work'))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140, 40) })
+    const badge = (await ui.findAll({ type: 'Text' })).find(t => String(t.text).startsWith('예산 '))
+    expect(badge?.text).toBe('예산 13/10분')
+    expect(badge?.props.color).toBe('error')
+    await ui.unmount()
+    // 턴이 끝나면 풀리고, 다음 요청은 새 예산
+    await $.turn.complete({ answer: '정리', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+    await ask($, '다음 일', 't2')
+    expect((await call()).deny).toBeUndefined()
+    expect(JSON.stringify(await $.command.run(typed('budget', 'off')))).toContain('꺼짐')
+  })
+
+  test('예산 설정 읽기', () => {
+    expect(parseBudget('20m')).toEqual({ minutes: 20, isHard: true })
+    expect(parseBudget('1h soft')).toEqual({ minutes: 60, isHard: false })
+    expect(parseBudget('30분')).toEqual({ minutes: 30, isHard: true })
+    expect(parseBudget('off')).toEqual({ minutes: 0, isHard: true })
+    expect(parseBudget('abc')).toBeUndefined()
+    expect(budgetBrief({ minutes: 20, isHard: true })).toContain('도구 호출이 거절됩니다')
   })
 
   test('데스크톱에서는 버튼 줄을 한 행에 가두지 않고 감싼다', async ($, on) => {
