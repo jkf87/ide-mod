@@ -214,15 +214,13 @@ declare module 'claude-code' {
       /** sound 끝남·부름 소리, voice 소리 + 30초 넘은 턴은 걸린 시간 읽기, off 끔 */
       alert: 'sound' | 'voice' | 'off'
 
-      // ── 시간 예산 ──
-      /** 요청마다 거는 예산(분, 0이면 꺼짐)과 넘기면 도구를 막을지 */
-      budget: { minutes: number; isHard: boolean }
-      /** 지금 도는 요청의 예산 시계: 시작 시각, 사람 기다린 시간, 보낸 알림 단계, 거절 횟수 */
+      // ── 예상 소요시간 ──
       /** 요청마다 에이전트가 첫 줄에 예상 소요시간을 적게 할지 */
       isEstimateOn: boolean
       /** 지금 도는 요청의 예상: 적은 값(분), 다시 적으라고 한 횟수, 넘겼다고 알린 예상 */
       estimateRun: { minutes?: number; reminded: number; overFor?: number } | null
-      budgetRun: { turnId: string; startAt: number; pausedMs: number; sent: number; denials: number } | null
+      /** 사람 요청 턴의 시계: 사람 기다린 시간은 pausedMs로 뺀다 */
+      turnClock: { turnId: string; startAt: number; pausedMs: number } | null
 
       // ── 시스템 상태 ──
       /** 메모리·스왑·디스크 (보드가 떠 있을 때 10초마다) */
