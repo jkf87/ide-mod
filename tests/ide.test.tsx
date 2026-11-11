@@ -33,7 +33,7 @@ const real = (p: string) => {
   return abs
 }
 
-type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined; taskSeq?: number; contexts: string[]; store: Map<string, unknown>; written: Map<string, string> }
+type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined; taskSeq?: number; contexts: string[]; listing?: string; store: Map<string, unknown>; written: Map<string, string> }
 
 const LISTING = `This session is 모드에 대해 [634505] — the name other sessions use to message it.
 
@@ -81,7 +81,7 @@ function fakeWorld(on: On): World {
     return { value: undefined } as never
   })
   on('tool.call', ($, e) => {
-    if (String(e.tool) === 'ListAgents') return { result: { listing: LISTING } } as never
+    if (String(e.tool) === 'ListAgents') return { result: { listing: world.listing ?? LISTING } } as never
     if (String(e.tool) === 'TaskCreate') return { result: { task: { id: `t${(world.taskSeq = (world.taskSeq ?? 0) + 1)}`, subject: '' } } } as never
     return String(e.tool) === 'Write' && (e as unknown as { content?: string }).content === 'DENY' ? { deny: 'no' } : ({ result: 'ok' } as never)
   })
@@ -1025,6 +1025,7 @@ describe('작업 진행', () => {
 
   test('턴이 끝나면 끝남 소리, 권한을 물으면 부름 소리, d로 소리→읽기→끔', async ($, on) => {
     const world = fakeWorld(on)
+    const clock = mock.clock(on)
     const played: string[] = []
     const spoken: string[] = []
     on('audio.play', ($, e) => {
@@ -1059,6 +1060,17 @@ describe('작업 진행', () => {
     await $.classic.PermissionRequest({ hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: {}, session_id: 's', transcript_path: '', cwd: '/work' } as never)
     expect(played).toEqual(['sounds/done.wav', 'sounds/ask.wav'])
     expect(banners.at(-1)?.title).toBe('모드에 대해 · 확인을 기다려요')
+    // /rename 으로 이름을 바꾸면 30초 안에 새 이름으로 부른다
+    world.listing = LISTING.replace('This session is 모드에 대해', 'This session is 쇼츠제작')
+    await ask($, '이름 바꾼 뒤', 't5')
+    await $.turn.complete({ answer: '됐어요', durationMs: 3_000, isAborted: false, turnId: 't5', reason: 'answer' } as never)
+    expect(banners.at(-1)?.title).toBe('모드에 대해 · 끝났어요')
+    await clock.advance(31_000)
+    await ask($, '조금 뒤', 't6')
+    await $.turn.complete({ answer: '됐어요', durationMs: 3_000, isAborted: false, turnId: 't6', reason: 'answer' } as never)
+    expect(banners.at(-1)?.title).toBe('쇼츠제작 · 끝났어요')
+    world.listing = undefined
+    await clock.advance(31_000)
     // 버튼으로 소리+읽기 → 30초 넘은 턴은 걸린 시간을 읽는다
     await $.command.run(typed('open', '/work'))
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140, 40) })
@@ -1082,7 +1094,7 @@ describe('작업 진행', () => {
   test('예상 소요시간: 요청에 안내를 붙이고, 안 적으면 다시 적게 하고, 넘기면 새 예상을 적게 한다', async ($, on) => {
     const world = fakeWorld(on)
     const clock = mock.clock(on)
-    on('tool.check', () => ({ decision: 'ask' }) as never)
+    on('tool.check', ($, e) => ({ decision: String(e.tool) === 'Bash' ? 'ask' : 'allow' }) as never)
     on('classic.PermissionRequest', () => ({}) as never)
     let reply = '파일부터 살펴볼게요.'
     on('turn.step', async function* () {

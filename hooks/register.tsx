@@ -2860,15 +2860,18 @@ function speakKo($: EngineInterface, text: string) {
 }
 
 /** 세션이 여럿일 때 어느 세션 소리인지: 세션 이름 → 폴더 이름(홈 폴더면 없음) */
-const selfNameTriedAtom = atom({ plugin: 'ide-mod', key: 'selfNameTried' } as const, false)
+const selfNameAtAtom = atom({ plugin: 'ide-mod', key: 'selfNameAt' } as const, null as number | null)
+/** 이름을 다시 받는 간격: /rename 으로 바꾼 이름이 이만큼 안에 알림에 실린다 */
+const SELF_NAME_TTL_MS = 30_000
 async function alertWhere($: EngineInterface): Promise<string> {
-  let self = await read($, selfNameAtom).catch(() => '')
-  // 핸드오프 화면을 연 적이 없으면 이름을 모른다: 처음 한 번만 ListAgents로 받아 둔다
-  if (self === '' && !(await read($, selfNameTriedAtom).catch(() => true))) {
-    await update($, selfNameTriedAtom, () => true).catch(() => undefined)
-    await loadPeers($).catch(err => undefined)
-    self = await read($, selfNameAtom).catch(() => '')
+  // /rename 하면 ListAgents 이름이 바로 바뀐다: 받은 지 오래면 다시 받는다 (한 번 받고 끝내면 옛 이름을 부른다)
+  const now = await nowOf($)
+  const at = await read($, selfNameAtAtom).catch(() => now)
+  if (at === null || now - at >= SELF_NAME_TTL_MS) {
+    await update($, selfNameAtAtom, () => now).catch(() => undefined)
+    await loadPeers($).catch(() => undefined)
   }
+  const self = await read($, selfNameAtom).catch(() => '')
   if (self !== '') return self
   const root = await $.session.root().catch(() => '')
   const home = ((await $.env.get('HOME').catch(() => undefined)) ?? '').replace(/\/+$/, '')
