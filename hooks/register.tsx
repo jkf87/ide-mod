@@ -2939,6 +2939,8 @@ const PERSON_TOOLS = ['AskUserQuestion', 'ExitPlanMode']
 const turnClockAtom = atom({ plugin: 'ide-mod', key: 'turnClock' } as const, null as TurnClock | null)
 /** tool_use_id → 사람에게 물은 시각 */
 const askedAt = new Map<string, number>()
+/** 판정이 ask인 호출: 아직 사람에게 물은 게 아니다 (자동 모드 분류기·권한 건너뛰기가 먼저 답할 수 있다) */
+const pendingAsk = new Map<string, string>()
 
 const nowOf = ($: EngineInterface) => $.clock.now().catch(() => Date.now())
 const minutesText = (ms: number) => `${Math.max(0, Math.round(ms / 60_000))}분`
@@ -2950,6 +2952,7 @@ async function clockUsed($: EngineInterface, clock: TurnClock) {
 
 async function startTurnClock($: EngineInterface, turnId: string) {
   askedAt.clear()
+  pendingAsk.clear()
   const startAt = await nowOf($)
   await update($, turnClockAtom, () => ({ turnId, startAt, pausedMs: 0 }))
   await update($, estimateRunAtom, () => ({ reminded: 0 }))
@@ -3243,14 +3246,28 @@ export const register: Register = (on, options) => {
   registerAgents(on)
   registerExplorerScroll(on)
 
-  // 권한 창·질문처럼 사람이 답해야 하는 호출이면 "부름" 소리. 판정은 그대로 돌려준다
+  // 판정이 ask여도 자동 모드 분류기나 권한 건너뛰기가 사람 없이 답할 수 있다: 여기서는 적어 두기만 한다
   on('tool.check', async ($, e, next) => {
     const verdict = await next(e)
-    if (verdict.decision === 'ask' && e.approver === 'person' && e.tool_use_id !== undefined) {
-      askedAt.set(e.tool_use_id, await nowOf($))
-      await alertAsk($).catch(() => undefined)
-    }
+    if (verdict.decision === 'ask' && e.approver === 'person' && e.tool_use_id !== undefined) pendingAsk.set(e.tool_use_id, String(e.tool))
     return verdict
+  }).catch(($, e, next) => next(e))
+
+  // 사람에게 권한 창·질문을 실제로 띄울 때만 "부름" 소리. 답은 하지 않고 그대로 넘긴다
+  on('classic.PermissionRequest', async ($, e, next) => {
+    try {
+      const at = await nowOf($)
+      // 같은 도구로 가장 늦게 적힌 ask가 이 창이다: 사람을 기다린 시간은 여기서부터 잰다
+      const id = [...pendingAsk.entries()].reverse().find(([, tool]) => tool === e.tool_name)?.[0]
+      if (id !== undefined) {
+        pendingAsk.delete(id)
+        askedAt.set(id, at)
+      }
+      await alertAsk($)
+    } catch {
+      // 소리는 덤이다
+    }
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   // 도구 호출 하나를 보드에는 "지금 하는 일"로, 탐색기에는 "고친 파일"로 남긴다
@@ -3261,7 +3278,10 @@ export const register: Register = (on, options) => {
     // 사람이 권한 창에 답하던 시간은 턴 시계에서 뺀다
     const callAt = await nowOf($)
     const askAt = e.tool_use_id === undefined ? undefined : askedAt.get(e.tool_use_id)
-    if (e.tool_use_id !== undefined) askedAt.delete(e.tool_use_id)
+    if (e.tool_use_id !== undefined) {
+      askedAt.delete(e.tool_use_id)
+      pendingAsk.delete(e.tool_use_id)
+    }
     if (askAt !== undefined && !PERSON_TOOLS.includes(tool)) await pauseClock($, callAt - askAt).catch(() => undefined)
     const input = e as unknown as Record<string, unknown>
     await recordToolCall($, e.agentId, tool, input).catch(() => undefined)

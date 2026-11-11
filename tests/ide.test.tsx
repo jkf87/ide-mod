@@ -1041,6 +1041,7 @@ describe('작업 진행', () => {
       return { value: { isSent: true, channel: 'iterm2' } } as never
     })
     on('tool.check', ($, e) => ({ decision: String(e.tool) === 'Bash' ? 'ask' : 'allow' }) as never)
+    on('classic.PermissionRequest', () => ({}) as never)
     await ask($, '고쳐줘', 't1')
     await $.turn.complete({ answer: '고쳤어요', durationMs: 45_000, isAborted: false, turnId: 't1', reason: 'answer' } as never)
     expect(played).toEqual(['sounds/done.wav'])
@@ -1051,7 +1052,11 @@ describe('작업 진행', () => {
     await ask($, '또', 't2')
     await $.turn.complete({ answer: '', durationMs: 45_000, isAborted: true, turnId: 't2', reason: 'answer' } as never)
     expect(played.length).toBe(1)
+    // 판정이 ask여도 자동 모드·권한 건너뛰기가 사람 없이 답할 수 있으니 아직 소리 없음
     await $.tool.check({ tool: 'Bash', input: { command: 'rm -rf x' }, tool_use_id: 'u1', approver: 'person' } as never)
+    expect(played).toEqual(['sounds/done.wav'])
+    // 사람에게 권한 창을 실제로 띄울 때 부름 소리
+    await $.classic.PermissionRequest({ hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: {}, session_id: 's', transcript_path: '', cwd: '/work' } as never)
     expect(played).toEqual(['sounds/done.wav', 'sounds/ask.wav'])
     expect(banners.at(-1)?.title).toBe('모드에 대해 · 확인을 기다려요')
     // 버튼으로 소리+읽기 → 30초 넘은 턴은 걸린 시간을 읽는다
@@ -1078,6 +1083,7 @@ describe('작업 진행', () => {
     const world = fakeWorld(on)
     const clock = mock.clock(on)
     on('tool.check', () => ({ decision: 'ask' }) as never)
+    on('classic.PermissionRequest', () => ({}) as never)
     let reply = '파일부터 살펴볼게요.'
     on('turn.step', async function* () {
       yield { kind: 'text', index: 0, text: reply, ref: 1 } as never
@@ -1102,6 +1108,7 @@ describe('작업 진행', () => {
     expect((await estText())?.text).toBe('예상 15분 · 0분째')
     // 권한 창에 5분 답하던 시간은 빼고 잰다
     await $.tool.check({ tool: 'Bash', input: { command: 'npm test' }, tool_use_id: 'u9', approver: 'person' } as never)
+    await $.classic.PermissionRequest({ hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: {}, session_id: 's', transcript_path: '', cwd: '/work' } as never)
     await clock.advance(5 * 60_000)
     await $.tool.call({ tool: 'Bash', command: 'npm test', tool_use_id: 'u9' } as never)
     expect((await estText())?.text).toBe('예상 15분 · 0분째')
