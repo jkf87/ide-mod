@@ -1766,7 +1766,8 @@ async function shareDir($: EngineInterface) {
   // 엔진은 읽는 변수를 미리 알 수 있게 $.env.get에 글자 그대로의 이름만 받는다
   const named = [await $.env.get('TEMP').catch(() => undefined), await $.env.get('TMP').catch(() => undefined), await $.env.get('TMPDIR').catch(() => undefined)]
   for (const value of named) if (value) temps.add(value.replace(/[\\/]+$/, ''))
-  for (const base of ['/tmp', '/private/tmp']) {
+  // macOS는 /tmp가 /private/tmp 링크라 링크 경로를 주면 Artifact가 '스크래치패드 밖'이라며 거절한다 → 실제 경로를 먼저 본다
+  for (const base of ['/private/tmp', '/tmp']) {
     temps.add(base)
     for (const d of await $.fs.list(base).catch(() => [])) if (d.kind === 'dir' && d.name.startsWith('claude-')) temps.add(`${base}/${d.name}`)
   }
@@ -2636,18 +2637,18 @@ function drawLimitLine($: EngineInterface, e: RenderInput<'AbovePrompt'>, width:
   return [
     <Box key="limits" flexDirection="row" columnGap={1} height={1} overflow="hidden" width={width}>
       {groups.flatMap((g, gi) => [
-        ...(gi === 0 ? [] : [<Box key={`sep:${g.name}`} flexShrink={0}><Text dimColor>│</Text></Box>]),
-        <Box key={`name:${g.name}`} flexShrink={0}>
+        ...(gi === 0 ? [] : [<Box key={`sep:${gi}`} flexShrink={0}><Text dimColor>│</Text></Box>]),
+        <Box key={`name:${gi}`} flexShrink={0}>
           <Text bold color={g.color}>{g.name}</Text>
         </Box>,
         ...g.items.map((item, ii) => (
-          <Box key={`item:${g.name}:${item.label}`} flexDirection="row" columnGap={1} flexShrink={0}>
+          <Box key={`item:${gi}:${ii}`} flexDirection="row" columnGap={1} flexShrink={0}>
             <Text dimColor>{item.label}</Text>
-            {keep[gi][ii] && gauge(`gauge:${g.name}:${item.label}`, item)}
+            {keep[gi][ii] && gauge(`gauge:${gi}:${ii}`, item)}
             <Text bold color={pctColor(item)}>{itemText(item)}</Text>
           </Box>
         )),
-        ...(g.tail === undefined ? [] : [<Box key={`tail:${g.name}`} flexShrink={0}><Text bold>{g.tail}</Text></Box>]),
+        ...(g.tail === undefined ? [] : [<Box key={`tail:${gi}`} flexShrink={0}><Text bold>{g.tail}</Text></Box>]),
       ])}
     </Box>,
   ]
@@ -2680,8 +2681,8 @@ function drawLimitRows($: EngineInterface, e: RenderInput<'AbovePrompt'>, width:
   return [...perfRow, ...rows.map(r => (
     <Box key={`limits:${r.name}`} flexDirection="row" columnGap={3} height={1} overflow="hidden" width={width}>
       <Text bold>{r.name.padEnd(nameWidth)}</Text>
-      {r.windows.map(w => (
-        <Box key={w.label} flexShrink={0}>
+      {r.windows.map((w, wi) => (
+        <Box key={`w:${wi}`} flexShrink={0}>
           <Text color={limitColor(w.pct)}>{`${w.label} ${bar(w.pct / 100, 10)} ${String(w.pct).padStart(3)}%${w.resetsAt === undefined ? '' : ` ${untilReset(w.resetsAt, now)}`}`}</Text>
         </Box>
       ))}
