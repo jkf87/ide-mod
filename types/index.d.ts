@@ -244,6 +244,8 @@ declare module 'claude-code' {
       peers: PeerRow[]
       /** 이 세션이 다른 세션에 불리는 이름 */
       selfName: string
+      /** 알림에 적을 이름을 ListAgents로 받아 보았는지 (한 번만) */
+      selfNameTried: boolean
       /** 마지막으로 보낸 핸드오프 결과 */
       handoffSent: { to: string; at: number; ok: boolean; reason?: string } | null
       /** 핸드오프 화면 오른쪽: local 이 PC의 다른 세션에게, share 다른 사람에게(Artifact) */

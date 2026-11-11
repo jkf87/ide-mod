@@ -332,7 +332,7 @@ function registerAgents(on: On) {
       await update($, turnClockAtom, () => null).catch(() => undefined)
       await update($, estimateRunAtom, () => null).catch(() => undefined)
       // 끝까지 답한 턴만 "끝남" 소리 (멈춤·오류는 끝남처럼 들리면 안 된다)
-      if (!e.isAborted && e.reason === 'answer') await alertDone($, e.durationMs).catch(() => undefined)
+      if (!e.isAborted && e.reason === 'answer') await alertDone($, e.durationMs, e.turnId).catch(() => undefined)
       await setCaption($, e.isAborted ? '작업을 멈췄어요' : '답을 다 썼어요. 다음 요청을 기다려요').catch(() => undefined)
     }
     return next(e)
@@ -2858,11 +2858,55 @@ function speakKo($: EngineInterface, text: string) {
   void $.audio.speak(text, { voice: KO_VOICE }).catch(() => $.audio.speak(text).catch(() => undefined))
 }
 
-async function alertDone($: EngineInterface, durationMs: number) {
+/** 세션이 여럿일 때 어느 세션 소리인지: 세션 이름 → 폴더 이름(홈 폴더면 없음) */
+const selfNameTriedAtom = atom({ plugin: 'ide-mod', key: 'selfNameTried' } as const, false)
+async function alertWhere($: EngineInterface): Promise<string> {
+  let self = await read($, selfNameAtom).catch(() => '')
+  // 핸드오프 화면을 연 적이 없으면 이름을 모른다: 처음 한 번만 ListAgents로 받아 둔다
+  if (self === '' && !(await read($, selfNameTriedAtom).catch(() => true))) {
+    await update($, selfNameTriedAtom, () => true).catch(() => undefined)
+    await loadPeers($).catch(err => undefined)
+    self = await read($, selfNameAtom).catch(() => '')
+  }
+  if (self !== '') return self
+  const root = await $.session.root().catch(() => '')
+  const home = ((await $.env.get('HOME').catch(() => undefined)) ?? '').replace(/\/+$/, '')
+  if (root === '' || root.replace(/\/+$/, '') === home) return ''
+  return baseName(root)
+}
+
+/** 이 소리를 낸 요청 한 줄: 그 턴의 요청, 없으면 마지막으로 돌고 있는 요청 */
+async function alertWhat($: EngineInterface, turnId?: string): Promise<string> {
+  const list = await read($, requestsAtom).catch(() => [] as RequestItem[])
+  const item = list.find(r => turnId !== undefined && r.turnId === turnId) ?? [...list].reverse().find(r => r.status === 'running') ?? list.at(-1)
+  return item === undefined ? '' : oneLine(firstLine(item.text), 60)
+}
+
+/** 알림 센터 배너: 소리만으로는 어느 세션인지 모르니 세션·요청을 적는다 */
+function notifyKo($: EngineInterface, title: string, body: string) {
+  void $.ui.notify(body || title, { title }).catch(() => undefined)
+}
+
+export function alertLines(kind: 'done' | 'ask', where: string, what: string, durationMs?: number) {
+  const head = kind === 'done' ? '끝났어요' : '확인을 기다려요'
+  const title = where !== '' ? `${where} · ${head}` : `Claude · ${head}`
+  const took = durationMs === undefined ? '' : spokenKo(durationMs)
+  const body = [what, took].filter(Boolean).join(' · ')
+  // 읽을 때는 짧게: 세션 이름, 없으면 요청 앞부분
+  const who = where !== '' ? where : what.slice(0, 20)
+  const spoken = kind === 'done'
+    ? `${who ? `${who}, ` : ''}끝났어요.${took ? ` ${took} 걸렸어요.` : ''}`
+    : `${who ? `${who}, ` : ''}확인이 필요해요.`
+  return { title, body, spoken }
+}
+
+async function alertDone($: EngineInterface, durationMs: number, turnId?: string) {
   const mode = await read($, alertAtom)
   if (mode === 'off') return
   playSound($, 'done')
-  if (mode === 'voice' && durationMs >= SPEAK_AFTER_MS) speakKo($, `요청 끝났어요. ${spokenKo(durationMs)} 걸렸어요.`)
+  const lines = alertLines('done', await alertWhere($), await alertWhat($, turnId), durationMs)
+  notifyKo($, lines.title, lines.body)
+  if (mode === 'voice' && durationMs >= SPEAK_AFTER_MS) speakKo($, lines.spoken)
 }
 
 async function alertAsk($: EngineInterface) {
@@ -2872,6 +2916,9 @@ async function alertAsk($: EngineInterface) {
   if (now - lastAskSoundAt < ASK_GAP_MS) return
   lastAskSoundAt = now
   playSound($, 'ask')
+  const lines = alertLines('ask', await alertWhere($), await alertWhat($))
+  notifyKo($, lines.title, lines.body)
+  if (mode === 'voice') speakKo($, lines.spoken)
 }
 
 /** 버튼(d): 소리 → 소리+읽기 → 끔 → 소리. 바꾸면 바로 들려 준다 */
@@ -2880,7 +2927,7 @@ async function cycleAlert($: EngineInterface) {
   await update($, alertAtom, () => next)
   await $.store.set(ALERT_KEY, next).catch(() => undefined)
   if (next === 'sound') playSound($, 'done')
-  if (next === 'voice') speakKo($, '요청 끝났어요. 2분 15초 걸렸어요.')
+  if (next === 'voice') speakKo($, alertLines('done', await alertWhere($), '', 135_000).spoken)
 }
 
 // ════════════════ 턴 시계 ════════════════

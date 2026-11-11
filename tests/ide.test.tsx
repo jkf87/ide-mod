@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
+import { alertLines, parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
 import { artifactUrlOf, gitInfoFrom, gitNotes, handoffFromText, handoffPage, receivePrompt, redactSecrets, savedPathOf, shareDoc, webUrlOf } from '../hooks/share'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
@@ -1035,17 +1035,25 @@ describe('작업 진행', () => {
       spoken.push(String((e as unknown as { text: string }).text))
       return { value: { via: 'system' } } as never
     })
-    on('tool.check', () => ({ decision: 'ask' }) as never)
+    const banners: { text: string; title?: string }[] = []
+    on('ui.notify', ($, e) => {
+      banners.push({ text: e.text, title: e.title })
+      return { value: { isSent: true, channel: 'iterm2' } } as never
+    })
+    on('tool.check', ($, e) => ({ decision: String(e.tool) === 'Bash' ? 'ask' : 'allow' }) as never)
     await ask($, '고쳐줘', 't1')
     await $.turn.complete({ answer: '고쳤어요', durationMs: 45_000, isAborted: false, turnId: 't1', reason: 'answer' } as never)
     expect(played).toEqual(['sounds/done.wav'])
     expect(spoken).toEqual([])
+    // 어느 세션인지: 배너 제목에 세션 이름, 본문에 요청
+    expect(banners.at(-1)).toEqual({ text: '고쳐줘 · 45초', title: '모드에 대해 · 끝났어요' })
     // 멈춘 턴은 소리 없음
     await ask($, '또', 't2')
     await $.turn.complete({ answer: '', durationMs: 45_000, isAborted: true, turnId: 't2', reason: 'answer' } as never)
     expect(played.length).toBe(1)
     await $.tool.check({ tool: 'Bash', input: { command: 'rm -rf x' }, tool_use_id: 'u1', approver: 'person' } as never)
     expect(played).toEqual(['sounds/done.wav', 'sounds/ask.wav'])
+    expect(banners.at(-1)?.title).toBe('모드에 대해 · 확인을 기다려요')
     // 버튼으로 소리+읽기 → 30초 넘은 턴은 걸린 시간을 읽는다
     await $.command.run(typed('open', '/work'))
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140, 40) })
@@ -1056,7 +1064,7 @@ describe('작업 진행', () => {
     spoken.length = 0
     await ask($, '하나 더', 't3')
     await $.turn.complete({ answer: '됐어요', durationMs: 135_000, isAborted: false, turnId: 't3', reason: 'answer' } as never)
-    expect(spoken).toEqual(['요청 끝났어요. 2분 15초 걸렸어요.'])
+    expect(spoken).toEqual(['모드에 대해, 끝났어요. 2분 15초 걸렸어요.'])
     await ui.press({ key: 'board-alert' })
     expect(world.store.get('alert')).toBe('off')
     const before = played.length
@@ -1112,6 +1120,11 @@ describe('작업 진행', () => {
     world.contexts.length = 0
     await ask($, '다음', 't2')
     expect(world.contexts).toEqual([])
+  })
+
+  test('알림 문구: 세션 이름이 없으면 요청 앞부분으로 부른다', () => {
+    expect(alertLines('done', '', '로그인 버그 고쳐줘', 75_000)).toEqual({ title: 'Claude · 끝났어요', body: '로그인 버그 고쳐줘 · 1분 15초', spoken: '로그인 버그 고쳐줘, 끝났어요. 1분 15초 걸렸어요.' })
+    expect(alertLines('ask', 'ide-mod', '')).toEqual({ title: 'ide-mod · 확인을 기다려요', body: '', spoken: 'ide-mod, 확인이 필요해요.' })
   })
 
   test('예상 읽기', () => {
