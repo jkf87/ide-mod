@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { budgetBrief, parseBudget, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
+import { budgetBrief, parseBudget, parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
 import { artifactUrlOf, gitInfoFrom, gitNotes, handoffFromText, handoffPage, receivePrompt, redactSecrets, savedPathOf, shareDoc, webUrlOf } from '../hooks/share'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
@@ -1070,6 +1070,7 @@ describe('작업 진행', () => {
     const world = fakeWorld(on)
     const clock = mock.clock(on)
     on('tool.check', () => ({ decision: 'ask' }) as never)
+    await $.command.run(typed('estimate', 'off'))
     expect(JSON.stringify(await $.command.run(typed('budget', '10m')))).toContain('요청마다 10분')
     expect(world.store.get('budget')).toEqual({ minutes: 10, isHard: true })
     await ask($, '리팩터링 해줘', 't1')
@@ -1102,6 +1103,57 @@ describe('작업 진행', () => {
     await ask($, '다음 일', 't2')
     expect((await call()).deny).toBeUndefined()
     expect(JSON.stringify(await $.command.run(typed('budget', 'off')))).toContain('꺼짐')
+  })
+
+  test('예상 소요시간: 요청에 안내를 붙이고, 안 적으면 다시 적게 하고, 넘기면 새 예상을 적게 한다', async ($, on) => {
+    const world = fakeWorld(on)
+    const clock = mock.clock(on)
+    let reply = '파일부터 살펴볼게요.'
+    on('turn.step', async function* () {
+      yield { kind: 'text', index: 0, text: reply, ref: 1 } as never
+      return { turnId: 't1', index: 0, answer: reply, toolUses: [], stopReason: 'tool_use', usage: null }
+    })
+    const step = async () => {
+      for await (const c of $.turn.step({ turnId: 't1', index: 0, model: 'm', messageCount: 1 })) void c
+    }
+    const call = async () => (await $.tool.call({ tool: 'Read', file_path: '/work/src/app.ts' } as never)) as { context?: string[] }
+    await ask($, '로그인 고쳐줘', 't1')
+    expect(world.contexts.join('\n')).toContain('⏱ 예상 N분')
+    // 예상 없이 도구부터 → 다시 적으라고 한다
+    await step()
+    expect((await call()).context?.join('')).toContain('아직 예상 소요시간을 적지 않았어요')
+    // 적으면 보드에 뜨고, 더는 조르지 않는다
+    reply = '⏱ 예상 10~15분\n로그인 흐름을 보고 고칠게요.'
+    await step()
+    expect((await call()).context).toBeUndefined()
+    await $.command.run(typed('open', '/work'))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140, 40) })
+    const estText = async () => (await ui.findAll({ type: 'Text' })).find(t => String(t.text).startsWith('예상 '))
+    expect((await estText())?.text).toBe('예상 15분 · 0분째')
+    // 예상을 넘기면 새 예상을 적게 한다 (한 번만)
+    await clock.advance(16 * 60_000)
+    expect((await call()).context?.join('')).toContain('예상 15분을 넘겼어요')
+    expect((await call()).context).toBeUndefined()
+    expect((await estText())?.props.color).toBe('warning')
+    await ui.unmount()
+    // 끝나면 요청 기록에 예상이 남는다
+    await $.turn.complete({ answer: '고쳤어요', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+    const saved = world.saved as { items: { estimate?: number }[] }
+    expect(saved.items.at(-1)?.estimate).toBe(15)
+    // 끄면 안내를 붙이지 않는다
+    expect(JSON.stringify(await $.command.run(typed('estimate', 'off')))).toContain('꺼짐')
+    world.contexts.length = 0
+    await ask($, '다음', 't2')
+    expect(world.contexts).toEqual([])
+  })
+
+  test('예상 읽기', () => {
+    expect(parseEstimate('⏱ 예상 15분')).toBe(15)
+    expect(parseEstimate('⏱ 예상 10~15분 걸려요')).toBe(15)
+    expect(parseEstimate('예상 소요시간: 약 2시간')).toBe(120)
+    expect(parseEstimate('Estimate: 30 min')).toBe(30)
+    expect(parseEstimate('⏱ 예상 5분 … 다시 보니 ⏱ 예상 20분')).toBe(20)
+    expect(parseEstimate('15분 전에 고친 것')).toBeUndefined()
   })
 
   test('예산 설정 읽기', () => {

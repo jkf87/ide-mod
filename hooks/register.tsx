@@ -269,6 +269,7 @@ function registerAgents(on: On) {
     const sentAt = await now()
     let firstAt: number | undefined
     for await (const chunk of next(e)) {
+      if (chunk.kind === 'text' && turnText.length < 20_000) turnText += chunk.text
       if (firstAt === undefined && chunk.kind !== 'engine') firstAt = await now()
       if (chunk.kind === 'stop' && chunk.usage !== null) {
         const usage = chunk.usage
@@ -277,6 +278,7 @@ function registerAgents(on: On) {
       }
       yield chunk
     }
+    await noteEstimate($).catch(() => undefined)
   })
 
   on('agent.spawn', async ($, e, next) => {
@@ -324,8 +326,11 @@ function registerAgents(on: On) {
       }
     })
     if (id === MAIN) {
-      await requestTurnEnded($, e.turnId, e.answer, e.isAborted || e.reason !== 'answer').catch(() => undefined)
+      await noteEstimate($).catch(() => undefined)
+      const estimate = (await read($, estimateRunAtom))?.minutes
+      await requestTurnEnded($, e.turnId, e.answer, e.isAborted || e.reason !== 'answer', estimate).catch(() => undefined)
       await update($, budgetRunAtom, () => null).catch(() => undefined)
+      await update($, estimateRunAtom, () => null).catch(() => undefined)
       // 끝까지 답한 턴만 "끝남" 소리 (멈춤·오류는 끝남처럼 들리면 안 된다)
       if (!e.isAborted && e.reason === 'answer') await alertDone($, e.durationMs).catch(() => undefined)
       await setCaption($, e.isAborted ? '작업을 멈췄어요' : '답을 다 썼어요. 다음 요청을 기다려요').catch(() => undefined)
@@ -483,6 +488,7 @@ async function drawBoard($: EngineInterface, e: RenderInput<'Pane'>, width: numb
   const isRecapOn = await read($, recapOnAtom)
   const alert = await read($, alertAtom)
   const badge = await budgetBadge($).catch(() => undefined)
+  const estBadge = await estimateBadge($).catch(() => undefined)
   await read($, tickAtom)
   const now = Date.now()
 
@@ -497,6 +503,7 @@ async function drawBoard($: EngineInterface, e: RenderInput<'Pane'>, width: numb
     <Box key="board-header" {...barRow(e.surface)}>
       <Text bold wrap="truncate-end">{summary}</Text>
       {sessionId !== '' && <Text dimColor wrap="truncate-end">세션 {sessionId.slice(0, 8)}</Text>}
+      {estBadge !== undefined && <Text key="estimate" color={estBadge.color} wrap="truncate-end">{estBadge.text}</Text>}
       {badge !== undefined && <Text color={badge.color} dimColor={badge.color === undefined} wrap="truncate-end">{badge.text}</Text>}
       <Button key="board-handoff" plain hotkey="i" label="핸드오프" onPress={() => void openHandoff($)} />
       <Button key="board-alert" plain hotkey="d" label={ALERT_LABEL[alert]} onPress={() => void cycleAlert($)} />
@@ -1603,7 +1610,7 @@ const otherTool = (from: string | undefined) => (from === undefined ? undefined 
 const requestStatus = (r: RequestItem) => {
   const tool = otherTool(r.from)
   if (tool !== undefined) return `${tool}에 보냄`
-  const took = r.endedAt !== undefined ? ` · ${formatElapsed(r.endedAt - r.at)}` : ''
+  const took = r.endedAt !== undefined ? ` · ${formatElapsed(r.endedAt - r.at)}${r.estimate !== undefined ? ` (예상 ${r.estimate}분)` : ''}` : ''
   return r.status === 'running' ? '진행 중' : r.status === 'done' ? `끝남${took}` : `중단됨${took}`
 }
 // ════════════════ 핸드오프 ════════════════
@@ -2020,13 +2027,13 @@ async function requestTurnStarted($: EngineInterface, text: string, turnId: stri
   return isLinked
 }
 
-async function requestTurnEnded($: EngineInterface, turnId: string, answer: string, isStopped: boolean) {
+async function requestTurnEnded($: EngineInterface, turnId: string, answer: string, isStopped: boolean, estimate?: number) {
   let changed = false
   await update($, requestsAtom, list =>
     list.map(r => {
       if (r.turnId !== turnId || r.status !== 'running') return r
       changed = true
-      return { ...r, status: isStopped ? 'stopped' : 'done', answer: firstLine(answer).slice(0, 300), endedAt: Date.now() }
+      return { ...r, status: isStopped ? 'stopped' : 'done', answer: firstLine(answer).slice(0, 300), endedAt: Date.now(), ...(estimate === undefined ? {} : { estimate }) }
     }),
   )
   if (changed) await saveRequests($)
@@ -2939,11 +2946,13 @@ async function budgetUsed($: EngineInterface, run: BudgetRun) {
   return (await nowOf($)) - run.startAt - run.pausedMs
 }
 
+/** 사람 요청 턴의 시계를 건다. 예산이 꺼져 있어도 돈다: 예상 소요시간도 이 시계로 잰다 */
 async function startBudget($: EngineInterface, turnId: string) {
-  const b = await read($, budgetAtom)
   askedAt.clear()
   const startAt = await nowOf($)
-  await update($, budgetRunAtom, () => (b.minutes > 0 ? { turnId, startAt, pausedMs: 0, sent: 0, denials: 0 } : null))
+  await update($, budgetRunAtom, () => ({ turnId, startAt, pausedMs: 0, sent: 0, denials: 0 }))
+  await update($, estimateRunAtom, () => ({ reminded: 0 }))
+  turnText = ''
 }
 
 async function pauseBudget($: EngineInterface, ms: number) {
@@ -2995,6 +3004,80 @@ async function budgetBadge($: EngineInterface): Promise<{ text: string; color?: 
   return { text: `예산 ${Math.floor(Math.max(0, used) / 60_000)}/${b.minutes}분`, color: ratio >= 1 ? 'error' : ratio >= 0.8 ? 'warning' : undefined }
 }
 
+// ════════════════ 예상 소요시간 ════════════════
+// 사람이 보낸 요청마다 에이전트가 첫 줄에 "⏱ 예상 N분"을 적게 한다.
+// 1) 요청을 보낼 때 그렇게 하라는 안내를 모델만 읽는 context로 붙이고
+// 2) 메인 응답 글(turn.step의 text 조각)에서 예상을 읽어 보드와 요청 기록에 띄우고
+// 3) 안 적고 도구부터 부르면 그 도구 결과 뒤에 다시 적으라고 붙이고
+// 4) 예상을 넘기면 남은 일과 새 예상을 적으라고 붙인다 (새로 적으면 그 값으로 바뀐다)
+type EstimateRun = { minutes?: number; reminded: number; overFor?: number }
+const ESTIMATE_KEY = 'estimate'
+const estimateOnAtom = atom({ plugin: 'ide-mod', key: 'isEstimateOn' } as const, true)
+const estimateRunAtom = atom({ plugin: 'ide-mod', key: 'estimateRun' } as const, null as EstimateRun | null)
+/** 안 적었을 때 다시 적으라고 하는 횟수 */
+const ESTIMATE_MAX_REMINDERS = 2
+/** 이번 턴 메인 응답 글 (예상을 찾는 데만 쓴다) */
+let turnText = ''
+
+export const ESTIMATE_BRIEF = [
+  '[예상 소요시간 · ide-mod] 이 요청에 답하기 시작할 때, 첫 응답의 첫 줄에 예상 소요시간을 이 형식으로 적으세요: `⏱ 예상 N분` (범위면 `⏱ 예상 10~15분`, 길면 `⏱ 예상 2시간`).',
+  '- 바로 답할 수 있는 질문이면 `⏱ 예상 1분`이라고 적으면 됩니다.',
+  '- 일하다가 예상이 크게 바뀌거나 예상을 넘기면, 남은 일과 새 예상을 같은 형식으로 다시 적으세요.',
+].join('\n')
+
+/** 글에서 마지막으로 적은 예상(분). 범위면 큰 쪽. 없으면 undefined */
+export function parseEstimate(text: string): number | undefined {
+  const re = /(?:⏱\s*)?(?:예상(?:\s*소요\s*시간)?|estimate[d]?(?:\s*time)?|ETA)\s*[:：]?\s*(?:약|about|~)?\s*(\d+(?:\.\d+)?)\s*(?:(?:~|-|–|〜)\s*(\d+(?:\.\d+)?)\s*)?(분|시간|min(?:ute)?s?|m\b|h(?:ours?)?\b|hrs?\b)/gi
+  let found: number | undefined
+  for (const m of text.matchAll(re)) {
+    const value = Number(m[2] ?? m[1])
+    const unit = (m[3] ?? '').toLowerCase()
+    const minutes = unit === '시간' || unit.startsWith('h') ? value * 60 : value
+    if (minutes > 0 && minutes <= 24 * 60) found = Math.max(1, Math.round(minutes))
+  }
+  return found
+}
+
+async function loadEstimate($: EngineInterface) {
+  const saved = await $.store.get(ESTIMATE_KEY).catch(() => undefined)
+  if (typeof saved === 'boolean') await update($, estimateOnAtom, () => saved)
+}
+
+/** 메인 응답 한 단계가 끝날 때: 쌓인 글에서 예상을 읽는다 */
+async function noteEstimate($: EngineInterface) {
+  const minutes = parseEstimate(turnText)
+  if (minutes === undefined) return
+  await update($, estimateRunAtom, run => (run === null || run.minutes === minutes ? run : { ...run, minutes }))
+}
+
+/** 메인 도구 호출 뒤: 예상을 안 적었거나 예상을 넘겼으면 모델에게 붙일 말 */
+async function estimateNote($: EngineInterface): Promise<string | undefined> {
+  if (!(await read($, estimateOnAtom))) return undefined
+  const est = await read($, estimateRunAtom)
+  const clock = await read($, budgetRunAtom)
+  if (est === null || clock === null) return undefined
+  const used = await budgetUsed($, clock)
+  if (est.minutes === undefined) {
+    if (est.reminded >= ESTIMATE_MAX_REMINDERS) return undefined
+    await update($, estimateRunAtom, r => (r === null ? r : { ...r, reminded: r.reminded + 1 }))
+    return '[예상 소요시간 · ide-mod] 아직 예상 소요시간을 적지 않았어요. 다음에 쓰는 글의 첫 줄에 `⏱ 예상 N분`으로 이 요청이 얼마나 걸릴지 적으세요.'
+  }
+  if (used < est.minutes * 60_000 || est.overFor === est.minutes) return undefined
+  await update($, estimateRunAtom, r => (r === null ? r : { ...r, overFor: r.minutes }))
+  return `[예상 소요시간 · ide-mod] 예상 ${est.minutes}분을 넘겼어요(지금 ${minutesText(used)} 지남). 다음 글에서 남은 일이 무엇인지와 새 예상을 \`⏱ 예상 N분\`으로 적으세요.`
+}
+
+/** 보드 머리: "예상 15분 · 7분째" (넘기면 노랑) */
+async function estimateBadge($: EngineInterface): Promise<{ text: string; color?: Color } | undefined> {
+  if (!(await read($, estimateOnAtom))) return undefined
+  const est = await read($, estimateRunAtom)
+  const clock = await read($, budgetRunAtom)
+  if (est === null || clock === null) return undefined
+  const used = Math.max(0, await budgetUsed($, clock))
+  if (est.minutes === undefined) return { text: `예상 묻는 중 · ${Math.floor(used / 60_000)}분째`, color: 'subtle' }
+  return { text: `예상 ${est.minutes}분 · ${Math.floor(used / 60_000)}분째`, color: used >= est.minutes * 60_000 ? 'warning' : undefined }
+}
+
 // ════════════════ 세션 시작 때 IDE 창 열기 ════════════════
 const autoOpenedAtom = atom({ plugin: 'ide-mod', key: 'autoOpened' } as const, false)
 const AUTO_OPEN_KEY = 'autoOpen'
@@ -3030,6 +3113,8 @@ export const register: Register = (on, options) => {
     await loadRequests($).catch(() => undefined)
     await loadAlert($).catch(() => undefined)
     await loadBudget($).catch(() => undefined)
+    await loadEstimate($).catch(() => undefined)
+    await $.command.register({ name: 'estimate', description: '예상 소요시간: 요청마다 에이전트가 첫 줄에 "⏱ 예상 N분"을 적게 합니다 (기본 켜짐)', argumentHint: '[on|off]' }).catch(() => undefined)
     await $.command.register({ name: 'budget', description: '시간 예산: 요청마다 N분 안에 계획·마무리하게 하고, 넘기면 도구 호출을 막습니다 (soft면 막지 않음)', argumentHint: '[20m|1h|off] [soft]' }).catch(() => undefined)
     const started = await next(e)
     if (e.isInteractive) await autoOpenIde($).catch(() => undefined)
@@ -3129,6 +3214,15 @@ export const register: Register = (on, options) => {
     return { text: lines.join('\n') }
   })
 
+  on('command.run', { command: 'estimate' }, async ($, e) => {
+    const arg = (e.args ?? '').trim().toLowerCase()
+    if (arg === 'on' || arg === 'off') {
+      await update($, estimateOnAtom, () => arg === 'on')
+      await $.store.set(ESTIMATE_KEY, arg === 'on').catch(() => undefined)
+    } else if (arg !== '') return { text: '쓰는 법: /estimate on · /estimate off' }
+    return { text: (await read($, estimateOnAtom)) ? '예상 소요시간: 켜짐. 요청마다 에이전트가 첫 줄에 "⏱ 예상 N분"을 적어요. 다음 요청부터 적용돼요.' : '예상 소요시간: 꺼짐.' }
+  })
+
   on('command.run', { command: 'budget' }, async ($, e) => {
     const args = (e.args ?? '').trim()
     if (args !== '') {
@@ -3136,8 +3230,6 @@ export const register: Register = (on, options) => {
       if (next === undefined) return { text: '쓰는 법: /budget 20m · /budget 1h · /budget 30m soft · /budget off' }
       await update($, budgetAtom, () => next)
       await $.store.set(BUDGET_KEY, next).catch(() => undefined)
-      // 지금 돌고 있는 요청에는 걸지 않는다: 다음 요청부터
-      if (next.minutes <= 0) await update($, budgetRunAtom, () => null)
     }
     const b = await read($, budgetAtom)
     if (b.minutes <= 0) return { text: '시간 예산: 꺼짐. /budget 20m 처럼 켜요.' }
@@ -3201,7 +3293,11 @@ export const register: Register = (on, options) => {
       if (isRequest) await addRequest($, text, e.turnId)
       // 쉬는 중에 보낸 새 요청에만 시간 예산을 붙인다 (일하는 중에 끼워 넣은 말은 같은 예산 안이다)
       const budget = await read($, budgetAtom)
-      if (isRequest && e.turnId === undefined && budget.minutes > 0) return next({ ...e, context: [...(e.context ?? []), budgetBrief(budget)] })
+      const briefs = [
+        ...((await read($, estimateOnAtom)) ? [ESTIMATE_BRIEF] : []),
+        ...(budget.minutes > 0 ? [budgetBrief(budget)] : []),
+      ]
+      if (isRequest && e.turnId === undefined && briefs.length > 0) return next({ ...e, context: [...(e.context ?? []), ...briefs] })
     } catch {
       // 기록은 덤이라 실패해도 프롬프트는 그대로 간다
     }
@@ -3250,8 +3346,8 @@ export const register: Register = (on, options) => {
     }
     // 메인 에이전트에게만 남은 시간을 도구 결과 뒤에 붙인다
     if (e.agentId === undefined && outcome.deny === undefined) {
-      const note = await budgetNote($).catch(() => undefined)
-      if (note !== undefined) return { ...ran, context: [...((ran as { context?: readonly string[] }).context ?? []), note] } as typeof ran
+      const notes = [await estimateNote($).catch(() => undefined), await budgetNote($).catch(() => undefined)].filter((n): n is string => n !== undefined)
+      if (notes.length > 0) return { ...ran, context: [...((ran as { context?: readonly string[] }).context ?? []), ...notes] } as typeof ran
     }
     return ran
   }).catch(($, e, next) => next(e))

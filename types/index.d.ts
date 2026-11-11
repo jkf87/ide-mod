@@ -140,6 +140,8 @@ export type RequestItem = {
   endedAt?: number
   /** 같은 폴더의 지난 세션에서 온 요청이면 그 세션 ID 앞 8자 */
   from?: string
+  /** 에이전트가 적은 예상 소요시간(분), 마지막으로 적은 값 */
+  estimate?: number
 }
 
 export type GateCheck = { label: string; count: number; limit: number; isHard: boolean }
@@ -216,6 +218,10 @@ declare module 'claude-code' {
       /** 요청마다 거는 예산(분, 0이면 꺼짐)과 넘기면 도구를 막을지 */
       budget: { minutes: number; isHard: boolean }
       /** 지금 도는 요청의 예산 시계: 시작 시각, 사람 기다린 시간, 보낸 알림 단계, 거절 횟수 */
+      /** 요청마다 에이전트가 첫 줄에 예상 소요시간을 적게 할지 */
+      isEstimateOn: boolean
+      /** 지금 도는 요청의 예상: 적은 값(분), 다시 적으라고 한 횟수, 넘겼다고 알린 예상 */
+      estimateRun: { minutes?: number; reminded: number; overFor?: number } | null
       budgetRun: { turnId: string; startAt: number; pausedMs: number; sent: number; denials: number } | null
 
       // ── 시스템 상태 ──
