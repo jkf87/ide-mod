@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { alertLines, parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
+import { alertLines, backgroundTaskId, endedTaskIds, parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
 import { artifactUrlOf, gitInfoFrom, gitNotes, handoffFromText, handoffPage, receivePrompt, redactSecrets, savedPathOf, shareDoc, webUrlOf } from '../hooks/share'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
@@ -33,7 +33,7 @@ const real = (p: string) => {
   return abs
 }
 
-type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined; taskSeq?: number; contexts: string[]; listing?: string; store: Map<string, unknown>; written: Map<string, string> }
+type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined; taskSeq?: number; contexts: string[]; listing?: string; bgBash?: string; store: Map<string, unknown>; written: Map<string, string> }
 
 const LISTING = `This session is 모드에 대해 [634505] — the name other sessions use to message it.
 
@@ -82,6 +82,7 @@ function fakeWorld(on: On): World {
   })
   on('tool.call', ($, e) => {
     if (String(e.tool) === 'ListAgents') return { result: { listing: world.listing ?? LISTING } } as never
+    if (String(e.tool) === 'Bash' && world.bgBash !== undefined) return { result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: world.bgBash } } as never
     if (String(e.tool) === 'TaskCreate') return { result: { task: { id: `t${(world.taskSeq = (world.taskSeq ?? 0) + 1)}`, subject: '' } } } as never
     return String(e.tool) === 'Write' && (e as unknown as { content?: string }).content === 'DENY' ? { deny: 'no' } : ({ result: 'ok' } as never)
   })
@@ -1139,6 +1140,51 @@ describe('작업 진행', () => {
     world.contexts.length = 0
     await ask($, '다음', 't2')
     expect(world.contexts).toEqual([])
+  })
+
+  test('백그라운드 에이전트·명령이 남아 있으면 끝남 소리를 미루고, 마지막 알림을 받은 턴에서 운다', async ($, on) => {
+    const world = fakeWorld(on)
+    world.bgBash = 'bg1'
+    const played: string[] = []
+    on('audio.play', ($, e) => {
+      played.push(String((e as unknown as { clip: { asset?: string } }).clip.asset))
+      return { value: undefined } as never
+    })
+    on('ui.notify', () => ({ value: { isSent: true, channel: 'iterm2' } }) as never)
+    const agents: { id: string; description: string; type: string; status: string; spawnedBy?: string }[] = []
+    on('agent.list', () => ({ value: agents }) as never)
+    // 백그라운드 서브에이전트가 도는 동안 메인 턴이 끝나면 조용히
+    agents.push({ id: 'a1', description: '조사', type: 'general-purpose', status: 'running' })
+    await ask($, '조사하고 빌드해줘', 't1')
+    await $.turn.complete({ answer: '조사 맡겨 뒀어요', durationMs: 5_000, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+    expect(played).toEqual([])
+    // 사람이 이어서 빌드를 시키면 메인이 명령을 백그라운드로 돌린다
+    await ask($, '빌드도', 't1b')
+    await $.tool.call({ tool: 'Bash', command: 'npm run build', run_in_background: true, tool_use_id: 'b1' } as never)
+    await $.turn.complete({ answer: '돌려 뒀어요', durationMs: 5_000, isAborted: false, turnId: 't1b', reason: 'answer' } as never)
+    expect(played).toEqual([])
+    // 플러그인이 띄운 에이전트·끝난 에이전트는 기다리지 않는다
+    agents[0]!.status = 'completed'
+    agents.push({ id: 'p1', description: '요약', type: 'general-purpose', status: 'running', spawnedBy: 'ide-mod' })
+    // 에이전트는 끝났지만 빌드 명령이 아직 돈다
+    await $.prompt.submit({ text: '<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>\n</task-notification>', origin: { kind: 'task-notification' } } as never)
+    await $.turn.start({ text: '', turnId: 't2' })
+    await $.turn.complete({ answer: '조사 끝, 빌드 기다려요', durationMs: 2_000, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+    expect(played).toEqual([])
+    // 마지막 명령이 끝났다는 알림을 받은 턴이 끝나면 운다
+    await $.prompt.submit({ text: '<task-notification>\n<task-id>bg1</task-id>\n<status>completed</status>\n</task-notification>', origin: { kind: 'task-notification' } } as never)
+    await $.turn.start({ text: '', turnId: 't3' })
+    await $.turn.complete({ answer: '다 끝났어요', durationMs: 2_000, isAborted: false, turnId: 't3', reason: 'answer' } as never)
+    expect(played).toEqual(['sounds/done.wav'])
+  })
+
+  test('백그라운드 작업 ID 읽기', () => {
+    expect(backgroundTaskId('Bash', {}, { result: { backgroundTaskId: 'x1' } })).toBe('x1')
+    expect(backgroundTaskId('Bash', {}, { result: { stdout: 'ok' } })).toBe(undefined)
+    expect(backgroundTaskId('Workflow', {}, { result: { status: 'async_launched', taskId: 'w1' } })).toBe('w1')
+    expect(backgroundTaskId('Monitor', {}, { result: { taskId: 'm1' } })).toBe(undefined)
+    expect(backgroundTaskId('Bash', {}, { deny: 'no' })).toBe(undefined)
+    expect(endedTaskIds('<task-notification><task-id>a</task-id><status>completed</status></task-notification><task-notification><task-id>b</task-id><status>running</status></task-notification>')).toEqual(['a'])
   })
 
   test('알림 문구: 세션 이름이 없으면 요청 앞부분으로 부른다', () => {

@@ -331,8 +331,9 @@ function registerAgents(on: On) {
       await requestTurnEnded($, e.turnId, e.answer, e.isAborted || e.reason !== 'answer', estimate).catch(() => undefined)
       await update($, turnClockAtom, () => null).catch(() => undefined)
       await update($, estimateRunAtom, () => null).catch(() => undefined)
-      // 끝까지 답한 턴만 "끝남" 소리 (멈춤·오류는 끝남처럼 들리면 안 된다)
-      if (!e.isAborted && e.reason === 'answer') await alertDone($, e.durationMs, e.turnId).catch(() => undefined)
+      // 끝까지 답한 턴만 "끝남" 소리 (멈춤·오류는 끝남처럼 들리면 안 된다).
+      // 백그라운드 에이전트·명령이 아직 돌면 기다리는 중일 뿐이다: 마지막 일이 끝나고 그 알림을 받은 턴이 끝날 때 운다
+      if (!e.isAborted && e.reason === 'answer' && (await backgroundBusy($).catch(() => 0)) === 0) await alertDone($, e.durationMs, e.turnId).catch(() => undefined)
       await setCaption($, e.isAborted ? '작업을 멈췄어요' : '답을 다 썼어요. 다음 요청을 기다려요').catch(() => undefined)
     }
     return next(e)
@@ -2832,6 +2833,49 @@ const ASK_GAP_MS = 2_000
 const KO_VOICE = 'Yuna'
 let lastAskSoundAt = 0
 
+/** 메인 에이전트가 백그라운드로 돌려 둔 일 (작업 ID → 시작 시각): 이게 남아 있으면 턴이 끝나도 "끝남"이 아니다 */
+const bgWorkAtom = atom({ plugin: 'ide-mod', key: 'bgWork' } as const, {} as Record<string, number>)
+/** 끝났다는 알림을 놓친 작업이 소리를 영영 막지 않게, 이보다 오래된 것은 끝난 것으로 본다 */
+const BG_WORK_TTL_MS = 6 * 60 * 60_000
+/** 끝날 때 알림이 오는 백그라운드 일. Monitor는 계속 지켜보는 일이라 넣지 않는다 */
+export function backgroundTaskId(tool: string, input: Record<string, unknown>, ran: unknown): string | undefined {
+  const out = ran as { deny?: string; isError?: true; result?: unknown }
+  if (out.deny !== undefined || out.isError === true) return undefined
+  const result = (out.result ?? {}) as { backgroundTaskId?: unknown; taskId?: unknown; status?: unknown }
+  if (tool === 'Bash' && typeof result.backgroundTaskId === 'string') return result.backgroundTaskId
+  if (tool === 'Workflow' && typeof result.taskId === 'string') return result.taskId
+  if (tool === 'Agent' && result.status === 'remote_launched' && typeof result.taskId === 'string') return result.taskId
+  return undefined
+}
+/** 백그라운드 작업 알림에서 끝난 작업 ID들 (아직 도는 중이라는 알림은 빼고) */
+export function endedTaskIds(text: string): string[] {
+  const ids: string[] = []
+  for (const block of text.split(/<task-notification>/).slice(1)) {
+    const id = /<task-id>\s*([^<\s]+)\s*<\/task-id>/.exec(block)?.[1]
+    const status = /<status>\s*([^<\s]+)\s*<\/status>/.exec(block)?.[1]
+    if (id !== undefined && status !== 'running') ids.push(id)
+  }
+  return ids
+}
+async function noteBgStart($: EngineInterface, id: string) {
+  const at = await nowOf($)
+  await update($, bgWorkAtom, m => ({ ...m, [id]: at })).catch(() => undefined)
+}
+async function noteBgEnd($: EngineInterface, ids: string[]) {
+  if (ids.length === 0) return
+  await update($, bgWorkAtom, m => Object.fromEntries(Object.entries(m).filter(([k]) => !ids.includes(k)))).catch(() => undefined)
+}
+/** 메인 턴이 끝났을 때 아직 도는 백그라운드 일: 서브에이전트(플러그인이 띄운 것 빼고) + 돌려 둔 명령·워크플로 */
+async function backgroundBusy($: EngineInterface): Promise<number> {
+  const agents = (await $.agent.list().catch(() => [])).filter(a =>
+    a.spawnedBy === undefined && a.teammateId === undefined && (a.status === 'running' || a.status === 'waiting' || a.status === 'pending'))
+  const now = await nowOf($)
+  const work = await read($, bgWorkAtom).catch(() => ({} as Record<string, number>))
+  const live = Object.entries(work).filter(([, at]) => now - at < BG_WORK_TTL_MS)
+  if (live.length !== Object.keys(work).length) await update($, bgWorkAtom, () => Object.fromEntries(live)).catch(() => undefined)
+  return agents.length + live.length
+}
+
 const isAlertMode = (v: unknown): v is AlertMode => typeof v === 'string' && (ALERT_MODES as readonly string[]).includes(v)
 
 async function loadAlert($: EngineInterface) {
@@ -3235,6 +3279,7 @@ export const register: Register = (on, options) => {
   // 턴이 시작되기 전에 기록해 두어야 turn.start가 그 요청과 이을 수 있다
   on('prompt.submit', async ($, e, next) => {
     try {
+      if (e.origin.kind === 'task-notification') await noteBgEnd($, endedTaskIds(e.text))
       const text = personText(e.text)
       const isRequest = REQUEST_ORIGINS.includes(e.origin.kind) && text !== '' && !isMachineText(text) && !/^\/[\w:.-]+$/.test(text)
       if (isRequest) await addRequest($, text, e.turnId)
@@ -3294,6 +3339,11 @@ export const register: Register = (on, options) => {
     const outcome = ran as { deny?: string; isError?: true }
     await noteEdit($, tool, input, outcome).catch(() => undefined)
     await noteTasks($, e.agentId, tool, input, ran).catch(() => undefined)
+    if (e.agentId === undefined) {
+      const bgId = backgroundTaskId(tool, input, ran)
+      if (bgId !== undefined) await noteBgStart($, bgId)
+      if (tool === 'TaskStop' && outcome.deny === undefined) await noteBgEnd($, [String(input.task_id ?? input.shell_id ?? '')])
+    }
     if (PERSON_TOOLS.includes(tool)) await pauseClock($, (await nowOf($)) - (askAt ?? callAt)).catch(() => undefined)
     // Claude가 한국어 원고를 쓰거나 고치면 문체 게이트를 돌린다
     const written = typeof input.file_path === 'string' ? input.file_path : undefined

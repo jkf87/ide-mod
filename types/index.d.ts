@@ -213,6 +213,8 @@ declare module 'claude-code' {
       // ── 알림 소리 ──
       /** sound 끝남·부름 소리, voice 소리 + 30초 넘은 턴은 걸린 시간 읽기, off 끔 */
       alert: 'sound' | 'voice' | 'off'
+      /** 메인 에이전트가 백그라운드로 돌려 둔 명령·워크플로 (작업 ID → 시작 시각); 남아 있으면 "끝남" 소리를 미룬다 */
+      bgWork: Record<string, number>
 
       // ── 예상 소요시간 ──
       /** 요청마다 에이전트가 첫 줄에 예상 소요시간을 적게 할지 */
