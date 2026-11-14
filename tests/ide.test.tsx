@@ -40,6 +40,8 @@ const LISTING = `This session is 모드에 대해 [634505] — the name other se
 Peer sessions (2):
   화목난로 자동 보충 기능 [a33860]  ·  interactive  ·  idle  ·  Claude Desktop session  ·  started 10h ago
   목차작성 [ed478e]  ·  interactive  ·  busy  ·  started 3h ago`
+/** 다른 세션이 모두 쉬는 목록: 끝남 소리는 이때만 바로 난다 */
+const IDLE_LISTING = LISTING.replace('·  busy  ·', '·  idle  ·')
 
 function fakeWorld(on: On): World {
   const world: World = { opened: 0, statuses: [], rhwpCalls: [], scripts: [], sent: [], copied: [], contexts: [], store: new Map(), written: new Map() }
@@ -1026,6 +1028,7 @@ describe('작업 진행', () => {
 
   test('턴이 끝나면 끝남 소리, 권한을 물으면 부름 소리, d로 소리→읽기→끔', async ($, on) => {
     const world = fakeWorld(on)
+    world.listing = IDLE_LISTING
     const clock = mock.clock(on)
     const played: string[] = []
     const spoken: string[] = []
@@ -1061,16 +1064,12 @@ describe('작업 진행', () => {
     await $.classic.PermissionRequest({ hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: {}, session_id: 's', transcript_path: '', cwd: '/work' } as never)
     expect(played).toEqual(['sounds/done.wav', 'sounds/ask.wav'])
     expect(banners.at(-1)?.title).toBe('모드에 대해 · 확인을 기다려요')
-    // /rename 으로 이름을 바꾸면 30초 안에 새 이름으로 부른다
-    world.listing = LISTING.replace('This session is 모드에 대해', 'This session is 쇼츠제작')
+    // /rename 으로 이름을 바꾸면 다음 끝남부터 새 이름으로 부른다 (끝날 때마다 세션 목록을 다시 받는다)
+    world.listing = IDLE_LISTING.replace('This session is 모드에 대해', 'This session is 쇼츠제작')
     await ask($, '이름 바꾼 뒤', 't5')
     await $.turn.complete({ answer: '됐어요', durationMs: 3_000, isAborted: false, turnId: 't5', reason: 'answer' } as never)
-    expect(banners.at(-1)?.title).toBe('모드에 대해 · 끝났어요')
-    await clock.advance(31_000)
-    await ask($, '조금 뒤', 't6')
-    await $.turn.complete({ answer: '됐어요', durationMs: 3_000, isAborted: false, turnId: 't6', reason: 'answer' } as never)
     expect(banners.at(-1)?.title).toBe('쇼츠제작 · 끝났어요')
-    world.listing = undefined
+    world.listing = IDLE_LISTING
     await clock.advance(31_000)
     // 버튼으로 소리+읽기 → 30초 넘은 턴은 걸린 시간을 읽는다
     await $.command.run(typed('open', '/work'))
@@ -1145,6 +1144,7 @@ describe('작업 진행', () => {
   test('백그라운드 에이전트·명령이 남아 있으면 끝남 소리를 미루고, 마지막 알림을 받은 턴에서 운다', async ($, on) => {
     const world = fakeWorld(on)
     world.bgBash = 'bg1'
+    world.listing = IDLE_LISTING
     const played: string[] = []
     on('audio.play', ($, e) => {
       played.push(String((e as unknown as { clip: { asset?: string } }).clip.asset))
@@ -1175,6 +1175,39 @@ describe('작업 진행', () => {
     await $.prompt.submit({ text: '<task-notification>\n<task-id>bg1</task-id>\n<status>completed</status>\n</task-notification>', origin: { kind: 'task-notification' } } as never)
     await $.turn.start({ text: '', turnId: 't3' })
     await $.turn.complete({ answer: '다 끝났어요', durationMs: 2_000, isAborted: false, turnId: 't3', reason: 'answer' } as never)
+    expect(played).toEqual(['sounds/done.wav'])
+  })
+
+  test('다른 세션이 아직 일하면 끝남 소리를 내지 않고, 잠시 뒤 다 끝났으면 운다', async ($, on) => {
+    const world = fakeWorld(on)
+    const clock = mock.clock(on)
+    const played: string[] = []
+    on('audio.play', ($, e) => {
+      played.push(String((e as unknown as { clip: { asset?: string } }).clip.asset))
+      return { value: undefined } as never
+    })
+    on('ui.notify', () => ({ value: { isSent: true, channel: 'iterm2' } }) as never)
+    // 목차작성 세션이 일하는 중: 이 세션이 끝나도 조용하고, 8초 뒤에도 그대로면 계속 조용하다 (그 세션이 끝날 때 운다)
+    world.listing = LISTING
+    await ask($, '하나', 't1')
+    await $.turn.complete({ answer: '끝', durationMs: 3_000, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+    expect(played).toEqual([])
+    await clock.advance(9_000)
+    expect(played).toEqual([])
+    // 거의 같이 끝난 경우: 그 세션이 잠시 뒤 쉬게 되면 다시 보고 운다
+    await ask($, '둘', 't2')
+    await $.turn.complete({ answer: '끝', durationMs: 3_000, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+    expect(played).toEqual([])
+    world.listing = IDLE_LISTING
+    await clock.advance(9_000)
+    expect(played).toEqual(['sounds/done.wav'])
+    // 다시 볼 때 이 세션이 새 일을 하고 있으면 지난 끝남은 울리지 않는다
+    world.listing = LISTING
+    await ask($, '셋', 't3')
+    await $.turn.complete({ answer: '끝', durationMs: 3_000, isAborted: false, turnId: 't3', reason: 'answer' } as never)
+    await ask($, '넷', 't4')
+    world.listing = IDLE_LISTING
+    await clock.advance(9_000)
     expect(played).toEqual(['sounds/done.wav'])
   })
 

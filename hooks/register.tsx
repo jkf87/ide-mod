@@ -333,7 +333,7 @@ function registerAgents(on: On) {
       await update($, estimateRunAtom, () => null).catch(() => undefined)
       // 끝까지 답한 턴만 "끝남" 소리 (멈춤·오류는 끝남처럼 들리면 안 된다).
       // 백그라운드 에이전트·명령이 아직 돌면 기다리는 중일 뿐이다: 마지막 일이 끝나고 그 알림을 받은 턴이 끝날 때 운다
-      if (!e.isAborted && e.reason === 'answer' && (await backgroundBusy($).catch(() => 0)) === 0) await alertDone($, e.durationMs, e.turnId).catch(() => undefined)
+      if (!e.isAborted && e.reason === 'answer' && (await backgroundBusy($).catch(() => 0)) === 0) await alertWhenAllDone($, e.durationMs, e.turnId).catch(() => undefined)
       await setCaption($, e.isAborted ? '작업을 멈췄어요' : '답을 다 썼어요. 다음 요청을 기다려요').catch(() => undefined)
     }
     return next(e)
@@ -2955,6 +2955,35 @@ async function alertDone($: EngineInterface, durationMs: number, turnId?: string
   const lines = alertLines('done', await alertWhere($), await alertWhat($, turnId), durationMs)
   notifyKo($, lines.title, lines.body)
   if (mode === 'voice' && durationMs >= SPEAK_AFTER_MS) speakKo($, lines.spoken)
+}
+
+/** 다른 세션이 다 끝났는지 다시 볼 때까지 (두 세션이 거의 같이 끝나면 서로 "아직 일하는 중"으로 볼 수 있다) */
+const ALL_DONE_RECHECK_MS = 8_000
+
+/** 이 PC에서 아직 일하는 다른 Claude 세션 (ListAgents의 busy) */
+async function busyPeers($: EngineInterface): Promise<string[]> {
+  const peers = await loadPeers($)
+  // 같은 목록에 이 세션 이름도 실려 왔으니 alertWhere가 또 받지 않게 받은 시각을 적는다
+  const now = await nowOf($)
+  await update($, selfNameAtAtom, () => now).catch(() => undefined)
+  return peers.filter(p => p.status === 'busy').map(p => p.name)
+}
+
+/**
+ * 끝남 소리는 Claude 일이 전부 끝났을 때만: 다른 세션이 아직 일하면 조용히 넘어간다 (그 세션이 끝날 때 운다).
+ * 거의 같이 끝난 세션끼리 서로 기다리다 아무도 안 우는 일을 막으려고, 잠시 뒤 한 번 더 본다.
+ */
+async function alertWhenAllDone($: EngineInterface, durationMs: number, turnId?: string) {
+  if ((await read($, alertAtom)) === 'off') return
+  const busy = await busyPeers($).catch(() => [] as string[])
+  if (busy.length === 0) return alertDone($, durationMs, turnId)
+  $.clock.after(ALL_DONE_RECHECK_MS, () => void (async () => {
+    // 그 사이 이 세션이 다시 일을 시작했으면 이번 끝남은 지난 일이다
+    if ((await read($, agentsAtom))[MAIN]?.phase === 'running') return
+    if ((await backgroundBusy($)) > 0) return
+    if ((await busyPeers($)).length > 0) return
+    await alertDone($, durationMs, turnId)
+  })().catch(() => undefined))
 }
 
 async function alertAsk($: EngineInterface) {
