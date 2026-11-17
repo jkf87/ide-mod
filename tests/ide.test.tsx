@@ -239,19 +239,22 @@ describe('Windows 경로', () => {
     expect([isInside('/work/src', '/work'), isInside('/workshop', '/work'), isInside('/work', '/work')]).toEqual([true, false, true])
   })
 
-  test('Windows는 PowerShell Start-Process로 열고(숨김 창을 물려받지 않게), 경로는 \\ 로 바꿔 환경 변수로 넘긴다', () => {
-    const [open] = openCommands('C:\\Users\\me/Documents/새 폴더')
-    expect(open?.argv.slice(0, 4)).toEqual(['powershell', '-NoProfile', '-NonInteractive', '-Command'])
-    expect(open?.argv[4]).toBe('Start-Process -FilePath $env:IDE_MOD_OPEN')
-    expect(open?.env).toEqual({ IDE_MOD_OPEN: 'C:\\Users\\me\\Documents\\새 폴더' })
-    // 경로는 명령 글자에 들어가지 않는다: 따옴표·&·% 가 든 이름도 그대로 간다
-    const [odd] = openCommands("C:\\Users\\me\\it's & 100%")
+  test('Windows는 node가 explorer를 띄우고(숨김 창을 물려받지 않게), 안 되면 PowerShell Start-Process로 연다', () => {
+    const [byNode, byPs] = openCommands('C:\\Users\\me/Documents/새 폴더')
+    expect(byNode?.argv.slice(0, 2)).toEqual(['node', '-e'])
+    expect(byNode?.argv[2]).toContain("spawnSync('explorer', process.argv.slice(1))")
+    expect(byNode?.argv.slice(3)).toEqual(['C:\\Users\\me\\Documents\\새 폴더'])
+    expect(byPs?.argv).toEqual(['powershell', '-NoProfile', '-NonInteractive', '-Command', 'Start-Process -FilePath $env:IDE_MOD_OPEN'])
+    expect(byPs?.env).toEqual({ IDE_MOD_OPEN: 'C:\\Users\\me\\Documents\\새 폴더' })
+    // PowerShell에는 경로가 명령 글자에 들어가지 않는다: 따옴표·&·% 가 든 이름도 그대로 간다
+    const [, odd] = openCommands("C:\\Users\\me\\it's & 100%")
     expect(odd?.argv.join(' ')).not.toContain("it's")
     expect(odd?.env).toEqual({ IDE_MOD_OPEN: "C:\\Users\\me\\it's & 100%" })
-    // 파일을 골라 보여 줄 때는 /select, 뒤에 따옴표로 감싼 경로
-    const [reveal] = openCommands('C:\\Users\\me/Documents/a b.txt', true)
-    expect(reveal?.argv[4]).toBe(`Start-Process -FilePath explorer.exe -ArgumentList ('/select,"' + $env:IDE_MOD_OPEN + '"')`)
-    expect(reveal?.env).toEqual({ IDE_MOD_OPEN: 'C:\\Users\\me\\Documents\\a b.txt' })
+    // 파일을 골라 보여 줄 때: node는 /select, 와 경로를 따로, PowerShell은 /select, 뒤에 따옴표로 감싼 경로
+    const [revealNode, revealPs] = openCommands('C:\\Users\\me/Documents/a b.txt', true)
+    expect(revealNode?.argv.slice(3)).toEqual(['/select,', 'C:\\Users\\me\\Documents\\a b.txt'])
+    expect(revealPs?.argv[4]).toBe(`Start-Process -FilePath explorer.exe -ArgumentList ('/select,"' + $env:IDE_MOD_OPEN + '"')`)
+    expect(revealPs?.env).toEqual({ IDE_MOD_OPEN: 'C:\\Users\\me\\Documents\\a b.txt' })
     // macOS·Linux는 전과 같다
     expect(openCommands('/work/src')).toEqual([{ argv: ['open', '/work/src'] }, { argv: ['xdg-open', '/work/src'] }])
     expect(openCommands('/work/README.md', true)).toEqual([{ argv: ['open', '-R', '/work/README.md'] }, { argv: ['xdg-open', '/work'] }])
