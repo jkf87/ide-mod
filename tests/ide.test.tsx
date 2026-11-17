@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { baseName, isInside, isWinPath, joinPath, openCommands, parentOf, alertLines, backgroundTaskId, endedTaskIds, parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
+import { baseName, isInside, isWinPath, joinPath, openCommands, parentOf, alertLines, herdrNameOf, backgroundTaskId, endedTaskIds, parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
 import { artifactUrlOf, gitInfoFrom, gitNotes, handoffFromText, handoffPage, receivePrompt, redactSecrets, savedPathOf, shareDoc, webUrlOf } from '../hooks/share'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
@@ -1275,6 +1275,13 @@ describe('작업 진행', () => {
   test('알림 문구: 세션 이름이 없으면 요청 앞부분으로 부른다', () => {
     expect(alertLines('done', '', '로그인 버그 고쳐줘', 75_000)).toEqual({ title: 'Claude · 끝났어요', body: '로그인 버그 고쳐줘 · 1분 15초', spoken: '로그인 버그 고쳐줘, 끝났어요. 1분 15초 걸렸어요.' })
     expect(alertLines('ask', 'ide-mod', '')).toEqual({ title: 'ide-mod · 확인을 기다려요', body: '', spoken: 'ide-mod, 확인이 필요해요.' })
+  })
+
+  test('허더 이름: 패널 이름 → 패널 하나뿐인 탭 이름', () => {
+    expect(herdrNameOf({ label: '충남대과제' }, { label: '아직여유', pane_count: 4 })).toBe('충남대과제')
+    expect(herdrNameOf({}, { label: '허더', pane_count: 1 })).toBe('허더')
+    expect(herdrNameOf({}, { label: '아직여유', pane_count: 4 })).toBe('')
+    expect(herdrNameOf(undefined, undefined)).toBe('')
   })
 
   test('예상 읽기', () => {

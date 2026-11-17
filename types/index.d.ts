@@ -248,6 +248,8 @@ declare module 'claude-code' {
       selfName: string
       /** 알림에 적을 이름을 ListAgents로 마지막에 받은 시각 (30초마다 다시 받아 /rename 을 따라간다) */
       selfNameAt: number | null
+      /** 허더 안에서 돌 때 허더 패널·탭 이름 (알림에서 Claude 세션 이름보다 먼저) */
+      herdrName: string
       /** 마지막으로 보낸 핸드오프 결과 */
       handoffSent: { to: string; at: number; ok: boolean; reason?: string } | null
       /** 핸드오프 화면 오른쪽: local 이 PC의 다른 세션에게, share 다른 사람에게(Artifact) */

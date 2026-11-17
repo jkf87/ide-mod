@@ -2972,7 +2972,34 @@ function speakKo($: EngineInterface, text: string) {
 
 /** 세션이 여럿일 때 어느 세션 소리인지: 세션 이름 → 폴더 이름(홈 폴더면 없음) */
 const selfNameAtAtom = atom({ plugin: 'ide-mod', key: 'selfNameAt' } as const, null as number | null)
-/** 이름을 다시 받는 간격: /rename 으로 바꾼 이름이 이만큼 안에 알림에 실린다 */
+/** 허더 안에서 돌 때 허더에서 붙인 이름 (허더의 이름 바꾸기는 Claude 세션 이름과 따로 논다) */
+const herdrNameAtom = atom({ plugin: 'ide-mod', key: 'herdrName' } as const, '')
+
+/** 허더 이름 고르기: 패널 이름 → 패널이 하나뿐인 탭의 이름 (여러 패널이 한 탭이면 탭 이름으로는 구분이 안 된다) */
+export function herdrNameOf(pane: { label?: string } | undefined, tab: { label?: string; pane_count?: number } | undefined): string {
+  const p = (pane?.label ?? '').trim()
+  if (p !== '') return p
+  const t = (tab?.label ?? '').trim()
+  return t !== '' && tab?.pane_count === 1 ? t : ''
+}
+
+async function loadHerdrName($: EngineInterface) {
+  const paneId = (await $.env.get('HERDR_PANE_ID').catch(() => undefined)) ?? ''
+  if (paneId === '') return
+  const bin = (await $.env.get('HERDR_BIN_PATH').catch(() => undefined)) || 'herdr'
+  const get = async (args: string[]) => {
+    const ran = await $.process.run([bin, ...args], { timeoutMs: 3_000 }).catch(() => undefined)
+    if (ran === undefined || ran.exitCode !== 0) return undefined
+    try { return (JSON.parse(ran.stdout) as { result?: Record<string, unknown> }).result } catch { return undefined }
+  }
+  const pane = (await get(['pane', 'get', paneId]))?.pane as { label?: string; tab_id?: string } | undefined
+  if (pane === undefined) return
+  const tab = pane.tab_id ? ((await get(['tab', 'get', pane.tab_id]))?.tab as { label?: string; pane_count?: number } | undefined) : undefined
+  const name = herdrNameOf(pane, tab)
+  await update($, herdrNameAtom, () => name)
+}
+
+/** 이름을 다시 받는 간격: /rename 이나 허더에서 바꾼 이름이 이만큼 안에 알림에 실린다 */
 const SELF_NAME_TTL_MS = 30_000
 async function alertWhere($: EngineInterface): Promise<string> {
   // /rename 하면 ListAgents 이름이 바로 바뀐다: 받은 지 오래면 다시 받는다 (한 번 받고 끝내면 옛 이름을 부른다)
@@ -2981,7 +3008,10 @@ async function alertWhere($: EngineInterface): Promise<string> {
   if (at === null || now - at >= SELF_NAME_TTL_MS) {
     await update($, selfNameAtAtom, () => now).catch(() => undefined)
     await loadPeers($).catch(() => undefined)
+    await loadHerdrName($).catch(() => undefined)
   }
+  const herdr = await read($, herdrNameAtom).catch(() => '')
+  if (herdr !== '') return herdr
   const self = await read($, selfNameAtom).catch(() => '')
   if (self !== '') return self
   const root = await $.session.root().catch(() => '')
