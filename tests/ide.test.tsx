@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { alertLines, backgroundTaskId, endedTaskIds, parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
+import { baseName, isInside, isWinPath, joinPath, openArgvs, parentOf, alertLines, backgroundTaskId, endedTaskIds, parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
 import { artifactUrlOf, gitInfoFrom, gitNotes, handoffFromText, handoffPage, receivePrompt, redactSecrets, savedPathOf, shareDoc, webUrlOf } from '../hooks/share'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
@@ -206,6 +206,44 @@ describe('순수 함수', () => {
 
   test('렌더 창은 코드 울타리 안에서 시작하지 않는다', () => {
     expect(blockStarts(['# a', '', 'para', '```', 'x', '', 'y', '```', '', 'end'])).toEqual([0, 2, 9])
+  })
+})
+
+describe('Windows 경로', () => {
+  test('드라이브 경로와 공유 경로만 Windows 경로로 본다', () => {
+    expect(['C:\\Users\\me', 'c:/Users/me', '\\\\nas\\share'].map(isWinPath)).toEqual([true, true, true])
+    expect(['/work/src', 'src/app.ts', '/tmp/a\\b', 'C:'].map(isWinPath)).toEqual([false, false, false, false])
+  })
+
+  test('이름과 위 폴더를 \\ 와 / 어느 쪽으로도 가른다', () => {
+    expect(baseName('C:\\Users\\me\\a b.txt')).toBe('a b.txt')
+    expect(baseName('C:\\Users\\me/Documents/')).toBe('Documents')
+    expect(parentOf('C:\\Users\\me\\a b.txt')).toBe('C:\\Users\\me')
+    expect(parentOf('C:\\Users\\me/Documents/model')).toBe('C:\\Users\\me/Documents')
+    expect(parentOf('C:\\Users')).toBe('C:\\')
+    expect(parentOf('C:\\')).toBe('C:\\')
+    expect(parentOf('\\\\nas\\share\\dir')).toBe('\\\\nas\\share')
+    // macOS·Linux 경로는 전과 같다 (역슬래시는 이름의 일부)
+    expect([baseName('/work/src/'), parentOf('/work/src/app.ts'), parentOf('/work'), parentOf('/')]).toEqual(['src', '/work/src', '/', '/'])
+    expect(baseName('/tmp/a\\b')).toBe('a\\b')
+  })
+
+  test('트리 경로는 엔진이 주는 실제 경로와 같은 글자로 붙는다', () => {
+    expect(joinPath('C:\\Users\\me', 'Documents')).toBe('C:\\Users\\me\\Documents')
+    expect(joinPath('C:\\', 'Users')).toBe('C:\\Users')
+    expect(joinPath('C:/Users/me', 'Documents')).toBe('C:/Users/me/Documents')
+    expect([joinPath('/work', 'src'), joinPath('/', 'work')]).toEqual(['/work/src', '/work'])
+    expect(isInside('C:\\Users\\me\\Documents\\a.txt', 'C:\\Users\\me')).toBe(true)
+    expect(isInside('c:/users/me/Documents', 'C:\\Users\\me\\')).toBe(true)
+    expect(isInside('C:\\Users\\meow', 'C:\\Users\\me')).toBe(false)
+    expect([isInside('/work/src', '/work'), isInside('/workshop', '/work'), isInside('/work', '/work')]).toEqual([true, false, true])
+  })
+
+  test('탐색기에는 \\ 로 바꾼 경로를 넘기고, /select, 는 경로와 따로 넘긴다', () => {
+    expect(openArgvs('C:\\Users\\me/Documents/새 폴더')).toEqual([['explorer', 'C:\\Users\\me\\Documents\\새 폴더']])
+    expect(openArgvs('C:\\Users\\me/Documents/a b.txt', true)).toEqual([['explorer', '/select,', 'C:\\Users\\me\\Documents\\a b.txt']])
+    expect(openArgvs('/work/src')).toEqual([['open', '/work/src'], ['xdg-open', '/work/src']])
+    expect(openArgvs('/work/README.md', true)).toEqual([['open', '-R', '/work/README.md'], ['xdg-open', '/work']])
   })
 })
 
