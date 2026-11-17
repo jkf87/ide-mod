@@ -833,27 +833,36 @@ async function pressTreeRow($: EngineInterface, row: TreeRow) {
 
 /**
  * 바깥 앱으로 여는 명령들: 앞에서부터 해 보고 되는 것을 쓴다.
- * 탐색기는 /가 섞인 경로를 못 읽고 '문서' 폴더를 열어 버리므로 \ 로 바꿔 넘긴다.
- * /select, 와 경로는 따로 넘긴다: 한 인자로 붙이면 공백이 든 경로에서 따옴표가 /select, 까지 감싸 탐색기가 못 읽는다.
+ *
+ * Windows는 PowerShell의 Start-Process로 연다. 엔진은 mod의 명령을 콘솔이 뜨지 않게 '창 숨김'으로 띄우는데,
+ * explorer를 바로 부르면 그 숨김을 물려받아 탐색기 창이 보이지 않는 채로 생긴다(창은 늘어나는데 화면엔 안 뜸).
+ * Start-Process는 보통 창으로 다시 열어 준다. 경로는 환경 변수로 넘겨 따옴표·&·% 를 탈출시키지 않는다.
+ * 탐색기는 /가 섞인 경로를 못 읽고 '문서' 폴더를 열어 버리므로 \ 로 바꿔 넘기고,
+ * /select, 뒤의 경로는 따옴표로 감싸야 공백이 든 경로에서도 그 파일을 골라 보여 준다.
  */
-export function openArgvs(path: string, reveal = false): string[][] {
+export type OpenCommand = { argv: string[]; env?: Record<string, string> }
+export const OPEN_ENV = 'IDE_MOD_OPEN'
+export function openCommands(path: string, reveal = false): OpenCommand[] {
   if (isWinPath(path)) {
-    const native = path.replace(/\//g, '\\')
-    return [reveal ? ['explorer', '/select,', native] : ['explorer', native]]
+    const script = reveal
+      ? `Start-Process -FilePath explorer.exe -ArgumentList ('/select,"' + $env:${OPEN_ENV} + '"')`
+      : `Start-Process -FilePath $env:${OPEN_ENV}`
+    return [{ argv: ['powershell', '-NoProfile', '-NonInteractive', '-Command', script], env: { [OPEN_ENV]: path.replace(/\//g, '\\') } }]
   }
-  return [reveal ? ['open', '-R', path] : ['open', path], ['xdg-open', reveal ? parentOf(path) : path]]
+  return (reveal ? [['open', '-R', path], ['xdg-open', parentOf(path)]] : [['open', path], ['xdg-open', path]]).map(argv => ({ argv }))
 }
 
 /** 운영체제 기본 앱으로 연다: 파일은 연결된 앱, 폴더는 Finder(탐색기). reveal이면 Finder(탐색기)에서 그 파일을 골라 보여준다 */
 async function openOutside($: EngineInterface, path: string, reveal = false) {
-  for (const argv of openArgvs(path, reveal)) {
-    const ran = await $.process.run(argv, { timeoutMs: 10_000 }).catch(error => {
-      notePress($, `run ${argv.join(' ')} threw ${oneLine(String(error), 200)}`)
+  for (const { argv, env } of openCommands(path, reveal)) {
+    const what = `${argv[0]} ${env?.[OPEN_ENV] ?? argv.slice(1).join(' ')}`
+    // PowerShell은 처음 뜰 때 몇 초 걸린다
+    const ran = await $.process.run(argv, { env, timeoutMs: 20_000 }).catch(error => {
+      notePress($, `run ${what} threw ${oneLine(String(error), 200)}`)
       return undefined
     })
-    if (ran !== undefined) notePress($, `run ${argv.join(' ')} exit=${ran.exitCode} ${oneLine(ran.stderr, 200)}`)
-    // explorer는 성공해도 1을 돌려준다
-    if (ran !== undefined && (ran.exitCode === 0 || argv[0] === 'explorer')) return true
+    if (ran !== undefined) notePress($, `run ${what} exit=${ran.exitCode} ${oneLine(ran.stderr, 200)}`)
+    if (ran?.exitCode === 0) return true
   }
   $.ui.toast(`열지 못했어요: ${baseName(path) || path}`)
   return false
