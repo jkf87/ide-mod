@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { baseName, isInside, isWinPath, joinPath, openArgvs, parentOf, alertLines, backgroundTaskId, endedTaskIds, parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
+import { baseName, isInside, isWinPath, joinPath, openCommands, parentOf, alertLines, backgroundTaskId, endedTaskIds, parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
 import { artifactUrlOf, gitInfoFrom, gitNotes, handoffFromText, handoffPage, receivePrompt, redactSecrets, savedPathOf, shareDoc, webUrlOf } from '../hooks/share'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
@@ -239,11 +239,22 @@ describe('Windows 경로', () => {
     expect([isInside('/work/src', '/work'), isInside('/workshop', '/work'), isInside('/work', '/work')]).toEqual([true, false, true])
   })
 
-  test('탐색기에는 \\ 로 바꾼 경로를 넘기고, /select, 는 경로와 따로 넘긴다', () => {
-    expect(openArgvs('C:\\Users\\me/Documents/새 폴더')).toEqual([['explorer', 'C:\\Users\\me\\Documents\\새 폴더']])
-    expect(openArgvs('C:\\Users\\me/Documents/a b.txt', true)).toEqual([['explorer', '/select,', 'C:\\Users\\me\\Documents\\a b.txt']])
-    expect(openArgvs('/work/src')).toEqual([['open', '/work/src'], ['xdg-open', '/work/src']])
-    expect(openArgvs('/work/README.md', true)).toEqual([['open', '-R', '/work/README.md'], ['xdg-open', '/work']])
+  test('Windows는 PowerShell Start-Process로 열고(숨김 창을 물려받지 않게), 경로는 \\ 로 바꿔 환경 변수로 넘긴다', () => {
+    const [open] = openCommands('C:\\Users\\me/Documents/새 폴더')
+    expect(open?.argv.slice(0, 4)).toEqual(['powershell', '-NoProfile', '-NonInteractive', '-Command'])
+    expect(open?.argv[4]).toBe('Start-Process -FilePath $env:IDE_MOD_OPEN')
+    expect(open?.env).toEqual({ IDE_MOD_OPEN: 'C:\\Users\\me\\Documents\\새 폴더' })
+    // 경로는 명령 글자에 들어가지 않는다: 따옴표·&·% 가 든 이름도 그대로 간다
+    const [odd] = openCommands("C:\\Users\\me\\it's & 100%")
+    expect(odd?.argv.join(' ')).not.toContain("it's")
+    expect(odd?.env).toEqual({ IDE_MOD_OPEN: "C:\\Users\\me\\it's & 100%" })
+    // 파일을 골라 보여 줄 때는 /select, 뒤에 따옴표로 감싼 경로
+    const [reveal] = openCommands('C:\\Users\\me/Documents/a b.txt', true)
+    expect(reveal?.argv[4]).toBe(`Start-Process -FilePath explorer.exe -ArgumentList ('/select,"' + $env:IDE_MOD_OPEN + '"')`)
+    expect(reveal?.env).toEqual({ IDE_MOD_OPEN: 'C:\\Users\\me\\Documents\\a b.txt' })
+    // macOS·Linux는 전과 같다
+    expect(openCommands('/work/src')).toEqual([{ argv: ['open', '/work/src'] }, { argv: ['xdg-open', '/work/src'] }])
+    expect(openCommands('/work/README.md', true)).toEqual([{ argv: ['open', '-R', '/work/README.md'] }, { argv: ['xdg-open', '/work'] }])
   })
 })
 
