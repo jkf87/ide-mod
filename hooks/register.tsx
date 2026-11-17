@@ -676,13 +676,34 @@ async function pngData($: EngineInterface, path: string, key: string) {
 }
 const FILE_CACHE_SIZE = 8
 
-const baseName = (path: string) => path.replace(/\/+$/, '').split('/').pop() || path
-const parentOf = (path: string) => {
-  const cut = path.replace(/\/+$/, '').lastIndexOf('/')
-  return cut <= 0 ? '/' : path.slice(0, cut)
+/** Windows 경로인가: C:\Users\me, C:/Users/me, \\서버\공유. 이런 경로는 \ 와 / 를 둘 다 구분자로 읽는다 */
+export const isWinPath = (path: string) => /^[A-Za-z]:[\\/]|^\\\\/.test(path)
+const trimSeps = (path: string) => path.replace(isWinPath(path) ? /[\\/]+$/ : /\/+$/, '')
+export const baseName = (path: string) => trimSeps(path).split(isWinPath(path) ? /[\\/]/ : '/').pop() || path
+export const parentOf = (path: string) => {
+  const trimmed = trimSeps(path)
+  if (!isWinPath(path)) {
+    const cut = trimmed.lastIndexOf('/')
+    return cut <= 0 ? '/' : path.slice(0, cut)
+  }
+  const cut = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
+  // 드라이브 뿌리(C:\)가 맨 위다: C:\Users 의 위는 C:\, C:\ 의 위는 자기 자신
+  if (cut <= 2) return /^[A-Za-z]:/.test(path) ? `${path.slice(0, 2)}\\` : trimmed
+  return path.slice(0, cut)
 }
-const joinPath = (dir: string, name: string) => (dir.endsWith('/') ? dir + name : `${dir}/${name}`)
-const isInside = (path: string, dir: string) => path === dir || path.startsWith(dir.endsWith('/') ? dir : `${dir}/`)
+/** Windows 경로에는 그 경로가 쓰는 구분자로 붙인다: 엔진이 주는 실제 경로(C:\a\b)와 트리의 경로가 같은 글자가 되어야 탭·펼침이 맞는다 */
+export const joinPath = (dir: string, name: string) => {
+  if (!isWinPath(dir)) return dir.endsWith('/') ? dir + name : `${dir}/${name}`
+  if (/[\\/]$/.test(dir)) return dir + name
+  return dir + (dir.includes('\\') ? '\\' : '/') + name
+}
+/** Windows 경로는 구분자가 섞여도, 대소문자가 달라도 같은 폴더로 본다 */
+export const isInside = (path: string, dir: string) => {
+  if (path === dir) return true
+  if (!isWinPath(dir)) return path.startsWith(dir.endsWith('/') ? dir : `${dir}/`)
+  const flat = (p: string) => trimSeps(p).replace(/[\\/]+/g, '\\').toLowerCase()
+  return flat(path) === flat(dir) || flat(path).startsWith(`${flat(dir)}\\`)
+}
 export const clamp = (n: number, low: number, high: number) => Math.min(Math.max(n, low), Math.max(low, high))
 const formatSize = (bytes: number) =>
   bytes < 1024 ? `${bytes} B`
@@ -721,12 +742,17 @@ export const blockStarts = (lines: string[]) => {
   return starts
 }
 
+/** 홈 폴더: macOS·Linux는 HOME, Windows는 USERPROFILE (PowerShell에서 띄운 Claude Code에는 HOME이 없다) */
+async function homeDir($: EngineInterface) {
+  return (await $.env.get('HOME').catch(() => undefined)) || (await $.env.get('USERPROFILE').catch(() => undefined)) || undefined
+}
+
 /** 입력한 경로(상대, ~, 따옴표, @ 포함)를 실제 절대 경로로 바꾼다 */
 async function resolvePath($: EngineInterface, raw: string): Promise<{ path: string; isDir: boolean } | { error: string }> {
   let target = raw.trim().replace(/^@/, '').replace(/^(['"])(.*)\1$/, '$2')
   if (target === '') target = '.'
-  if (target === '~' || target.startsWith('~/')) {
-    const home = await $.env.get('HOME')
+  if (target === '~' || /^~[\\/]/.test(target)) {
+    const home = await homeDir($)
     if (home === undefined) return { error: '홈 폴더(HOME)를 알 수 없어요.' }
     target = home + target.slice(1)
   }
@@ -805,13 +831,22 @@ async function pressTreeRow($: EngineInterface, row: TreeRow) {
   await openOutside($, row.path)
 }
 
-/** 운영체제 기본 앱으로 연다: 파일은 연결된 앱, 폴더는 Finder(탐색기). reveal이면 Finder에서 그 파일을 골라 보여준다 */
+/**
+ * 바깥 앱으로 여는 명령들: 앞에서부터 해 보고 되는 것을 쓴다.
+ * 탐색기는 /가 섞인 경로를 못 읽고 '문서' 폴더를 열어 버리므로 \ 로 바꿔 넘긴다.
+ * /select, 와 경로는 따로 넘긴다: 한 인자로 붙이면 공백이 든 경로에서 따옴표가 /select, 까지 감싸 탐색기가 못 읽는다.
+ */
+export function openArgvs(path: string, reveal = false): string[][] {
+  if (isWinPath(path)) {
+    const native = path.replace(/\//g, '\\')
+    return [reveal ? ['explorer', '/select,', native] : ['explorer', native]]
+  }
+  return [reveal ? ['open', '-R', path] : ['open', path], ['xdg-open', reveal ? parentOf(path) : path]]
+}
+
+/** 운영체제 기본 앱으로 연다: 파일은 연결된 앱, 폴더는 Finder(탐색기). reveal이면 Finder(탐색기)에서 그 파일을 골라 보여준다 */
 async function openOutside($: EngineInterface, path: string, reveal = false) {
-  const isWindowsPath = /^[A-Za-z]:|\\/.test(path)
-  const tries = isWindowsPath
-    ? [reveal ? ['explorer', `/select,${path}`] : ['explorer', path]]
-    : [reveal ? ['open', '-R', path] : ['open', path], ['xdg-open', reveal ? parentOf(path) : path]]
-  for (const argv of tries) {
+  for (const argv of openArgvs(path, reveal)) {
     const ran = await $.process.run(argv, { timeoutMs: 10_000 }).catch(error => {
       notePress($, `run ${argv.join(' ')} threw ${oneLine(String(error), 200)}`)
       return undefined
@@ -982,7 +1017,7 @@ async function noteScroll($: EngineInterface, e: { by: number; offset: number; b
   $.clock.after(500, () => {
     scrollLogTimer = false
     void (async () => {
-      const home = (await $.env.get('HOME')) ?? ''
+      const home = (await homeDir($)) ?? ''
       if (home !== '') await $.fs.write(`${home}/.cache/ide-mod/scroll.log`, scrollLog.join('\n') + '\n')
     })().catch(() => undefined)
   })
@@ -1063,7 +1098,7 @@ function notePress($: EngineInterface, line: string) {
   $.clock.after(300, () => {
     pressLogTimer = false
     void (async () => {
-      const home = (await $.env.get('HOME')) ?? ''
+      const home = (await homeDir($)) ?? ''
       if (home !== '') await $.fs.write(`${home}/.cache/ide-mod/press.log`, pressLog.join('\n') + '\n')
     })().catch(() => undefined)
   })
@@ -1627,7 +1662,7 @@ async function sessionInfo($: EngineInterface): Promise<SessionInfo> {
   const id = await $.session.id()
   const root = await $.session.root()
   if (sessionInfoCache?.id === id && sessionInfoCache.root === root && sessionInfoCache.transcript !== undefined) return sessionInfoCache
-  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${(await $.env.get('HOME')) ?? ''}/.claude`
+  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${(await homeDir($)) ?? ''}/.claude`
   const projects = `${config}/projects`
   let transcript: string | undefined = `${projects}/${root.replace(/[^a-zA-Z0-9]/g, '-')}/${id}.jsonl`
   if (!(await $.fs.exists(transcript).catch(() => false))) {
@@ -1947,7 +1982,7 @@ async function codexPrompts($: EngineInterface, root: string) {
 }
 
 async function agyPrompts($: EngineInterface, root: string) {
-  const file = `${(await $.env.get('HOME')) ?? ''}/.gemini/antigravity-cli/history.jsonl`
+  const file = `${(await homeDir($)) ?? ''}/.gemini/antigravity-cli/history.jsonl`
   if (!(await $.fs.exists(file).catch(() => false))) return []
   return parseAgyHistory(String(await $.fs.read(file)), root)
 }
@@ -1957,7 +1992,7 @@ export async function loadPastRequests($: EngineInterface) {
   isPastRequested = true
   const id = await $.session.id()
   const root = await $.session.root().catch(() => '')
-  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${(await $.env.get('HOME')) ?? ''}/.claude`
+  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${(await homeDir($)) ?? ''}/.claude`
   const projectDir = `${config}/projects/${root.replace(/[^a-zA-Z0-9]/g, '-')}`
   const keys = (await $.store.keys()).filter(k => k.startsWith(STORE_PREFIX) && k !== `${STORE_PREFIX}${id}`)
   const sessions: { id: string; at: number; items: RequestItem[] }[] = []
@@ -2202,10 +2237,10 @@ async function runRhwp($: EngineInterface, args: string[]): Promise<Record<strin
   }
 }
 
-/** 원본 모양 그대로 보기: PDF는 파일을 그대로, HWP는 지금 쪽 그림을 macOS 미리보기로 연다 */
+/** 원본 모양 그대로 보기: PDF는 파일을 그대로, HWP는 지금 쪽 그림을 기본 앱(macOS는 미리보기)으로 연다 */
 async function openHwpPreview($: EngineInterface, path: string, page: number) {
   if (isPdf(path)) {
-    await $.process.run(['open', path], { timeoutMs: 10_000 }).catch(() => undefined)
+    await openOutside($, path)
     return
   }
   const shot = (await runRhwp($, ['page', path, String(page)])) as HwpPage
@@ -2213,7 +2248,7 @@ async function openHwpPreview($: EngineInterface, path: string, page: number) {
     $.ui.toast(`미리보기를 만들지 못했어요: ${shot.error ?? 'PNG 변환 도구 없음'}`)
     return
   }
-  await $.process.run(['open', shot.pngPath], { timeoutMs: 10_000 }).catch(() => undefined)
+  await openOutside($, shot.pngPath)
 }
 
 /** 편집 창: rhwp 편집기를 이 컴퓨터 안의 서버로 띄워 브라우저 앱 창에 연다. 저장하면 원래 파일에 쓰고, 보기는 수정 시각으로 다시 읽는다 */
@@ -2480,7 +2515,7 @@ async function shareLimits($: EngineInterface) {
   const now = Date.now()
   if (body === lastShared.body && now - lastShared.at < 5 * 60_000) return
   lastShared = { body, at: now }
-  const base = (await $.env.get('XDG_CACHE_HOME')) || `${(await $.env.get('HOME')) ?? ''}/.cache`
+  const base = (await $.env.get('XDG_CACHE_HOME')) || `${(await homeDir($)) ?? ''}/.cache`
   const file = `${base}/ide-mod/limits.json`
   // 세션이 여럿이면 아직 한쪽을 못 받은 세션이 빈 값으로 덮지 않게, 출처마다 받은 것만 고쳐 쓴다
   let old: Record<string, unknown> = {}
@@ -2918,8 +2953,8 @@ async function alertWhere($: EngineInterface): Promise<string> {
   const self = await read($, selfNameAtom).catch(() => '')
   if (self !== '') return self
   const root = await $.session.root().catch(() => '')
-  const home = ((await $.env.get('HOME').catch(() => undefined)) ?? '').replace(/\/+$/, '')
-  if (root === '' || root.replace(/\/+$/, '') === home) return ''
+  const home = trimSeps((await homeDir($)) ?? '')
+  if (root === '' || trimSeps(root) === home) return ''
   return baseName(root)
 }
 
