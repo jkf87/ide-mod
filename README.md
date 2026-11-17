@@ -70,7 +70,7 @@ g: 앱으로 열기  f: 폴더 열기(src)  t: 트리 접기  …
 
 - 단축키는 창(IDE 창)을 한 번 누른 뒤에 먹어요. 입력창에 글을 쓰는 중에는 글자로 들어가요.
 - 트리에서 같은 줄을 1.2초 안에 두 번 눌러도 열려요. 다만 터미널은 빠른 더블클릭을 글자 선택·복사로 가져가서 모드가 받지 못해요. 터미널에서는 단축키가 확실해요.
-- macOS는 `open`, Linux는 `xdg-open`, Windows는 PowerShell `Start-Process`로 탐색기를 열어요(`explorer`를 바로 부르면 Claude Code가 명령을 띄우는 '창 숨김'을 물려받아 창이 보이지 않아요). Windows에서는 경로의 `/`를 `\`로 바꿔 넘기고, 로그와 `~`는 `HOME`이 없으면 `USERPROFILE`을 홈 폴더로 써요.
+- macOS는 `open`, Linux는 `xdg-open`, Windows는 `node`가 탐색기를 띄우고, `node`가 없으면 PowerShell `Start-Process`로 열어요(`explorer`를 바로 부르면 Claude Code가 명령을 띄우는 '창 숨김'을 물려받아 창이 보이지 않아요). 탐색기가 뜨는 몇 초 동안 다시 누른 것은 한 번으로 쳐요. Windows에서는 경로의 `/`를 `\`로 바꿔 넘기고, 로그와 `~`는 `HOME`이 없으면 `USERPROFILE`을 홈 폴더로 써요.
 
 ### 다른 컴퓨터로 핸드오프
 
