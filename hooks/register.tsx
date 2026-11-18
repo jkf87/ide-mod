@@ -1679,6 +1679,81 @@ const requestStatus = (r: RequestItem) => {
   const took = r.endedAt !== undefined ? ` · ${formatElapsed(r.endedAt - r.at)}${r.estimate !== undefined ? ` (예상 ${r.estimate}분)` : ''}` : ''
   return r.status === 'running' ? '진행 중' : r.status === 'done' ? `끝남${took}` : `중단됨${took}`
 }
+// ════════════════ 답변 속 경로·URL 누르기 ════════════════
+// 허더 같은 다중화기가 마우스를 잡으면 터미널의 Cmd+클릭이 안 먹는다.
+// 답변의 파일 경로를 file: 링크로 바꿔 그리고, 링크를 누르면 mod가 연다: 파일·폴더는 IDE 창, URL은 기본 브라우저.
+
+/** 경로로 보이는 글자: 절대 경로(/Users…), 홈(~/…), 또는 /가 들고 확장자로 끝나는 상대 경로. 끝의 :줄(:열)은 허용 */
+const PATH_HEADS = '(?:~|/(?:Users|private|tmp|opt|Library|Applications|Volumes|var|etc|usr|home|mnt|srv))'
+const ABS_PATH = new RegExp(`^${PATH_HEADS}(?:/[^\\s/]+)+/?(?::\\d+(?::\\d+)?)?$`)
+const REL_PATH = /^(?:\.{1,2}\/)?[\w.@-]+(?:\/[\w.@-]+)*\.[A-Za-z0-9]{1,8}(?::\d+(?::\d+)?)?$/
+/** 글 속 맨 경로: 앞이 줄 처음·공백·여는 괄호이고, 한글·닫는 괄호·따옴표·백틱 앞에서 끊는다 */
+const BARE_PATH = new RegExp(`(^|[\\s(（])(${PATH_HEADS}/[^\\s)\\]\`'"<>가-힣ㄱ-ㅎㅏ-ㅣ（）]+)`, 'g')
+
+/** 경로 하나를 file: 링크 주소로. 상대 경로는 cwd 기준, 홈은 home 기준. 끝의 :줄은 #L줄로 */
+export function fileHref(raw: string, cwd: string, home: string): string | undefined {
+  const m = /^(.*?)(?::(\d+)(?::\d+)?)?$/.exec(raw)
+  let path = (m?.[1] ?? raw).replace(/[.,;:!?]+$/, '')
+  const line = m?.[2]
+  if (path === '' ) return undefined
+  if (path === '~' || path.startsWith('~/')) {
+    if (home === '') return undefined
+    path = home.replace(/\/+$/, '') + path.slice(1)
+  } else if (!path.startsWith('/')) {
+    if (cwd === '') return undefined
+    path = `${cwd.replace(/\/+$/, '')}/${path.replace(/^\.\//, '')}`
+  }
+  return `file://${encodeURI(path)}${line !== undefined ? `#L${line}` : ''}`
+}
+
+/** file: 링크 주소를 다시 경로로 (줄 번호는 뺀다) */
+export function pathOfHref(href: string): string | undefined {
+  if (!href.startsWith('file://')) return undefined
+  try { return decodeURI(href.slice('file://'.length).replace(/#.*$/, '')) } catch { return undefined }
+}
+
+const escapeLinkText = (t: string) => t.replace(/([\[\]\\])/g, '\\$1')
+
+/**
+ * 답변 마크다운의 경로를 링크로: 코드 블록(```)과 이미 있는 링크는 그대로 두고,
+ * 경로처럼 보이는 인라인 코드(`…`)와 글 속 맨 절대 경로만 바꾼다. 바뀐 것이 없으면 같은 글을 돌려준다.
+ */
+export function linkifyPaths(text: string, cwd: string, home: string): string {
+  // 코드 블록 · 인라인 코드 · 기존 링크/이미지 · 꺾쇠 자동 링크를 토막으로 떼어 낸다
+  const TOKEN = /(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$))|(`[^`\n]+`)|(!?\[[^\]\n]*\]\([^)\n]*\))|(<[a-z]+:[^>\s]+>)/g
+  let out = ''
+  let last = 0
+  const plain = (seg: string) => seg.replace(BARE_PATH, (all, pre: string, path: string) => {
+    const href = fileHref(path, cwd, home)
+    return href === undefined ? all : `${pre}[${escapeLinkText(path.replace(/[.,;:!?]+$/, ''))}](${href})${path.match(/[.,;:!?]+$/)?.[0] ?? ''}`
+  })
+  for (const m of text.matchAll(TOKEN)) {
+    out += plain(text.slice(last, m.index))
+    const [whole, , code] = m
+    if (code !== undefined) {
+      const inner = code.slice(1, -1).trim()
+      const href = (ABS_PATH.test(inner) || REL_PATH.test(inner)) && !/^https?:/.test(inner) ? fileHref(inner, cwd, home) : undefined
+      out += href === undefined ? whole : `[${escapeLinkText(inner)}](${href})`
+    } else out += whole
+    last = (m.index ?? 0) + whole.length
+  }
+  out += plain(text.slice(last))
+  return out
+}
+
+/** 링크를 눌렀을 때: 파일·폴더는 IDE 창, 웹 주소는 기본 브라우저 */
+async function openPressedLink($: EngineInterface, href: string) {
+  const path = pathOfHref(href)
+  if (path !== undefined) {
+    const found = await resolvePath($, path)
+    if ('error' in found) { $.ui.toast(found.error); return }
+    $.ui.toast(`열어요: ${baseName(found.path) || found.path}`)
+    await openIde($, found.path).catch(() => undefined)
+    return
+  }
+  if (/^https?:\/\//.test(href)) await openOutside($, href)
+}
+
 // ════════════════ 핸드오프 ════════════════
 // 이 세션을 다른 에이전트 세션에 넘긴다: 세션 ID·작업 폴더·대화 기록 경로·이어서 여는 명령·요청 목록을 한 글로
 
@@ -3484,6 +3559,29 @@ export const register: Register = (on, options) => {
     }
     return ran
   }).catch(($, e, next) => next(e))
+
+  // 답변 속 파일 경로·URL: 눌러서 연다 (허더처럼 마우스를 잡는 화면에서도)
+  on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
+    const drawn = await next(e)
+    // 터미널에서만: 데스크톱·모바일은 링크를 제 손으로 잘 연다. 요약 줄은 표시(· summary)를 지키려고 그대로
+    if (e.surface !== 'terminal' || e.props.isSummary === true) return drawn
+    const text = e.props.text
+    if (!/https?:\/\/|`[^`\n]*[/.][^`\n]*`|(?:^|[\s(])(?:~|\/(?:Users|private|tmp|opt|Library|Applications|Volumes|var|etc|usr|home|mnt|srv))\//.test(text)) return drawn
+    const cwd = await $.session.cwd().catch(() => '')
+    const home = (await homeDir($).catch(() => undefined)) ?? ''
+    const linked = linkifyPaths(text, cwd, home)
+    if (linked === text && !/https?:\/\//.test(text)) return drawn
+    // 엔진이 그린 답변은 속을 고칠 수 없는 한 덩어리라, 링크가 있는 답변은 글머리 점까지 직접 그린다
+    const { Box, Text, Markdown } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="row">
+        <Box minWidth={2} flexShrink={0}><Text>{e.props.isFirstOfReply ? '⏺' : ' '}</Text></Box>
+        <Box flexGrow={1} flexDirection="column">
+          <Markdown key={`links:${e.requestId}`} text={linked} onLinkPress={link => { void openPressedLink($, link.href) }} />
+        </Box>
+      </Box>
+    )
+  })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
