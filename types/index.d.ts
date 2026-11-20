@@ -1,35 +1,5 @@
 export type ViewMode = 'code' | 'rendered'
 
-export type AgentPhase = 'running' | 'idle' | 'done' | 'failed'
-
-export type AgentRow = {
-  /** 'main' 또는 서브에이전트 id */
-  id: string
-  /** 이 에이전트를 띄운 에이전트; 메인은 없음 */
-  parentId?: string
-  /** 역할: 메인이면 'main', 아니면 서브에이전트 타입(+팀원 이름) */
-  role: string
-  /** 맡은 작업 한 줄 (Agent 호출의 description, 메인은 사용자 프롬프트) */
-  task: string
-  model: string
-  effort?: string
-  phase: AgentPhase
-  isBackground: boolean
-  isTeammate: boolean
-  /** 지금 하고 있는 일: 마지막 도구 호출 */
-  activity: string
-  /** 최근 도구 호출 몇 개; 요약의 재료 */
-  log: string[]
-  toolCount: number
-  /** 모델이 만든 한 줄 요약, 또는 끝난 에이전트의 답 첫 줄 */
-  recap: string
-  /** 마지막 요약 뒤로 일이 쌓였는지 */
-  isRecapStale: boolean
-  startedAt: number
-  updatedAt: number
-  endedAt?: number
-}
-
 /** 이번 세션에 사람이 보낸 요청 하나 */
 export type SysStat = {
   at: number
@@ -84,6 +54,21 @@ export type SessionPerf = {
   keptRead?: number
   /** 띠의 남은 시간을 다시 그리게 하는 분 단위 시계 */
   minute?: number
+}
+
+/** bin/herdr-panes.mjs list --json 의 패인 하나 */
+export type HerdrPane = {
+  pane_id: string
+  tab_id: string
+  name: string
+  agent: string
+  /** idle | working | done | unknown */
+  status: string
+  cwd: string
+  /** 이 세션이 도는 패인 */
+  self: boolean
+  lastAsk: string
+  lastAnswer: string
 }
 
 export type PeerRow = {
@@ -188,17 +173,25 @@ declare module 'claude-code' {
       /** 트리에서 마지막으로 누른 폴더 (f가 Finder로 여는 곳); 파일을 누르면 비운다 */
       pickedDir: string
 
-      // ── 에이전트 보드 ──
-      agents: Record<string, AgentRow>
-      /** 경과 시간을 다시 그리게 하는 시계 */
+      // ── 이 세션 ──
+      /** 예상 소요시간·자막의 경과 시간을 다시 그리게 하는 시계 (메인이 일하는 동안 5초마다) */
       tick: number
-      isBoardFolded: boolean
-      hideDone: boolean
-      isRecapOn: boolean
+      /** 입력창 위 띠 맨 아래 핸드오프 줄(대화 기록 주소 + 복사)을 그릴지 (/ide addr on|off) */
+      isHandoffLineOn: boolean
+
+      // ── 허더 세션 (/panes) ──
+      /** 받은 패인 목록과 그때 범위(all이면 모든 탭), 받은 시각, 못 받은 이유 */
+      panes: { list: HerdrPane[]; isAll: boolean; at: number; error?: string; isLoading?: boolean }
+      /** 닫으려고 고른 패인 ID들 */
+      panesPicked: string[]
+      /** [고른 것 닫기]를 한 번 누른 시각 (5초 안에 한 번 더 누르면 닫는다); null이면 아님 */
+      panesArmedAt: number | null
+      /** 마지막 닫기 결과 줄들 */
+      panesResult: string[]
 
       // ── 요청 기록 ──
       /** 왼쪽 칸: 파일 트리 또는 요청 기록 */
-      leftMode: 'files' | 'requests' | 'handoff'
+      leftMode: 'files' | 'requests' | 'handoff' | 'panes'
       requests: RequestItem[]
       /** 같은 폴더에서 연 지난 세션들의 요청 (오래된 것부터, n은 음수) */
       pastRequests: RequestItem[]
@@ -211,8 +204,8 @@ declare module 'claude-code' {
       requestScope: 'all' | 'session'
 
       // ── 알림 소리 ──
-      /** sound 끝남·부름 소리, voice 소리 + 30초 넘은 턴은 걸린 시간 읽기, off 끔 */
-      alert: 'sound' | 'voice' | 'off'
+      /** voice 이 세션이 끝나면 소리 + "세션 이름. 답 요약" 읽기(30초 넘은 턴), sound 이 PC 세션이 전부 끝났을 때만 소리, off 끔 */
+      alert: 'voice' | 'sound' | 'off'
       /** 메인 에이전트가 백그라운드로 돌려 둔 명령·워크플로 (작업 ID → 시작 시각); 남아 있으면 "끝남" 소리를 미룬다 */
       bgWork: Record<string, number>
 

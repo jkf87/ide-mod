@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { baseName, isInside, isWinPath, joinPath, openCommands, parentOf, alertLines, herdrNameOf, fileHref, linkifyPaths, pathOfHref, backgroundTaskId, endedTaskIds, parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, describeCall, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortModel, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
+import { answerGist, donePaneIds, isRevealHref, middleCut, tildePath, baseName, isInside, isWinPath, joinPath, openCommands, parentOf, alertLines, herdrNameOf, fileHref, linkifyPaths, pathOfHref, backgroundTaskId, endedTaskIds, parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
 import { artifactUrlOf, gitInfoFrom, gitNotes, handoffFromText, handoffPage, receivePrompt, redactSecrets, savedPathOf, shareDoc, webUrlOf } from '../hooks/share'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
@@ -33,7 +33,7 @@ const real = (p: string) => {
   return abs
 }
 
-type World = { opened: number; statuses: (string | undefined)[]; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined; taskSeq?: number; contexts: string[]; listing?: string; bgBash?: string; store: Map<string, unknown>; written: Map<string, string> }
+type World = { herdrPane?: string; noTranscript?: boolean; opened: number; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined; taskSeq?: number; contexts: string[]; listing?: string; bgBash?: string; store: Map<string, unknown>; written: Map<string, string> }
 
 const LISTING = `This session is 모드에 대해 [634505] — the name other sessions use to message it.
 
@@ -44,9 +44,9 @@ Peer sessions (2):
 const IDLE_LISTING = LISTING.replace('·  busy  ·', '·  idle  ·')
 
 function fakeWorld(on: On): World {
-  const world: World = { opened: 0, statuses: [], rhwpCalls: [], scripts: [], sent: [], copied: [], contexts: [], store: new Map(), written: new Map() }
+  const world: World = { opened: 0, rhwpCalls: [], scripts: [], sent: [], copied: [], contexts: [], store: new Map(), written: new Map() }
   on('session.cwd', () => ({ value: ROOT }))
-  on('env.get', () => ({ value: '/home/me' }))
+  on('env.get', ($, e) => ({ value: e.name === 'HERDR_PANE_ID' ? world.herdrPane : '/home/me' }))
   on('fs.stat', ($, e) => {
     const abs = norm(e.path)
     const target = real(e.path)
@@ -78,10 +78,6 @@ function fakeWorld(on: On): World {
     world.opened += 1
     return { value: { isPlaced: true as const } }
   })
-  on('ui.status', ($, e) => {
-    world.statuses.push((e as unknown as { text?: string }).text)
-    return { value: undefined } as never
-  })
   on('tool.call', ($, e) => {
     if (String(e.tool) === 'ListAgents') return { result: { listing: world.listing ?? LISTING } } as never
     if (String(e.tool) === 'Bash' && world.bgBash !== undefined) return { result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: world.bgBash } } as never
@@ -89,7 +85,7 @@ function fakeWorld(on: On): World {
     return String(e.tool) === 'Write' && (e as unknown as { content?: string }).content === 'DENY' ? { deny: 'no' } : ({ result: 'ok' } as never)
   })
   on('session.root', () => ({ value: ROOT }))
-  on('fs.exists', ($, e) => ({ value: e.path === `/home/me/projects/${ROOT.replace(/[^a-zA-Z0-9]/g, '-')}/test-session.jsonl` }))
+  on('fs.exists', ($, e) => ({ value: world.noTranscript !== true && e.path === `/home/me/projects/${ROOT.replace(/[^a-zA-Z0-9]/g, '-')}/test-session.jsonl` }))
   on('session.send', ($, e) => {
     world.sent.push({ to: e.to, text: e.text })
     return { isDelivered: true as const }
@@ -182,22 +178,6 @@ const spawn = (id: string, description: string, subagentType: string) => ({
 })
 
 describe('순수 함수', () => {
-  test('모델 이름을 짧게 줄인다 (Bedrock·Vertex 표기 포함)', () => {
-    expect(shortModel('claude-opus-5-5[1m]')).toBe('opus 5.5 1M')
-    expect(shortModel('claude-haiku-4-5-20251001')).toBe('haiku 4.5')
-    expect(shortModel('claude-fable-5-1')).toBe('fable 5.1')
-    expect(shortModel('us.anthropic.claude-sonnet-4-5-20250929-v1:0')).toBe('sonnet 4.5')
-    expect(shortModel('claude-sonnet-4-5@20250929')).toBe('sonnet 4.5')
-    expect(shortModel('claude-3-5-haiku-20241022')).toBe('haiku 3.5')
-    expect(shortModel('gpt-x')).toBe('gpt-x')
-  })
-
-  test('도구 호출을 한 줄 활동으로 바꾼다', () => {
-    expect(describeCall('Bash', { command: 'ls -la', description: '파일 목록' })).toBe('Bash  파일 목록')
-    expect(describeCall('Agent', { subagent_type: 'Explore', description: '인증 코드 찾기' })).toBe('Agent → Explore: 인증 코드 찾기')
-    expect(describeCall('mcp__stitch__stitch_get', {})).toBe('stitch_get')
-  })
-
   test('풀어 쓴(NFD) 한글 이름도 칸 수대로 자른다', () => {
     const nfd = '스크린샷'.normalize('NFD')
     expect(fit(nfd, 8)).toBe('스크린샷')
@@ -336,8 +316,8 @@ describe('탐색기', () => {
     const code = await ui.find({ type: 'Code' })
     expect(code?.props.startLine).toBe(1)
     const shown = String(code?.props.source).split('\n').length
-    // 보드(시스템 줄 1 + 머리줄 1 + 빈 보드 안내 1) · 구분선 1 · 툴바 1 · 탭 1 · 파일 정보 1을 뺀 행
-    expect(shown).toBe(30 - 3 - 1 - 1 - 2)
+    // 보드(시스템 줄 1 + 이 세션 줄 1) · 구분선 1 · 툴바 1 · 탭 1 · 파일 정보 1을 뺀 행
+    expect(shown).toBe(30 - 2 - 1 - 1 - 2)
     await ui.unmount()
   })
 
@@ -368,88 +348,6 @@ describe('탐색기', () => {
     fakeWorld(on)
     const ran = await $.command.run(typed('open', 'nope.txt'))
     expect(ran.text).toContain('찾을 수 없어요')
-  })
-})
-
-describe('에이전트 보드', () => {
-  test('보드가 IDE 맨 위에 메인과 서브에이전트를 트리로 그린다', async ($, on) => {
-    const world = fakeWorld(on)
-    on('agent.spawn', () => ({ model: 'claude-haiku-4-5-20251001', agentId: 'sub-1' }))
-    await $.command.run(typed('ide', ''))
-    await ask($, '로그인 버그 고쳐줘', 't1')
-    await $.agent.spawn(spawn('sub-1', '인증 코드 찾기', 'Explore'))
-    await $.tool.call({ tool: 'Grep', pattern: 'login', agentId: 'sub-1' } as never)
-
-    for (const surface of ['terminal', 'desktop'] as const) {
-      const ui = await $.ui.mount({ ...PANE, surface, props: props(140) })
-      const all = await ui.findAll({ type: 'Text' })
-      const text = textOf(all)
-      expect(text).toContain('메인')
-      expect(text).toContain('로그인 버그 고쳐줘')
-      expect(text).toContain('└─ ')
-      expect(text).toContain('Explore')
-      expect(text).toContain('haiku 4.5')
-      expect(text).toMatch(/지금 Grep\s+login/)
-      // 보드가 탐색기보다 위에 있다
-      expect(text.indexOf('메인')).toBeLessThan(text.indexOf('열린 파일 없음'))
-      await ui.unmount()
-    }
-    expect(world.statuses.some(s => s?.includes('서브에이전트 1개'))).toBe(true)
-    // 색: 맡긴 일(사람의 프롬프트·서브에이전트 작업 설명)은 초록, 돌고 있는 에이전트의 지금 하는 일은 노랑
-    const colored = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
-    const texts = await colored.findAll({ type: 'Text' })
-    expect(texts.find(x => x.text.includes('로그인 버그 고쳐줘') && x.props.color === 'success')).toBeDefined()
-    expect(texts.find(x => x.text.includes('Grep') && x.props.color === 'warning')).toBeDefined()
-    // 서브에이전트에게 맡긴 작업 설명도 초록
-    expect(texts.find(x => x.text.includes('인증 코드 찾기') && x.props.color === 'success')).toBeDefined()
-    await colored.unmount()
-
-    await $.turn.complete({ answer: '## 찾았다\nlogin.ts 42행', durationMs: 1200, isAborted: false, turnId: 't2', agentId: 'sub-1', reason: 'answer' } as never)
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
-    const text = textOf(await ui.findAll({ type: 'Text' }))
-    expect(text).toContain('✓')
-    expect(text).toContain('찾았다')
-    await ui.unmount()
-  })
-
-  test('오류로 끝난 서브에이전트는 실패로 표시한다', async ($, on) => {
-    fakeWorld(on)
-    on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'sub-err' }))
-    await ask($, '작업', 't1')
-    await $.agent.spawn(spawn('sub-err', '깨질 작업', 'general-purpose'))
-    await $.turn.complete({ answer: '', durationMs: 10, isAborted: false, turnId: 't3', agentId: 'sub-err', reason: 'error' } as never)
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
-    const text = textOf(await ui.findAll({ type: 'Text' }))
-    expect(text).toContain('✗')
-    expect(text).toContain('실패')
-    await ui.unmount()
-  })
-
-  test('spawn 없이 온 내부 포크는 보드에 줄을 만들지 않는다', async ($, on) => {
-    fakeWorld(on)
-    await ask($, '작업', 't1')
-    await $.tool.call({ tool: 'Read', file_path: '/work/README.md', agentId: 'compaction-fork' } as never)
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
-    const text = textOf(await ui.findAll({ type: 'Text' }))
-    expect(text).toContain('서브 0개 작업 중')
-    await ui.unmount()
-  })
-
-  test('끝난 것을 숨겨도 돌고 있는 손자 에이전트는 남는다', async ($, on) => {
-    fakeWorld(on)
-    let n = 0
-    on('agent.spawn', () => ({ model: 'claude-haiku-4-5-20251001', agentId: n++ === 0 ? 'parent' : 'child' }))
-    await ask($, '작업', 't1')
-    await $.agent.spawn(spawn('parent', '부모 작업', 'Plan'))
-    await $.agent.spawn({ ...spawn('child', '손자 작업', 'Explore'), parentAgentId: 'parent' })
-    await $.turn.complete({ answer: '부모 끝', durationMs: 10, isAborted: false, turnId: 't4', agentId: 'parent', reason: 'answer' } as never)
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
-    await ui.press({ key: 'board-hide' })
-    const text = textOf(await ui.findAll({ type: 'Text' }))
-    expect(text).toContain('손자 작업')
-    await ui.press({ key: 'board-fold' })
-    expect(textOf(await ui.findAll({ type: 'Text' }))).not.toContain('손자 작업')
-    await ui.unmount()
   })
 })
 
@@ -1003,23 +901,21 @@ describe('세션 시작 때 열기', () => {
 })
 
 describe('데스크톱 앱', () => {
-  test('isInteractive가 false로 와도(데스크톱·SDK) 보드가 그려지면 요약 타이머가 돈다', async ($, on) => {
-    fakeWorld(on)
+  test('isInteractive가 false로 와도(데스크톱·SDK) 창이 그려지면 타이머가 돈다', async ($, on) => {
+    const world = fakeWorld(on)
     const clock = mock.clock(on)
-    const asked: string[] = []
-    on('model.complete', ($, e) => {
-      asked.push(String((e as unknown as { prompt: string }).prompt))
-      return { value: { isAnswered: true, text: '로그인 코드를 읽는 중' } } as never
-    })
-    // 데스크톱 앱은 session.start에 isInteractive: false를 준다 → 그때는 타이머를 걸지 않고, 보드를 처음 그릴 때 건다
+    const runs = () => world.rhwpCalls.length + world.scripts.length
+    let sysReads = 0
+    world.extraRuns = argv => (argv[0] === '/bin/sh' ? (sysReads++, undefined) : undefined)
+    // 데스크톱 앱은 session.start에 isInteractive: false를 준다 → 그때는 타이머를 걸지 않고, 창을 처음 그릴 때 건다
     await ask($, '로그인 버그 고쳐줘', 't1')
-    await $.tool.call({ tool: 'Read', file_path: '/work/src/app.ts' } as never)
     await clock.advance(25_000)
-    expect(asked).toEqual([])
+    expect(sysReads).toBe(0)
     await $.command.run(typed('ide', ''))
     const ui = await $.ui.mount({ ...PANE, surface: 'desktop', props: props(140) })
     await clock.advance(25_000)
-    expect(asked.length).toBe(1)
+    expect(sysReads).toBeGreaterThan(1)
+    expect(runs()).toBe(0)
     await ui.unmount()
   })
 })
@@ -1078,9 +974,12 @@ describe('작업 진행', () => {
     await ui.unmount()
   })
 
-  test('턴이 끝나면 끝남 소리, 권한을 물으면 부름 소리, d로 소리→읽기→끔', async ($, on) => {
+  test('기본은 이 세션이 끝나면 바로 "세션 이름. 답 요약"을 읽고, d로 읽기→전부 끝나면 소리→끔', async ($, on) => {
     const world = fakeWorld(on)
-    world.listing = IDLE_LISTING
+    // v0.24까지의 저장값(alert: sound)은 읽지 않는다: 새 기본값 voice가 한 번 적용된다
+    world.store.set('alert', 'sound')
+    // 다른 세션이 일하는 중이어도 voice는 기다리지 않는다
+    world.listing = LISTING
     const clock = mock.clock(on)
     const played: string[] = []
     const spoken: string[] = []
@@ -1100,11 +999,11 @@ describe('작업 진행', () => {
     on('tool.check', ($, e) => ({ decision: String(e.tool) === 'Bash' ? 'ask' : 'allow' }) as never)
     on('classic.PermissionRequest', () => ({}) as never)
     await ask($, '고쳐줘', 't1')
-    await $.turn.complete({ answer: '고쳤어요', durationMs: 45_000, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+    await $.turn.complete({ answer: '⏱ 예상 3분\n\n## 결과\n**로그인 버그를 고쳤어요.** 테스트도 통과했어요.', durationMs: 45_000, isAborted: false, turnId: 't1', reason: 'answer' } as never)
     expect(played).toEqual(['sounds/done.wav'])
-    expect(spoken).toEqual([])
-    // 어느 세션인지: 배너 제목에 세션 이름, 본문에 요청
-    expect(banners.at(-1)).toEqual({ text: '고쳐줘 · 45초', title: '모드에 대해 · 끝났어요' })
+    expect(spoken).toEqual(['모드에 대해. 로그인 버그를 고쳤어요.'])
+    // 배너도 같은 이름·요약
+    expect(banners.at(-1)).toEqual({ text: '로그인 버그를 고쳤어요. · 45초', title: '모드에 대해 · 끝났어요' })
     // 멈춘 턴은 소리 없음
     await ask($, '또', 't2')
     await $.turn.complete({ answer: '', durationMs: 45_000, isAborted: true, turnId: 't2', reason: 'answer' } as never)
@@ -1112,30 +1011,44 @@ describe('작업 진행', () => {
     // 판정이 ask여도 자동 모드·권한 건너뛰기가 사람 없이 답할 수 있으니 아직 소리 없음
     await $.tool.check({ tool: 'Bash', input: { command: 'rm -rf x' }, tool_use_id: 'u1', approver: 'person' } as never)
     expect(played).toEqual(['sounds/done.wav'])
-    // 사람에게 권한 창을 실제로 띄울 때 부름 소리
+    // 사람에게 권한 창을 실제로 띄울 때 부름 소리 + "이름. 확인이 필요해요"
     await $.classic.PermissionRequest({ hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: {}, session_id: 's', transcript_path: '', cwd: '/work' } as never)
     expect(played).toEqual(['sounds/done.wav', 'sounds/ask.wav'])
     expect(banners.at(-1)?.title).toBe('모드에 대해 · 확인을 기다려요')
-    // /rename 으로 이름을 바꾸면 다음 끝남부터 새 이름으로 부른다 (끝날 때마다 세션 목록을 다시 받는다)
+    expect(spoken.at(-1)).toBe('모드에 대해. 확인이 필요해요')
+    // /rename 으로 이름을 바꾸면 다음 끝남부터 새 이름으로 부른다. 30초 안에 끝난 턴은 읽지 않는다
     world.listing = IDLE_LISTING.replace('This session is 모드에 대해', 'This session is 쇼츠제작')
+    await clock.advance(31_000)
+    spoken.length = 0
     await ask($, '이름 바꾼 뒤', 't5')
     await $.turn.complete({ answer: '됐어요', durationMs: 3_000, isAborted: false, turnId: 't5', reason: 'answer' } as never)
     expect(banners.at(-1)?.title).toBe('쇼츠제작 · 끝났어요')
+    expect(spoken).toEqual([])
     world.listing = IDLE_LISTING
     await clock.advance(31_000)
-    // 버튼으로 소리+읽기 → 30초 넘은 턴은 걸린 시간을 읽는다
+    // 버튼: 이름·요약 읽기 → 전부 끝나면 소리 (읽지 않는다)
     await $.command.run(typed('open', '/work'))
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140, 40) })
-    expect((await ui.find({ key: 'board-alert' }))?.props.label).toBe('알림 소리')
+    expect((await ui.find({ key: 'board-alert' }))?.props.label).toBe('알림: 이름·요약 읽기')
     await ui.press({ key: 'board-alert' })
-    expect((await ui.find({ key: 'board-alert' }))?.props.label).toBe('알림 소리+읽기')
-    expect(world.store.get('alert')).toBe('voice')
+    expect((await ui.find({ key: 'board-alert' }))?.props.label).toBe('알림: 전부 끝나면 소리')
+    expect(world.store.get('alert2')).toBe('sound')
     spoken.length = 0
     await ask($, '하나 더', 't3')
     await $.turn.complete({ answer: '됐어요', durationMs: 135_000, isAborted: false, turnId: 't3', reason: 'answer' } as never)
-    expect(spoken).toEqual(['모드에 대해, 끝났어요. 2분 15초 걸렸어요.'])
+    expect(played.at(-1)).toBe('sounds/done.wav')
+    expect(spoken).toEqual([])
+    expect(banners.at(-1)).toEqual({ text: '하나 더 · 2분 15초', title: '모드에 대해 · 끝났어요' })
+    // 소리 모드는 다른 세션이 일하면 조용하다
+    world.listing = LISTING
+    const beforeBusy = played.length
+    await ask($, '바쁠 때', 't6')
+    await $.turn.complete({ answer: '끝', durationMs: 5_000, isAborted: false, turnId: 't6', reason: 'answer' } as never)
+    expect(played.length).toBe(beforeBusy)
+    world.listing = IDLE_LISTING
+    await clock.advance(9_000)
     await ui.press({ key: 'board-alert' })
-    expect(world.store.get('alert')).toBe('off')
+    expect(world.store.get('alert2')).toBe('off')
     const before = played.length
     await ask($, '마지막', 't4')
     await $.turn.complete({ answer: '끝', durationMs: 5_000, isAborted: false, turnId: 't4', reason: 'answer' } as never)
@@ -1230,8 +1143,9 @@ describe('작업 진행', () => {
     expect(played).toEqual(['sounds/done.wav'])
   })
 
-  test('다른 세션이 아직 일하면 끝남 소리를 내지 않고, 잠시 뒤 다 끝났으면 운다', async ($, on) => {
+  test('전부 끝나면 소리(sound): 다른 세션이 아직 일하면 끝남 소리를 내지 않고, 잠시 뒤 다 끝났으면 운다', async ($, on) => {
     const world = fakeWorld(on)
+    world.store.set('alert2', 'sound')
     const clock = mock.clock(on)
     const played: string[] = []
     on('audio.play', ($, e) => {
@@ -1272,16 +1186,31 @@ describe('작업 진행', () => {
     expect(endedTaskIds('<task-notification><task-id>a</task-id><status>completed</status></task-notification><task-notification><task-id>b</task-id><status>running</status></task-notification>')).toEqual(['a'])
   })
 
-  test('알림 문구: 세션 이름이 없으면 요청 앞부분으로 부른다', () => {
-    expect(alertLines('done', '', '로그인 버그 고쳐줘', 75_000)).toEqual({ title: 'Claude · 끝났어요', body: '로그인 버그 고쳐줘 · 1분 15초', spoken: '로그인 버그 고쳐줘, 끝났어요. 1분 15초 걸렸어요.' })
-    expect(alertLines('ask', 'ide-mod', '')).toEqual({ title: 'ide-mod · 확인을 기다려요', body: '', spoken: 'ide-mod, 확인이 필요해요.' })
+  test('알림 문구: "세션 이름. 요약", 부름은 "세션 이름. 확인이 필요해요"', () => {
+    expect(alertLines('done', '충남대과제', '보고서 초안을 다 썼어요.', 75_000)).toEqual({ title: '충남대과제 · 끝났어요', body: '보고서 초안을 다 썼어요. · 1분 15초', spoken: '충남대과제. 보고서 초안을 다 썼어요.' })
+    expect(alertLines('done', '', '로그인 버그 고쳐줘', 75_000)).toEqual({ title: 'Claude · 끝났어요', body: '로그인 버그 고쳐줘 · 1분 15초', spoken: '로그인 버그 고쳐줘' })
+    expect(alertLines('done', 'ide-mod', '').spoken).toBe('ide-mod. 끝났어요')
+    expect(alertLines('ask', 'ide-mod', '')).toEqual({ title: 'ide-mod · 확인을 기다려요', body: '', spoken: 'ide-mod. 확인이 필요해요' })
+  })
+
+  test('답 요약: 첫 뜻 있는 문장 (예상 줄·제목·코드 블록·표는 건너뛰고 마크다운을 벗겨 60자)', () => {
+    expect(answerGist('⏱ 예상 3분\n\n## 결과\n**다 고쳤어요.** 테스트도 통과했어요.')).toBe('다 고쳤어요.')
+    expect(answerGist('```ts\nconst a = 1\n```\n| a | b |\n|---|---|\n- [README](README.md)를 `고쳤어요`')).toBe('README를 고쳤어요')
+    expect(answerGist('> **⏱ 예상 1분**\n---\n1. 첫째 할 일은 v0.25.0 올리기예요. 둘째는')).toBe('첫째 할 일은 v0.25.0 올리기예요.')
+    expect(answerGist('가'.repeat(80))).toBe('가'.repeat(60))
+    expect(answerGist('```\n코드만\n```')).toBe('')
+    expect(answerGist('')).toBe('')
   })
 
   test('답변 속 경로를 누를 수 있는 file: 링크로', () => {
     const cwd = '/work', home = '/Users/me'
-    expect(linkifyPaths('`hooks/register.tsx:12` 를 고쳤어요', cwd, home)).toBe('[hooks/register.tsx:12](file:///work/hooks/register.tsx#L12) 를 고쳤어요')
-    expect(linkifyPaths('파일은 ~/ide-mod/README.md에 있어요.', cwd, home)).toBe('파일은 [~/ide-mod/README.md](file:///Users/me/ide-mod/README.md)에 있어요.')
-    expect(linkifyPaths('로그: /Library/Logs/a b.panic', cwd, home)).toBe('로그: [/Library/Logs/a](file:///Library/Logs/a) b.panic')
+    // 경로마다 링크 둘: 경로(실행) + 바로 뒤 📂(폴더에서 보이기)
+    expect(linkifyPaths('`hooks/register.tsx:12` 를 고쳤어요', cwd, home)).toBe('[hooks/register.tsx:12](file:///work/hooks/register.tsx#L12) [📂](file:///work/hooks/register.tsx#reveal) 를 고쳤어요')
+    expect(linkifyPaths('파일은 ~/ide-mod/README.md에 있어요.', cwd, home)).toBe('파일은 [~/ide-mod/README.md](file:///Users/me/ide-mod/README.md) [📂](file:///Users/me/ide-mod/README.md#reveal)에 있어요.')
+    expect(linkifyPaths('로그: /Library/Logs/a b.panic', cwd, home)).toBe('로그: [/Library/Logs/a](file:///Library/Logs/a) [📂](file:///Library/Logs/a#reveal) b.panic')
+    expect(isRevealHref('file:///Users/me/a.md#reveal')).toBe(true)
+    expect(isRevealHref('file:///Users/me/a.md#L3')).toBe(false)
+    expect(pathOfHref('file:///Users/me/a.md#reveal')).toBe('/Users/me/a.md')
     // 코드 블록·기존 링크·경로 아닌 인라인 코드·URL은 그대로
     expect(linkifyPaths('```\n/Users/me/x.ts\n```', cwd, home)).toBe('```\n/Users/me/x.ts\n```')
     expect(linkifyPaths('[문서](https://x.dev/a.md) `npm test` `https://x.dev/a.md`', cwd, home)).toBe('[문서](https://x.dev/a.md) `npm test` `https://x.dev/a.md`')
@@ -1301,6 +1230,30 @@ describe('작업 진행', () => {
     await ui.press({ key: 'links:m1', link: { href: 'file:///work/src/app.ts' } })
     const pane = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
     expect((await pane.find({ type: 'Code' }))?.props.source).toBe('export const answer = 42')
+  })
+
+  test('허더 안에서는 경로를 누르면 기본 앱으로, 📂는 늘 Finder에서 골라 보인다 (/ide links로 바꾼다)', async ($, on) => {
+    const world = fakeWorld(on)
+    world.herdrPane = 'w2:p3'
+    const opened: string[] = []
+    world.extraRuns = argv => (argv[0] === 'open' ? (opened.push(argv.slice(1).join(' ')), '') : undefined)
+    const ui = await $.ui.mount({ plugin: 'ide-mod', component: 'AssistantMessage', requestId: 'm2', surface: 'terminal', props: { text: '`src/app.ts` 와 /work/src 를 봤어요', isFirstOfReply: true } as never })
+    expect(String((await ui.find({ key: 'links:m2' }))?.props.text)).toContain('[📂](file:///work/src/app.ts#reveal)')
+    await ui.press({ key: 'links:m2', link: { href: 'file:///work/src/app.ts' } })
+    await ui.press({ key: 'links:m2', link: { href: 'file:///work/src/app.ts#reveal' } })
+    await ui.press({ key: 'links:m2', link: { href: 'file:///work/src#reveal' } })
+    expect(opened).toEqual(['/work/src/app.ts', '-R /work/src/app.ts', '/work/src'])
+    // IDE 창으로 바꾸면 경로는 IDE 창에서, 📂는 그대로 Finder
+    expect(JSON.stringify(await $.command.run(typed('ide', 'links')))).toContain('설정 auto')
+    expect(JSON.stringify(await $.command.run(typed('ide', 'links ide')))).toContain('IDE 창에서')
+    expect(world.store.get('linkOpen')).toBe('ide')
+    expect(JSON.stringify(await $.command.run(typed('ide', 'links nope')))).toContain('쓰는 법')
+    await ui.press({ key: 'links:m2', link: { href: 'file:///work/src/app.ts' } })
+    expect(opened.length).toBe(3)
+    const pane = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    expect((await pane.find({ type: 'Code' }))?.props.source).toBe('export const answer = 42')
+    await ui.unmount()
+    await pane.unmount()
   })
 
   test('허더 이름: 패널 이름 → 패널 하나뿐인 탭 이름', () => {
@@ -1418,6 +1371,137 @@ describe('강의 모드·문체 게이트', () => {
     await $.command.run(typed('lecture', 'off'))
     const ui = await $.ui.mount({ ...BAND, surface: 'terminal', props: bandProps })
     expect(textOf(await ui.findAll({ type: 'Text' }))).not.toContain('▶')
+    await ui.unmount()
+  })
+})
+
+describe('핸드오프 줄 (띠 맨 아래)', () => {
+  test('대화 기록 주소를 ~로 줄여 보이고, 주소·글을 복사하고, /ide addr off로 끈다', async ($, on) => {
+    const world = fakeWorld(on)
+    await ask($, '로그인 고쳐줘', 't1')
+    const band = await $.ui.mount({ ...BAND, surface: 'terminal', props: { ...bandProps, isCollapsed: false } })
+    const line = textOf(await band.findAll({ type: 'Text' }))
+    expect(line).toContain('핸드오프')
+    expect(line).toContain('~/projects/-work/test-session.jsonl')
+    await band.press({ key: 'handoff-line-addr' })
+    expect(world.copied.at(-1)).toBe('/home/me/projects/-work/test-session.jsonl')
+    await band.press({ key: 'handoff-line-note' })
+    expect(world.copied.at(-1)).toContain('[핸드오프]')
+    expect(world.copied.at(-1)).toContain('로그인 고쳐줘')
+    expect(JSON.stringify(await $.command.run(typed('ide', 'addr off')))).toContain('꺼짐')
+    expect(world.store.get('handoffLine')).toBe(false)
+    expect(await band.find({ key: 'handoff-line-addr' })).toBeUndefined()
+    expect(JSON.stringify(await $.command.run(typed('ide', 'addr on')))).toContain('켜짐')
+    expect(await band.find({ key: 'handoff-line-addr' })).toBeDefined()
+    await band.unmount()
+  })
+
+  test('기록 파일이 아직 없으면 그 줄을 그리지 않는다', async ($, on) => {
+    const world = fakeWorld(on)
+    world.noTranscript = true
+    const band = await $.ui.mount({ ...BAND, surface: 'terminal', props: { ...bandProps, isCollapsed: false } })
+    expect(await band.find({ key: 'handoff-line-addr' })).toBeUndefined()
+    await band.unmount()
+  })
+
+  test('폭이 모자라면 가운데를 줄인다', () => {
+    expect(tildePath('/Users/me/.claude/projects/x/a.jsonl', '/Users/me')).toBe('~/.claude/projects/x/a.jsonl')
+    expect(tildePath('/Users/meow/a', '/Users/me')).toBe('/Users/meow/a')
+    expect(middleCut('짧은 글', 20)).toBe('짧은 글')
+    const cut = middleCut('~/.claude/projects/-Users-me-ide-mod/4f0e1c2a-aaaa-bbbb.jsonl', 30)
+    expect(cut.length).toBe(30)
+    expect(cut.startsWith('~/.claude/')).toBe(true)
+    expect(cut.endsWith('-bbbb.jsonl')).toBe(true)
+    expect(cut).toContain('…')
+  })
+})
+
+describe('허더 세션 (/panes)', () => {
+  const PANES = [
+    { pane_id: 'w2:p4', tab_id: 'w2:t2', name: 'ide-mod', agent: 'claude', status: 'working', cwd: '/work', self: true, lastAsk: '지시서 수행', lastAnswer: '' },
+    { pane_id: 'w2:p1', tab_id: 'w2:t2', name: '보고서', agent: 'claude', status: 'done', cwd: '/work', self: false, lastAsk: '초안 써 줘', lastAnswer: '초안을 다 썼어요.' },
+    { pane_id: 'w2:p2', tab_id: 'w2:t2', name: 'codex', agent: 'codex', status: 'idle', cwd: '/work', self: false, lastAsk: '', lastAnswer: '> ' },
+    { pane_id: 'w2:p3', tab_id: 'w2:t2', name: '빌드', agent: 'claude', status: 'working', cwd: '/work', self: false, lastAsk: '빌드해 줘', lastAnswer: '' },
+  ]
+
+  test('끝난 것 고르기는 done·idle만, 닫기는 두 번 눌러야 하고 5초 뒤 풀린다', async ($, on) => {
+    const world = fakeWorld(on)
+    const clock = mock.clock(on)
+    expect(JSON.stringify(await $.command.run(typed('panes', '')))).toContain('허더 안에서만 써요')
+    world.herdrPane = 'w2:p4'
+    let list = [...PANES]
+    const calls: string[] = []
+    world.extraRuns = argv => {
+      if (!String(argv[1]).endsWith('herdr-panes.mjs')) return undefined
+      calls.push(argv.slice(2).join(' '))
+      if (argv[2] === 'list') return JSON.stringify({ panes: list })
+      list = list.filter(p => !argv.includes(p.pane_id))
+      return argv.slice(3).map(id => `닫음 ${id} (${PANES.find(p => p.pane_id === id)?.name})`).join('\n')
+    }
+    expect(JSON.stringify(await $.command.run(typed('panes', '')))).toContain('허더 세션 4개')
+    expect(calls).toEqual(['list --json'])
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    const text = textOf(await ui.findAll({ type: 'Text' }))
+    expect(text).toContain('보고서')
+    expect(text).toContain('초안 써 줘 / 초안을 다 썼어요.')
+    expect(text).toContain('일하는 중 2 · 끝남 1 · 쉼 1')
+    // 나는 고를 수 없다
+    expect(await ui.find({ key: 'pane:w2:p4' })).toBeUndefined()
+    const label = async () => (await ui.find({ key: 'panes-close' }))?.props.label
+    expect(await label()).toBe('고른 것 닫기 (0)')
+    await ui.press({ key: 'panes-pick-done' })
+    expect(await label()).toBe('고른 것 닫기 (2)')
+    expect((await ui.find({ key: 'pane:w2:p1' }))?.props.label).toBe('[x]')
+    expect((await ui.find({ key: 'pane:w2:p3' }))?.props.label).toBe('[ ]')
+    await ui.press({ key: 'pane:w2:p2' })
+    expect(await label()).toBe('고른 것 닫기 (1)')
+    // 첫 누름은 확인만, 5초 지나면 풀린다
+    await ui.press({ key: 'panes-close' })
+    expect(await label()).toBe('한 번 더 누르면 1개를 닫아요')
+    await clock.advance(6_000)
+    expect(await label()).toBe('고른 것 닫기 (1)')
+    expect(calls.filter(c => c.startsWith('close'))).toEqual([])
+    await ui.press({ key: 'panes-close' })
+    await ui.press({ key: 'panes-close' })
+    expect(calls.filter(c => c.startsWith('close'))).toEqual(['close w2:p1'])
+    const after = textOf(await ui.findAll({ type: 'Text' }))
+    expect(after).toContain('닫음 w2:p1 (보고서)')
+    expect(await ui.find({ key: 'pane:w2:p1' })).toBeUndefined()
+    expect(await label()).toBe('고른 것 닫기 (0)')
+    // 모든 탭으로
+    await ui.press({ key: 'panes-scope' })
+    expect(calls.at(-1)).toBe('list --json --all')
+    // 파일 트리로 돌아가면 툴바 맨 앞에 허더 세션 단추가 있다
+    await ui.press({ key: 'panes-back' })
+    expect(await ui.find({ key: 'panes' })).toBeDefined()
+    expect(await ui.find({ key: 'panes-close' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('허더 밖에서는 툴바에 허더 세션 단추가 없다', async ($, on) => {
+    fakeWorld(on)
+    await $.command.run(typed('open', '/work'))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    expect(await ui.find({ key: 'panes' })).toBeUndefined()
+    await ui.unmount()
+    expect(donePaneIds(PANES)).toEqual(['w2:p1', 'w2:p2'])
+  })
+})
+
+describe('IDE 창 머리', () => {
+  test('시스템 줄과 이 세션 줄만 그리고 에이전트 트리는 그리지 않는다', async ($, on) => {
+    fakeWorld(on)
+    on('agent.spawn', () => ({ model: 'claude-haiku-4-5-20251001', agentId: 'sub-1' }))
+    await ask($, '로그인 버그 고쳐줘', 't1')
+    await $.agent.spawn(spawn('sub-1', '인증 코드 찾기', 'Explore'))
+    await $.command.run(typed('ide', ''))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    const text = textOf(await ui.findAll({ type: 'Text' }))
+    expect(text).toContain('세션 test-ses')
+    expect(text).not.toContain('Explore')
+    expect(text).not.toContain('서브')
+    expect(await ui.find({ key: 'board-fold' })).toBeUndefined()
+    expect(await ui.find({ key: 'board-handoff' })).toBeDefined()
     await ui.unmount()
   })
 })

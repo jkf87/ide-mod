@@ -1,45 +1,19 @@
 import { atom, read, update } from 'claude-code'
 import type { Color, EngineInterface, ModelUsage, On, Register, RenderElement, RenderInput, RenderSurface } from 'claude-code'
 
-import type { AgentPhase, AgentRow, Caption, GateCheck, GateResult, GitInfo, LimitWindow, LimitsSnapshot, PeerRow, RequestItem, SessionPerf, ShareState, SysStat, ViewMode } from '../types'
+import type { Caption, GateCheck, HerdrPane, GateResult, GitInfo, LimitWindow, LimitsSnapshot, PeerRow, RequestItem, SessionPerf, ShareState, SysStat, ViewMode } from '../types'
 import { SHARE_PROMPT, artifactUrlOf, gitInfoFrom, gitNotes, handoffFromText, handoffPage, receivePrompt, savedPathOf, shareDoc, stringsIn } from './share'
 
-// ════════════════ 에이전트 보드 ════════════════
-const MAIN = 'main'
-const agentsAtom = atom({ plugin: 'ide-mod', key: 'agents' } as const, {} as Record<string, AgentRow>)
+// ════════════════ 턴·타이머 ════════════════
+// 에이전트 트리·서브에이전트 줄은 Claude Code 자체 화면에 이미 보여서 v0.25.0에서 뺐다.
+// 여기는 메인 턴의 시작·끝(요청 기록·턴 시계·알림·속도)과 타이머만 남는다.
 const tickAtom = atom({ plugin: 'ide-mod', key: 'tick' } as const, 0)
-const foldedAtom = atom({ plugin: 'ide-mod', key: 'isBoardFolded' } as const, false)
-const hideDoneAtom = atom({ plugin: 'ide-mod', key: 'hideDone' } as const, false)
-const recapOnAtom = atom({ plugin: 'ide-mod', key: 'isRecapOn' } as const, true)
-
-const LOG_SIZE = 12
-const MAX_AGENTS = 40
-const RECAP_EVERY_MS = 20_000
-const RECAP_TIMEOUT_MS = 15_000
-const RECAP_MODEL = 'haiku'
-const RECAP_MAX_FAILURES = 3
-// 목록에서 빠진 지 이만큼 소식이 없으면 끝난 것으로 본다
-const STALE_AFTER_MS = 30_000
-// 도구 입력에서 "무엇을 하는지" 가장 잘 말해주는 필드 순서
-const SUMMARY_KEYS = ['description', 'command', 'file_path', 'notebook_path', 'pattern', 'url', 'query', 'skill', 'subject', 'prompt', 'path']
-
-const PHASE_ICON: Record<AgentPhase, string> = { running: '●', idle: '○', done: '✓', failed: '✗' }
-const PHASE_COLOR: Record<AgentPhase, Color> = { running: 'warning', idle: 'subtle', done: 'success', failed: 'error' }
-const PHASE_LABEL: Record<AgentPhase, string> = { running: '작업 중', idle: '대기', done: '완료', failed: '실패' }
-const ROLE_COLORS: Color[] = ['suggestion', 'claude', 'permission', 'planMode', 'autoAccept', 'remember', 'ide', 'merged']
-const LIST_PHASE: Record<string, AgentPhase> = {
-  pending: 'running', running: 'running', waiting: 'idle', idle: 'idle', completed: 'done', failed: 'failed', killed: 'failed',
-}
 
 // 재로드되면 처음부터 다시 세는 값들: 화면이 읽는 값은 전부 $.state에 둔다
-let isInteractive = true
 let timersStarted = false
 let autoOpenDefault = true
 let isAutoOpenPending = false
-let isRecapping = false
-let recapFailures = 0
-let lastStatus: string | undefined
-/** 보드가 마지막으로 그려진 시각: 창이 열려 있을 때만 요약을 만든다 */
+/** IDE 창이 마지막으로 그려진 시각: 창이 열려 있을 때만 시스템 줄을 읽는다 */
 let lastDrawnAt = 0
 
 const oneLine = (text: string, max: number) => {
@@ -48,33 +22,6 @@ const oneLine = (text: string, max: number) => {
 }
 const firstLine = (text: string) => text.split('\n').map(l => l.replace(/^[#>*\-\s]+/, '').trim()).find(l => l !== '') ?? ''
 
-/** claude-opus-5-5[1m] → opus 5.5 1M, us.anthropic.claude-sonnet-4-5-20250929-v1:0 → sonnet 4.5 */
-export const shortModel = (model: string) => {
-  const isLong = /\[1m\]/i.test(model)
-  const bare = model
-    .replace(/\[.*?\]/g, '')
-    .replace(/^.*?(?=claude-)/, '')
-    .replace(/@.*$/, '')
-    .replace(/-v\d+(:\d+)?$/, '')
-  const m = /^(?:claude-)?([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$/i.exec(bare)
-    ?? /^(?:claude-)(\d+)-(\d+)-([a-z]+)(?:-\d{8})?$/i.exec(bare)
-  let name = bare
-  if (m !== null && /^[a-z]/i.test(m[1] ?? '')) name = `${m[1]} ${m[2]}${m[3] ? `.${m[3]}` : ''}`
-  else if (m !== null) name = `${m[3]} ${m[1]}.${m[2]}`
-  return isLong ? `${name} 1M` : name
-}
-const toolName = (tool: string) => (tool.startsWith('mcp__') ? tool.split('__').slice(2).join('__') || tool : tool)
-
-export const describeCall = (tool: string, input: Record<string, unknown>) => {
-  if (tool === 'Agent') {
-    const type = typeof input.subagent_type === 'string' ? input.subagent_type : 'agent'
-    return `Agent → ${type}: ${oneLine(String(input.description ?? ''), 50)}`
-  }
-  const key = SUMMARY_KEYS.find(k => typeof input[k] === 'string' && input[k] !== '')
-  const detail = key === undefined ? '' : oneLine(String(input[key]), 60)
-  return detail === '' ? toolName(tool) : `${toolName(tool)}  ${detail}`
-}
-
 const formatElapsed = (ms: number) => {
   const s = Math.max(0, Math.round(ms / 1000))
   if (s < 60) return `${s}s`
@@ -82,188 +29,36 @@ const formatElapsed = (ms: number) => {
   return m < 60 ? `${m}m${String(s % 60).padStart(2, '0')}s` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`
 }
 
-const freshRow = (id: string, fields: Partial<AgentRow>): AgentRow => ({
-  id,
-  role: id === MAIN ? 'main' : 'agent',
-  task: '',
-  model: '',
-  phase: 'running',
-  isBackground: false,
-  isTeammate: false,
-  activity: '',
-  log: [],
-  toolCount: 0,
-  recap: '',
-  isRecapStale: false,
-  startedAt: Date.now(),
-  updatedAt: Date.now(),
-  ...fields,
-})
-
-/**
- * 한 에이전트 줄을 고친다. 서브에이전트 줄은 agent.spawn만 만든다: 엔진 내부의 포크(압축·메모리)는
- * spawn 없이 agentId를 달고 오고 끝을 알리지 않아서, 여기서 만들면 영영 "작업 중"으로 남는다.
- */
-async function patch($: EngineInterface, id: string, fn: (row: AgentRow) => AgentRow | undefined, canCreate = id === MAIN) {
-  await update($, agentsAtom, all => {
-    const existing = all[id]
-    if (existing === undefined && !canCreate) return all
-    const changed = fn(existing ?? freshRow(id, {}))
-    if (changed === undefined || changed === existing) return all
-    const next = { ...all, [id]: changed }
-    const ids = Object.keys(next)
-    if (ids.length <= MAX_AGENTS) return next
-    // 오래전에 끝난 서브에이전트부터 정리한다
-    const drop = ids
-      .filter(k => k !== MAIN && next[k]?.phase !== 'running')
-      .sort((a, b) => (next[a]?.startedAt ?? 0) - (next[b]?.startedAt ?? 0))
-      .slice(0, ids.length - MAX_AGENTS)
-    for (const k of drop) delete next[k]
-    return next
-  })
-  await refreshStatus($)
-}
-
-/** 서브에이전트가 돌 때만 상태줄에 모델·effort와 개수를 띄운다 (메인 모델은 기본 화면에도 있다) */
-async function refreshStatus($: EngineInterface) {
-  const all = await read($, agentsAtom)
-  const running = Object.values(all).filter(r => r.id !== MAIN && r.phase === 'running').length
-  const main = all[MAIN]
-  const brain = main === undefined ? '' : `${shortModel(main.model) || '?'}${main.effort ? ` · ${main.effort}` : ''}  `
-  const text = running > 0 ? `◆ ${brain}⇉ 서브에이전트 ${running}개 작업 중` : undefined
-  if (text === lastStatus) return
-  lastStatus = text
-  $.ui.status(text)
-}
-
-/** 엔진의 에이전트 목록과 맞춰, 죽었거나 사라진 서브에이전트가 "작업 중"에 머물지 않게 한다 */
-async function reconcile($: EngineInterface) {
-  const all = await read($, agentsAtom)
-  const running = Object.values(all).filter(r => r.id !== MAIN && r.phase === 'running')
-  if (running.length === 0) return
-  const listed = new Map((await $.agent.list().catch(() => [])).map(info => [info.id, info]))
-  const now = Date.now()
-  for (const row of running) {
-    const info = listed.get(row.id)
-    const phase: AgentPhase | undefined = info !== undefined
-      ? LIST_PHASE[info.status]
-      : now - row.updatedAt > STALE_AFTER_MS ? 'done' : undefined
-    if (phase === undefined || phase === 'running') continue
-    await patch($, row.id, r => (r.phase !== 'running' ? undefined : { ...r, phase, activity: '', endedAt: r.endedAt ?? now }))
-  }
-}
-
-/** 쌓인 도구 기록을 haiku로 한 줄 요약한다. 타이머에서만, 보드가 화면에 있을 때만 부른다 */
-async function recapStale($: EngineInterface) {
-  if (isRecapping || Date.now() - lastDrawnAt > 30_000) return
-  if (!(await read($, recapOnAtom))) return
-  isRecapping = true
-  try {
-    const all = await read($, agentsAtom)
-    const due = Object.values(all).filter(r => r.phase === 'running' && r.isRecapStale && r.log.length > 0).slice(0, 3)
-    for (const row of due) {
-      const seenTools = row.toolCount
-      const prompt = [
-        '아래는 코딩 에이전트 하나의 맡은 작업과 최근 도구 호출 기록이다.',
-        '이 에이전트가 지금 무엇을 하고 있는지 한국어 한 문장(40자 이내, 마침표 없이)으로만 답하라.',
-        `역할: ${row.role}`,
-        `맡은 작업: ${row.task || '(알 수 없음)'}`,
-        '최근 도구 호출(오래된 것부터):',
-        ...row.log.map(l => `- ${l}`),
-      ].join('\n')
-      const answer = await $.model
-        .complete({ model: RECAP_MODEL, prompt, maxTokens: 120, effort: 'low', timeoutMs: RECAP_TIMEOUT_MS })
-        .catch(() => undefined)
-      if (answer === undefined || !answer.isAnswered) {
-        recapFailures += 1
-        if (recapFailures >= RECAP_MAX_FAILURES) {
-          await update($, recapOnAtom, () => false)
-          $.ui.toast(`ide-mod: ${RECAP_MODEL} 요약 호출이 ${RECAP_MAX_FAILURES}번 실패해서 요약을 껐어요 (보드에서 s로 다시 켜기)`)
-        }
-        return
-      }
-      recapFailures = 0
-      const recap = oneLine(answer.text.replace(/^["'「]|["'」.]$/g, ''), 80)
-      // 기다리는 사이 끝났거나, 지워졌거나, 새 도구 호출이 쌓였으면 덮어쓰지 않는다
-      await patch($, row.id, r => (r.phase !== 'running' || r.toolCount !== seenTools ? undefined : { ...r, recap, isRecapStale: false }), false)
-    }
-  } finally {
-    isRecapping = false
-  }
-}
-
-/** 요약·정리 타이머를 건다. 터미널(REPL)은 session.start에서, 데스크톱 앱·SDK처럼 isInteractive가 false로 오는
- *  화면은 보드가 처음 그려질 때 건다 (-p 실행처럼 아무것도 그리지 않으면 걸리지 않는다) */
-function startAgents($: EngineInterface, interactive: boolean) {
-  isInteractive = interactive
-  if (interactive) startTimers($)
-}
-
+/** 정리 타이머를 건다. 터미널(REPL)은 session.start에서, 데스크톱 앱·SDK처럼 isInteractive가 false로 오는
+ *  화면은 창이나 띠가 처음 그려질 때 건다 (-p 실행처럼 아무것도 그리지 않으면 걸리지 않는다) */
 function startTimers($: EngineInterface) {
   if (timersStarted) return
   timersStarted = true
-  $.clock.every(RECAP_EVERY_MS, () => void recapStale($).catch(() => undefined))
+  // v0.24까지 서브에이전트가 돌 때 띄우던 상태줄이 재로드 뒤에 남지 않게 한 번 지운다
+  void Promise.resolve().then(() => $.ui.status(undefined)).catch(() => undefined)
   $.clock.every(30_000, () => void keepCacheWarm($).catch(() => undefined))
   $.clock.every(SYS_EVERY_MS, () => void refreshSys($).catch(() => undefined))
   $.clock.every(30_000, () => void refreshLimits($).catch(() => undefined))
-  $.clock.every(5_000, () =>
-    void (async () => {
-      await reconcile($)
-      const all = await read($, agentsAtom)
-      if (Object.values(all).some(r => r.phase === 'running')) await update($, tickAtom, n => n + 1)
-    })().catch(() => undefined),
-  )
+  // 메인이 일하는 동안 "예상 N분 · M분째"와 자막의 걸린 시간을 다시 그린다
+  $.clock.every(5_000, () => void (isMainBusy ? update($, tickAtom, n => n + 1) : Promise.resolve()).catch(() => undefined))
 }
 
-function registerAgents(on: On) {
-  on('session.end', async ($, e, next) => {
-    if (e.reason === 'clear') {
-      await update($, agentsAtom, () => ({}))
-      lastStatus = undefined
-      $.ui.status(undefined)
-    }
-    return next(e)
-  })
-
-  // 사람이 프롬프트를 보내면 메인 에이전트의 작업이 새로 정해진다 (서브에이전트는 turn.start가 없다)
+function registerTurns(on: On) {
+  // 사람이 보낸 요청으로 시작한 턴만 요청 기록·턴 시계에 잇는다. 백그라운드 작업 알림·다른 세션 메시지로
+  // 시작한 턴은 사람이 쓴 게 아니라서 기록하지 않는다
   on('turn.start', async ($, e, next) => {
     isMainBusy = true // 메인이 일하는 동안에는 캐시 유지 요청을 보내지 않는다
-    // 사람이 보낸 요청으로 시작한 턴만 메인 작업을 바꾼다. 백그라운드 작업 알림·다른 세션 메시지로 시작한 턴은
-    // 작업 줄은 두고 "지금 하는 일"만 바꾼다 (그 글은 사람이 쓴 게 아니라서 요청 기록에도 넣지 않는다)
     const own = personText(e.text)
     const isPersonTurn = own !== '' && (await requestTurnStarted($, own, e.turnId).catch(() => false))
-    if (!isPersonTurn && e.text.trim() !== '') {
-      await patch($, MAIN, row => ({ ...row, role: 'main', phase: 'running', activity: '알림·메시지 처리 중', updatedAt: Date.now(), endedAt: undefined }))
-    }
     if (isPersonTurn) {
       await startTurnClock($, e.turnId).catch(() => undefined)
-      await patch($, MAIN, row => ({
-        ...row,
-        role: 'main',
-        task: oneLine(own, 120),
-        phase: 'running',
-        activity: '생각 중',
-        log: [],
-        recap: '',
-        isRecapStale: false,
-        startedAt: Date.now(),
-        updatedAt: Date.now(),
-        endedAt: undefined,
-      }))
       await setCaption($, '요청을 읽고 계획을 세우는 중이에요', true).catch(() => undefined)
     }
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  // 모델 요청마다 그 에이전트가 실제로 쓰는 모델과 effort가 실려 온다
+  // 메인 응답은 첫 조각과 끝(stop) 시각을 재서 속도·캐시 적중을 띠에 올린다. 조각은 손대지 않고 그대로 넘긴다
   on('turn.step', async function* ($, e, next) {
-    const effort = e.effort === undefined ? undefined : String(e.effort)
-    await patch($, e.agentId ?? MAIN, row =>
-      row.model === e.model && row.effort === effort && row.phase === 'running'
-        ? undefined
-        : { ...row, model: e.model, effort, phase: 'running', updatedAt: Date.now(), endedAt: undefined },
-    ).catch(() => undefined)
-    // 메인 응답은 첫 조각과 끝(stop) 시각을 재서 속도·캐시 적중을 띠에 올린다. 조각은 손대지 않고 그대로 넘긴다
     if (e.agentId !== undefined) return yield* next(e)
     const now = () => $.clock.now().catch(() => Date.now())
     const sentAt = await now()
@@ -281,81 +76,38 @@ function registerAgents(on: On) {
     await noteEstimate($).catch(() => undefined)
   })
 
+  // 강의 자막: 서브에이전트가 일을 시작하면 알린다
   on('agent.spawn', async ($, e, next) => {
     const started = await next(e)
     if (started.agentId === undefined) return started
     const role = e.name ? `${e.subagentType} · ${e.name}` : e.fork ? `${e.subagentType} (fork)` : e.subagentType
-    await patch(
-      $,
-      started.agentId,
-      row => ({
-        ...row,
-        parentId: e.parentAgentId ?? MAIN,
-        role,
-        task: oneLine(e.description || firstLine(e.prompt), 120),
-        model: row.model || started.model,
-        isBackground: e.background,
-        isTeammate: e.isTeammate === true,
-        phase: 'running',
-        activity: '시작하는 중',
-        startedAt: Date.now(),
-        updatedAt: Date.now(),
-      }),
-      true,
-    )
+    agentRoles.set(started.agentId, role)
+    if (agentRoles.size > 40) agentRoles.delete(agentRoles.keys().next().value ?? '')
     await setCaption($, `${role} 에이전트가 일을 시작했어요 · ${oneLine(e.description, 50)}`).catch(() => undefined)
     return started
   }).catch(($, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
-    if (e.agentId === undefined) isMainBusy = false
-    const id = e.agentId ?? MAIN
-    const isFailed = e.reason !== 'answer'
-    await patch($, id, row => {
-      // 메인과 팀원은 턴이 끝나도 다음 지시를 기다릴 뿐이다
-      const phase: AgentPhase = id === MAIN || row.isTeammate ? 'idle' : isFailed ? 'failed' : 'done'
-      const note = e.isAborted ? '중단됨' : e.reason === 'error' ? '오류로 끝남' : e.reason === 'refusal' ? '거절로 끝남' : ''
-      return {
-        ...row,
-        phase,
-        activity: note,
-        recap: oneLine(firstLine(e.answer), 120) || row.recap,
-        isRecapStale: false,
-        updatedAt: Date.now(),
-        endedAt: Date.now(),
-      }
-    })
-    if (id === MAIN) {
-      await noteEstimate($).catch(() => undefined)
-      const estimate = (await read($, estimateRunAtom))?.minutes
-      await requestTurnEnded($, e.turnId, e.answer, e.isAborted || e.reason !== 'answer', estimate).catch(() => undefined)
-      await update($, turnClockAtom, () => null).catch(() => undefined)
-      await update($, estimateRunAtom, () => null).catch(() => undefined)
-      // 끝까지 답한 턴만 "끝남" 소리 (멈춤·오류는 끝남처럼 들리면 안 된다).
-      // 백그라운드 에이전트·명령이 아직 돌면 기다리는 중일 뿐이다: 마지막 일이 끝나고 그 알림을 받은 턴이 끝날 때 운다
-      if (!e.isAborted && e.reason === 'answer' && (await backgroundBusy($).catch(() => 0)) === 0) await alertWhenAllDone($, e.durationMs, e.turnId).catch(() => undefined)
-      await setCaption($, e.isAborted ? '작업을 멈췄어요' : '답을 다 썼어요. 다음 요청을 기다려요').catch(() => undefined)
-    }
+    if (e.agentId !== undefined) return next(e)
+    isMainBusy = false
+    await noteEstimate($).catch(() => undefined)
+    const estimate = (await read($, estimateRunAtom))?.minutes
+    await requestTurnEnded($, e.turnId, e.answer, e.isAborted || e.reason !== 'answer', estimate).catch(() => undefined)
+    await update($, turnClockAtom, () => null).catch(() => undefined)
+    await update($, estimateRunAtom, () => null).catch(() => undefined)
+    // 끝까지 답한 턴만 "끝남" 소리 (멈춤·오류는 끝남처럼 들리면 안 된다).
+    // 백그라운드 에이전트·명령이 아직 돌면 기다리는 중일 뿐이다: 마지막 일이 끝나고 그 알림을 받은 턴이 끝날 때 운다
+    if (!e.isAborted && e.reason === 'answer' && (await backgroundBusy($).catch(() => 0)) === 0) await alertTurnDone($, e.durationMs, e.turnId, e.answer).catch(() => undefined)
+    await setCaption($, e.isAborted ? '작업을 멈췄어요' : '답을 다 썼어요. 다음 요청을 기다려요').catch(() => undefined)
     return next(e)
   }).catch(($, e, next) => next(e))
 }
 
-/** 도구 호출 하나를 그 에이전트의 "지금 하는 일"로 기록한다 (탐색기와 같은 tool.call 훅에서 부른다) */
-async function recordToolCall($: EngineInterface, agentId: string | undefined, tool: string, input: Record<string, unknown>) {
-  const line = describeCall(tool, input)
-  await patch($, agentId ?? MAIN, row => ({
-    ...row,
-    phase: 'running',
-    activity: line,
-    log: [...row.log, line].slice(-LOG_SIZE),
-    toolCount: row.toolCount + 1,
-    isRecapStale: true,
-    updatedAt: Date.now(),
-  }))
-}
+/** 서브에이전트 ID → 역할 (강의 자막 앞머리에만 쓴다) */
+const agentRoles = new Map<string, string>()
 
 // ════════════════ 시스템 상태 (메모리·스왑·디스크) ════════════════
-// 보드 맨 위 한 줄. macOS의 sysctl·vm_stat·df·ps 출력을 한 번에 받아 읽는다 (Linux는 /proc/meminfo)
+// IDE 창 맨 위 한 줄. macOS의 sysctl·vm_stat·df·ps 출력을 한 번에 받아 읽는다 (Linux는 /proc/meminfo)
 
 const sysAtom = atom({ plugin: 'ide-mod', key: 'sys' } as const, null as SysStat | null)
 const showProcsAtom = atom({ plugin: 'ide-mod', key: 'showProcs' } as const, false)
@@ -441,7 +193,7 @@ const bar = (ratio: number, width = 8) => {
   return '█'.repeat(filled) + '░'.repeat(width - filled)
 }
 
-/** 보드 맨 위 시스템 줄 (+ z로 펼치는 메모리 많이 쓰는 앱 줄) */
+/** IDE 창 맨 위 시스템 줄 (+ z로 펼치는 메모리 많이 쓰는 앱 줄) */
 async function drawSys($: EngineInterface, e: RenderInput<'Pane'>): Promise<RenderElement[]> {
   const { Box, Text, Button } = $.ui.resolve(e)
   const stat = await read($, sysAtom)
@@ -476,115 +228,28 @@ async function drawSys($: EngineInterface, e: RenderInput<'Pane'>): Promise<Rend
 }
 
 /**
- * IDE 창 맨 위의 에이전트 보드: 한 줄이 한 행인 요소들을 돌려준다.
- * 아래 탐색기가 남은 행을 정확히 쓰도록 maxRows를 넘기지 않는다.
+ * IDE 창 맨 위: 시스템 줄 + 이 세션 줄(세션 ID · 예상 소요시간 · 핸드오프 · 알림 · 허더 세션).
+ * 에이전트 트리는 Claude Code 화면에 이미 있어서 그리지 않는다.
  */
-async function drawBoard($: EngineInterface, e: RenderInput<'Pane'>, width: number, maxRows: number): Promise<RenderElement[]> {
+async function drawBoard($: EngineInterface, e: RenderInput<'Pane'>, withSys = true): Promise<RenderElement[]> {
   const { Box, Text, Button } = $.ui.resolve(e)
   lastDrawnAt = Date.now()
   startTimers($)
-  const all = await read($, agentsAtom)
-  const isFolded = await read($, foldedAtom)
-  const hideDone = await read($, hideDoneAtom)
-  const isRecapOn = await read($, recapOnAtom)
-  const alert = await read($, alertAtom)
+  const alert = await alertModeOf($)
   const estBadge = await estimateBadge($).catch(() => undefined)
   await read($, tickAtom)
-  const now = Date.now()
-
-  const subs = Object.values(all).filter(r => r.id !== MAIN)
-  const running = subs.filter(r => r.phase === 'running').length
-  const main = all[MAIN]
-  const mainBrain = main === undefined ? '' : `${shortModel(main.model) || '…'}${main.effort ? ` · ${main.effort}` : ''}`
-  const summary = `에이전트 ${main === undefined ? '대기' : `${PHASE_ICON[main.phase]} ${mainBrain}`} · 서브 ${running}개 작업 중 / ${subs.length - running}개 끝남`
-
   const sessionId = await $.session.id().catch(() => '')
   const header = (
     <Box key="board-header" {...barRow(e.surface)}>
-      <Text bold wrap="truncate-end">{summary}</Text>
       {sessionId !== '' && <Text dimColor wrap="truncate-end">세션 {sessionId.slice(0, 8)}</Text>}
       {estBadge !== undefined && <Text key="estimate" color={estBadge.color} wrap="truncate-end">{estBadge.text}</Text>}
       <Button key="board-handoff" plain hotkey="i" label="핸드오프" onPress={() => void openHandoff($)} />
       <Button key="board-alert" plain hotkey="d" label={ALERT_LABEL[alert]} onPress={() => void cycleAlert($)} />
-      <Button key="board-fold" plain hotkey="a" label={isFolded ? '보드 펼치기' : '보드 접기'} onPress={() => void update($, foldedAtom, v => !v)} />
-      {!isFolded && <Button key="board-hide" plain hotkey="h" label={hideDone ? '끝난 것 보이기' : '끝난 것 숨기기'} onPress={() => void update($, hideDoneAtom, v => !v)} />}
-      {!isFolded && <Button key="board-recap" plain hotkey="s" label={isRecapOn ? `요약 끄기(${RECAP_MODEL})` : '요약 켜기'} onPress={() => { recapFailures = 0; void update($, recapOnAtom, v => !v) }} />}
-      {!isFolded && (
-        <Button
-          key="board-clear"
-          plain
-          hotkey="x"
-          label="끝난 것 지우기"
-          onPress={() => void update($, agentsAtom, list => Object.fromEntries(Object.entries(list).filter(([id, r]) => id === MAIN || r.phase === 'running')))}
-        />
-      )}
     </Box>
   )
-  // 시스템 줄은 접어도 남긴다 (램이 모자랄 때 늘 보이게)
-  const sys = await drawSys($, e).catch(() => [] as RenderElement[])
-  if (isFolded || maxRows <= 1 + sys.length) return [...sys, header]
-
-  // 숨길 때도 돌고 있는 에이전트와 그 조상은 남겨 트리가 끊기지 않게 한다
-  const visible = new Set<string>([MAIN])
-  for (const row of subs) {
-    if (hideDone && row.phase !== 'running') continue
-    for (let at: AgentRow | undefined = row; at !== undefined && !visible.has(at.id); at = at.parentId === undefined ? undefined : all[at.parentId]) visible.add(at.id)
-  }
-  const children = new Map<string, AgentRow[]>()
-  for (const row of subs) {
-    if (!visible.has(row.id)) continue
-    const parent = row.parentId !== undefined && visible.has(row.parentId) && all[row.parentId] !== undefined ? row.parentId : MAIN
-    children.set(parent, [...(children.get(parent) ?? []), row])
-  }
-  for (const list of children.values()) list.sort((a, b) => a.startedAt - b.startedAt)
-  const roleColor = new Map<string, Color>()
-  const colorOf = (role: string) => {
-    const base = role.split(' ')[0] ?? role
-    if (!roleColor.has(base)) roleColor.set(base, ROLE_COLORS[roleColor.size % ROLE_COLORS.length] ?? 'suggestion')
-    return roleColor.get(base) ?? 'suggestion'
-  }
-
-  const lines: RenderElement[] = []
-  const draw = (row: AgentRow, lead: string, branch: string, depth: number) => {
-    const elapsed = formatElapsed((row.endedAt ?? now) - row.startedAt)
-    const brain = `${shortModel(row.model) || '모델 확인 중'}${row.effort ? ` · ${row.effort}` : ''}`
-    const pad = `${lead}${depth === 0 ? '' : branch === '└─ ' ? '   ' : '│  '}  `
-    // 지금 하는 일·요약은 노란색(돌고 있을 때만), 끝난 결과는 흐리게
-    const isLive = row.phase === 'running'
-    const [label, body] = isLive && row.recap !== '' ? ['요약', row.recap] : isLive && row.activity !== '' ? ['지금', row.activity] : row.recap !== '' ? ['결과', row.recap] : ['', row.activity]
-    const live = isLive && body !== ''
-    lines.push(
-      <Text key={`agent:${row.id}`} wrap="truncate-end">
-        <Text dimColor>{lead}{depth === 0 ? '' : branch}</Text>
-        <Text color={PHASE_COLOR[row.phase]}>{PHASE_ICON[row.phase]} </Text>
-        <Text bold color={row.id === MAIN ? 'claude' : colorOf(row.role)}>{row.id === MAIN ? '메인' : row.role}</Text>
-        <Text>  {brain}</Text>
-        <Text dimColor>  {PHASE_LABEL[row.phase]} {elapsed}{row.isBackground ? ' · 백그라운드' : ''}{row.toolCount > 0 ? ` · 도구 ${row.toolCount}` : ''}</Text>
-        {/* 맡긴 일(메인은 사람이 입력한 프롬프트, 서브에이전트는 받은 작업 설명)은 초록색 */}
-        <Text color="success">{row.task !== '' ? `  ${oneLine(row.task, 80)}` : ''}</Text>
-      </Text>,
-    )
-    if (body !== '') {
-      lines.push(
-        <Text key={`agent-doing:${row.id}`} wrap="truncate-end">
-          <Text dimColor>{pad}{label === '' ? '' : `${label} `}</Text>
-          <Text color={live ? 'warning' : undefined} dimColor={!live}>{oneLine(body, Math.max(10, width))}</Text>
-        </Text>,
-      )
-    }
-    const kids = children.get(row.id) ?? []
-    kids.forEach((kid, i) => {
-      const nextLead = depth === 0 ? lead : `${lead}${branch === '└─ ' ? '   ' : '│  '}`
-      draw(kid, nextLead, i === kids.length - 1 ? '└─ ' : '├─ ', depth + 1)
-    })
-  }
-  if (main !== undefined) draw(main, '', '', 0)
-  else (children.get(MAIN) ?? []).forEach((kid, i, kids) => draw(kid, '', i === kids.length - 1 ? '└─ ' : '├─ ', 1))
-
-  const room = maxRows - 1 - sys.length
-  if (lines.length === 0) return [...sys, header, <Text key="board-empty" dimColor>프롬프트를 보내면 에이전트가 여기 나타나요.</Text>].slice(0, maxRows)
-  if (lines.length <= room) return [...sys, header, ...lines]
-  return [...sys, header, ...lines.slice(0, room - 1), <Text key="board-more" dimColor>… {lines.length - room + 1}줄 더 (a로 접기, h로 끝난 것 숨기기)</Text>]
+  // 시스템 줄은 늘 남긴다 (램이 모자랄 때 보이게). 허더 세션 화면만 한 줄이라도 아끼려고 뺀다
+  const sys = withSys ? await drawSys($, e).catch(() => [] as RenderElement[]) : []
+  return [...sys, header]
 }
 
 // ════════════════ 탐색기 ════════════════
@@ -618,7 +283,7 @@ type TreeRow = { path: string; name: string; depth: number; isDir: boolean; isOp
 
 // 스크롤 훅이 쓰는 마지막 배치: 그릴 때마다 다시 잰다
 const layout = {
-  /** 탐색기 위에 놓인 행 수(에이전트 보드·구분선·툴바) */
+  /** 탐색기 위에 놓인 행 수(시스템 줄·이 세션 줄·구분선·툴바) */
   topRows: 0,
   showTree: true,
   showFile: true,
@@ -627,7 +292,7 @@ const layout = {
   treeView: 10,
   active: '',
   fileMaxOffset: 0,
-  leftMode: 'files' as 'files' | 'requests' | 'handoff',
+  leftMode: 'files' as 'files' | 'requests' | 'handoff' | 'panes',
   requestRows: 0,
   /** 엔진이 창을 내려 둔 행 수(창 안 트리가 창보다 길 때만 0이 아니다) */
   engineOffset: 0,
@@ -975,7 +640,7 @@ async function noteEdit($: EngineInterface, tool: string, input: Record<string, 
 
 function registerExplorerScroll(on: On) {
   // 휠은 포인터가 있는 쪽(트리/파일)을, 키보드는 열린 파일을(없으면 트리를) 스크롤한다.
-  // 이 창 안에서 움직일 게 없으면(끝에 닿음·보드 위·빈 칸) 휠을 엔진에 돌려준다. 삼키면 데스크톱 앱에서
+  // 이 창 안에서 움직일 게 없으면(끝에 닿음·머리줄 위·빈 칸) 휠을 엔진에 돌려준다. 삼키면 데스크톱 앱에서
   // 대화를 올렸다가 내릴 때 창이 포인터 밑에 오는 순간 대화가 더 안 내려간다.
   on('ui.scroll', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     const moved = await scrollExplorer($, e).catch(() => false)
@@ -1150,6 +815,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
   const pickedDir = await read($, pickedDirAtom)
   const rev = await read($, revAtom)
   const leftMode = await read($, leftModeAtom)
+  const isHerdr = (await herdrPaneId($)) !== ''
   const requests = await read($, requestsAtom)
   // 같은 폴더의 지난 세션 요청이 앞에, 이번 세션 요청이 뒤에
   const pastRequests = await read($, pastRequestsAtom)
@@ -1190,7 +856,8 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
   // ── 툴바 ──
   const toolbar = (
     <Box key="ide-toolbar" {...barRow(e.surface)}>
-      {/* 바깥 앱으로 여는 두 버튼은 맨 앞: 툴바 뒤쪽은 좁은 창에서 잘린다 */}
+      {/* 허더 세션·바깥 앱으로 여는 버튼은 맨 앞: 툴바 뒤쪽은 좁은 창에서 잘린다 */}
+      {isHerdr && <Button key="panes" plain hotkey="s" label="허더 세션" onPress={() => void togglePanes($)} />}
       {isFiles && active !== '' && <Button key="open-app" plain hotkey="g" label="앱으로 열기" onPress={() => void openOutside($, active)} />}
       {isFiles && <Button key="open-folder" plain hotkey="f" label={`폴더 열기(${fit(baseName(folderTarget) || '/', 12)})`} onPress={() => void (pickedDir === '' && active !== '' ? openOutside($, active, true) : openOutside($, folderTarget))} />}
       <Button key="tree" plain hotkey="t" label={showTree && showFile ? '트리 접기' : '트리'} onPress={() => void update($, treeHiddenAtom, v => (rightKey === '' ? false : !v))} />
@@ -1631,7 +1298,7 @@ async function drawExplorer($: EngineInterface, e: RenderInput<'Pane'>, width: n
 }
 
 // ════════════════ 요청 기록 · HWP 뷰어 · 강의 모드 · 문체 게이트 ════════════════
-const leftModeAtom = atom({ plugin: 'ide-mod', key: 'leftMode' } as const, 'files' as 'files' | 'requests' | 'handoff')
+const leftModeAtom = atom({ plugin: 'ide-mod', key: 'leftMode' } as const, 'files' as 'files' | 'requests' | 'handoff' | 'panes')
 const requestsAtom = atom({ plugin: 'ide-mod', key: 'requests' } as const, [] as RequestItem[])
 const selectedRequestAtom = atom({ plugin: 'ide-mod', key: 'selectedRequest' } as const, 0)
 const requestOffsetAtom = atom({ plugin: 'ide-mod', key: 'requestOffset' } as const, 0)
@@ -1681,7 +1348,9 @@ const requestStatus = (r: RequestItem) => {
 }
 // ════════════════ 답변 속 경로·URL 누르기 ════════════════
 // 허더 같은 다중화기가 마우스를 잡으면 터미널의 Cmd+클릭이 안 먹는다.
-// 답변의 파일 경로를 file: 링크로 바꿔 그리고, 링크를 누르면 mod가 연다: 파일·폴더는 IDE 창, URL은 기본 브라우저.
+// 답변의 파일 경로를 file: 링크로 바꿔 그리고, 링크를 누르면 mod가 연다. 경로마다 링크가 둘이다:
+// 경로를 누르면 실행(파일은 기본 앱, 폴더는 Finder — 허더 밖에서는 IDE 창, /ide links로 바꾼다),
+// 바로 뒤 📂를 누르면 Finder에서 그 파일을 골라 보여 준다(폴더면 그 폴더). 웹 주소는 기본 브라우저.
 
 /** 경로로 보이는 글자: 절대 경로(/Users…), 홈(~/…), 또는 /가 들고 확장자로 끝나는 상대 경로. 끝의 :줄(:열)은 허용 */
 const PATH_HEADS = '(?:~|/(?:Users|private|tmp|opt|Library|Applications|Volumes|var|etc|usr|home|mnt|srv))'
@@ -1706,13 +1375,18 @@ export function fileHref(raw: string, cwd: string, home: string): string | undef
   return `file://${encodeURI(path)}${line !== undefined ? `#L${line}` : ''}`
 }
 
-/** file: 링크 주소를 다시 경로로 (줄 번호는 뺀다) */
+/** file: 링크 주소를 다시 경로로 (줄 번호·#reveal은 뺀다) */
 export function pathOfHref(href: string): string | undefined {
   if (!href.startsWith('file://')) return undefined
   try { return decodeURI(href.slice('file://'.length).replace(/#.*$/, '')) } catch { return undefined }
 }
 
 const escapeLinkText = (t: string) => t.replace(/([\[\]\\])/g, '\\$1')
+const REVEAL = '#reveal'
+/** 📂 링크인가 (폴더에서 보이기) */
+export const isRevealHref = (href: string) => href.startsWith('file://') && href.endsWith(REVEAL)
+/** 경로 링크 + 바로 뒤 📂 링크 */
+const pathLinks = (label: string, href: string) => `[${escapeLinkText(label)}](${href}) [📂](${href.replace(/#.*$/, '')}${REVEAL})`
 
 /**
  * 답변 마크다운의 경로를 링크로: 코드 블록(```)과 이미 있는 링크는 그대로 두고,
@@ -1725,7 +1399,7 @@ export function linkifyPaths(text: string, cwd: string, home: string): string {
   let last = 0
   const plain = (seg: string) => seg.replace(BARE_PATH, (all, pre: string, path: string) => {
     const href = fileHref(path, cwd, home)
-    return href === undefined ? all : `${pre}[${escapeLinkText(path.replace(/[.,;:!?]+$/, ''))}](${href})${path.match(/[.,;:!?]+$/)?.[0] ?? ''}`
+    return href === undefined ? all : `${pre}${pathLinks(path.replace(/[.,;:!?]+$/, ''), href)}${path.match(/[.,;:!?]+$/)?.[0] ?? ''}`
   })
   for (const m of text.matchAll(TOKEN)) {
     out += plain(text.slice(last, m.index))
@@ -1733,7 +1407,7 @@ export function linkifyPaths(text: string, cwd: string, home: string): string {
     if (code !== undefined) {
       const inner = code.slice(1, -1).trim()
       const href = (ABS_PATH.test(inner) || REL_PATH.test(inner)) && !/^https?:/.test(inner) ? fileHref(inner, cwd, home) : undefined
-      out += href === undefined ? whole : `[${escapeLinkText(inner)}](${href})`
+      out += href === undefined ? whole : pathLinks(inner, href)
     } else out += whole
     last = (m.index ?? 0) + whole.length
   }
@@ -1741,14 +1415,35 @@ export function linkifyPaths(text: string, cwd: string, home: string): string {
   return out
 }
 
-/** 링크를 눌렀을 때: 파일·폴더는 IDE 창, 웹 주소는 기본 브라우저 */
+type LinkOpen = 'auto' | 'app' | 'ide'
+const LINK_OPEN_KEY = 'linkOpen'
+const isLinkOpen = (v: unknown): v is LinkOpen => v === 'auto' || v === 'app' || v === 'ide'
+
+/** 경로 링크를 어디서 열지: auto는 허더 안(HERDR_PANE_ID)이면 앱, 아니면 IDE 창 */
+async function linkOpenOf($: EngineInterface): Promise<{ saved: LinkOpen; actual: 'app' | 'ide' }> {
+  const raw = await $.store.get(LINK_OPEN_KEY).catch(() => undefined)
+  const saved = isLinkOpen(raw) ? raw : 'auto'
+  if (saved !== 'auto') return { saved, actual: saved }
+  const pane = (await $.env.get('HERDR_PANE_ID').catch(() => undefined)) ?? ''
+  return { saved, actual: pane !== '' ? 'app' : 'ide' }
+}
+
+/** 링크를 눌렀을 때: 경로는 실행(앱·Finder 또는 IDE 창), 📂는 늘 Finder, 웹 주소는 기본 브라우저 */
 async function openPressedLink($: EngineInterface, href: string) {
   const path = pathOfHref(href)
   if (path !== undefined) {
     const found = await resolvePath($, path)
     if ('error' in found) { $.ui.toast(found.error); return }
-    $.ui.toast(`열어요: ${baseName(found.path) || found.path}`)
-    await openIde($, found.path).catch(() => undefined)
+    const name = baseName(found.path) || found.path
+    if (isRevealHref(href)) {
+      $.ui.toast(`폴더에서 보여요: ${name}`)
+      // 파일은 Finder에서 골라 보이고, 폴더는 그 폴더를 연다 (Windows·Linux는 f 단축키와 같은 방식)
+      await openOutside($, found.path, !found.isDir)
+      return
+    }
+    $.ui.toast(`열어요: ${name}`)
+    if ((await linkOpenOf($)).actual === 'app') await openOutside($, found.path)
+    else await openIde($, found.path).catch(() => undefined)
     return
   }
   if (/^https?:\/\//.test(href)) await openOutside($, href)
@@ -1763,12 +1458,15 @@ const handoffSentAtom = atom({ plugin: 'ide-mod', key: 'handoffSent' } as const,
 
 type SessionInfo = { id: string; root: string; transcript: string | undefined }
 let sessionInfoCache: SessionInfo | undefined
+/** 기록 파일을 못 찾았을 때 다시 찾기까지 (띠가 그릴 때마다 projects 폴더를 뒤지지 않게) */
+let sessionInfoMissAt = 0
+const SESSION_INFO_RETRY_MS = 10_000
 
 /** 세션 ID와 대화 기록 파일 경로. 기록은 <설정 폴더>/projects/<루트의 영숫자 외 문자를 -로>/<id>.jsonl 에 있다 */
 async function sessionInfo($: EngineInterface): Promise<SessionInfo> {
   const id = await $.session.id()
   const root = await $.session.root()
-  if (sessionInfoCache?.id === id && sessionInfoCache.root === root && sessionInfoCache.transcript !== undefined) return sessionInfoCache
+  if (sessionInfoCache?.id === id && sessionInfoCache.root === root && (sessionInfoCache.transcript !== undefined || Date.now() - sessionInfoMissAt < SESSION_INFO_RETRY_MS)) return sessionInfoCache
   const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${(await homeDir($)) ?? ''}/.claude`
   const projects = `${config}/projects`
   let transcript: string | undefined = `${projects}/${root.replace(/[^a-zA-Z0-9]/g, '-')}/${id}.jsonl`
@@ -1784,7 +1482,78 @@ async function sessionInfo($: EngineInterface): Promise<SessionInfo> {
     }
   }
   sessionInfoCache = { id, root, transcript }
+  if (transcript === undefined) sessionInfoMissAt = Date.now()
   return sessionInfoCache
+}
+
+// ── 띠 맨 아래 핸드오프 줄: 대화 기록 주소를 늘 보이게 (다른 세션·사람에게 "이거 읽고 이어 줘"로 넘기기) ──
+const HANDOFF_LINE_KEY = 'handoffLine'
+const handoffLineAtom = atom({ plugin: 'ide-mod', key: 'isHandoffLineOn' } as const, true)
+
+async function loadHandoffLine($: EngineInterface) {
+  const saved = await $.store.get(HANDOFF_LINE_KEY).catch(() => undefined)
+  if (typeof saved === 'boolean') await update($, handoffLineAtom, () => saved)
+}
+
+/** 홈 폴더를 ~로 */
+export const tildePath = (path: string, home: string) => {
+  const h = home.replace(/\/+$/, '')
+  return h !== '' && (path === h || path.startsWith(`${h}/`)) ? `~${path.slice(h.length)}` : path
+}
+
+/** 칸 폭이 max를 넘으면 가운데를 …로 줄인다 (끝의 파일 이름 쪽을 더 남긴다) */
+export function middleCut(text: string, max: number): string {
+  const chars = [...text]
+  if (chars.reduce((n, ch) => n + cellsOf(ch), 0) <= max) return text
+  if (max < 2) return max === 1 ? '…' : ''
+  const tailRoom = Math.ceil((max - 1) * 0.6)
+  const headRoom = max - 1 - tailRoom
+  let used = 0
+  let head = ''
+  for (const ch of chars) {
+    if (used + cellsOf(ch) > headRoom) break
+    used += cellsOf(ch)
+    head += ch
+  }
+  used = 0
+  let tail = ''
+  for (const ch of chars.reverse()) {
+    if (used + cellsOf(ch) > tailRoom) break
+    used += cellsOf(ch)
+    tail = ch + tail
+  }
+  return `${head}…${tail}`
+}
+
+/** "핸드오프 ~/.claude/projects/…/<id>.jsonl [주소 복사] [글 복사]" (기록 파일이 없으면 없음) */
+async function drawHandoffLine($: EngineInterface, e: RenderInput<'AbovePrompt'>, width: number): Promise<RenderElement[]> {
+  if (!(await read($, handoffLineAtom))) return []
+  const info = await sessionInfo($)
+  const transcript = info.transcript
+  if (transcript === undefined) return []
+  const { Box, Text, Button } = $.ui.resolve(e)
+  const shown = tildePath(transcript, (await homeDir($)) ?? '')
+  // 이름표 8 + 단추 둘(괄호 포함 약 20) + 사이 3칸 + 여유
+  const room = Math.max(8, width - 36)
+  return [
+    <Box key="handoff-line" flexDirection="row" columnGap={1} height={1} overflow="hidden">
+      <Box flexShrink={0}><Text dimColor>핸드오프</Text></Box>
+      <Box flexShrink={0}><Text>{middleCut(shown, room)}</Text></Box>
+      <Box flexShrink={0}>
+        <Button key="handoff-line-addr" plain label="주소 복사" onPress={() => {
+          void $.ui.copy({ text: transcript, surface: e.surface })
+          $.ui.toast('대화 기록 주소를 복사했어요')
+        }} />
+      </Box>
+      <Box flexShrink={0}>
+        <Button key="handoff-line-note" plain label="글 복사" onPress={() => void (async () => {
+          const { text } = await currentHandoff($)
+          await $.ui.copy({ text, surface: e.surface })
+          $.ui.toast('핸드오프 글을 복사했어요')
+        })().catch(() => undefined)} />
+      </Box>
+    </Box>,
+  ]
 }
 
 /** 다른 에이전트가 읽고 바로 이어받을 수 있는 핸드오프 글 */
@@ -1847,9 +1616,10 @@ async function openHandoff($: EngineInterface) {
 
 async function currentHandoff($: EngineInterface, memo = '') {
   const info = await sessionInfo($)
-  const main = (await read($, agentsAtom))[MAIN]
-  const status = main === undefined ? '' : oneLine(main.recap || main.activity || '', 200)
-  return { info, text: handoffNote(info, await read($, requestsAtom), status, memo) }
+  const requests = await read($, requestsAtom)
+  const last = [...requests].reverse().find(r => r.answer !== '')
+  const status = last === undefined ? '' : oneLine(last.answer, 200)
+  return { info, text: handoffNote(info, requests, status, memo) }
 }
 
 /** 인자 앞부분과 가장 길게 맞는 세션 이름 또는 ref */
@@ -2312,7 +2082,7 @@ const hwpNow = { path: '', page: 0, pages: 0 }
 const hwpOffsetKey = (path: string, page: number) => `${path}#${page}`
 
 /**
- * rhwp를 그리기 밖에서 돌린다. 그리기는 자주 다시 시작되므로(보드 시계·핫 리로드) 타이머로 넘겨
+ * rhwp를 그리기 밖에서 돌린다. 그리기는 자주 다시 시작되므로(예상 시간 시계·핫 리로드) 타이머로 넘겨
  * 끝까지 돌리고, 끝나면 다시 그리게 한다.
  */
 function loadHwp($: EngineInterface, key: string, args: string[], into: Map<string, Record<string, unknown>>) {
@@ -2961,13 +2731,16 @@ export function perfParts(p: SessionPerf, context: number | undefined): { text: 
 // ════════════════ 알림 소리 ════════════════
 // lemo-mod(lemomo-ai/lemo-mod, MIT)의 lemo-sound·lemo-voice에서 가져온 생각:
 // 메인 턴이 끝나면 "끝남" 소리, 내 확인(권한·질문)을 기다리면 "부름" 소리. 다른 창에 가 있어도 돌아올 때를 안다.
+// voice(기본): 이 세션이 끝나면 바로 소리 + "세션 이름. 답 요약"을 읽는다 (허더에 세션이 30개쯤 떠 있어도 어느 세션인지 안다)
+// sound: 이 PC의 Claude 세션이 전부 끝났을 때만 소리. off: 끔.
 // 소리 파일(sounds/*.wav)은 이 저장소에서 직접 합성한 것이다
-type AlertMode = 'sound' | 'voice' | 'off'
-const ALERT_KEY = 'alert'
-const ALERT_MODES: readonly AlertMode[] = ['sound', 'voice', 'off']
-const ALERT_NEXT: Record<AlertMode, AlertMode> = { sound: 'voice', voice: 'off', off: 'sound' }
-const ALERT_LABEL: Record<AlertMode, string> = { sound: '알림 소리', voice: '알림 소리+읽기', off: '알림 끔' }
-const alertAtom = atom({ plugin: 'ide-mod', key: 'alert' } as const, 'sound' as AlertMode)
+type AlertMode = 'voice' | 'sound' | 'off'
+/** 'alert'(v0.24까지, 기본 sound)에서 바꿨다: 새 기본값 voice가 한 번 적용되게 */
+const ALERT_KEY = 'alert2'
+const ALERT_MODES: readonly AlertMode[] = ['voice', 'sound', 'off']
+const ALERT_NEXT: Record<AlertMode, AlertMode> = { voice: 'sound', sound: 'off', off: 'voice' }
+const ALERT_LABEL: Record<AlertMode, string> = { voice: '알림: 이름·요약 읽기', sound: '알림: 전부 끝나면 소리', off: '알림 끔' }
+const alertAtom = atom({ plugin: 'ide-mod', key: 'alert' } as const, 'voice' as AlertMode)
 /** 이보다 오래 걸린 턴만 소리 내어 읽는다 (짧은 턴마다 말하면 시끄럽다) */
 const SPEAK_AFTER_MS = 30_000
 /** 권한 창이 연달아 뜰 때 부름 소리는 이 간격에 한 번만 */
@@ -3020,9 +2793,16 @@ async function backgroundBusy($: EngineInterface): Promise<number> {
 
 const isAlertMode = (v: unknown): v is AlertMode => typeof v === 'string' && (ALERT_MODES as readonly string[]).includes(v)
 
+let isAlertLoaded = false
 async function loadAlert($: EngineInterface) {
+  isAlertLoaded = true
   const saved = await $.store.get(ALERT_KEY).catch(() => undefined)
   if (isAlertMode(saved)) await update($, alertAtom, () => saved)
+}
+/** 저장한 알림 모드 (session.start 전에 불려도 저장값을 읽는다) */
+async function alertModeOf($: EngineInterface): Promise<AlertMode> {
+  if (!isAlertLoaded) await loadAlert($).catch(() => undefined)
+  return read($, alertAtom)
 }
 
 /** 걸린 시간을 읽기 좋게: 45초, 2분 15초, 1시간 3분 */
@@ -3107,26 +2887,63 @@ function notifyKo($: EngineInterface, title: string, body: string) {
   void $.ui.notify(body || title, { title }).catch(() => undefined)
 }
 
+/**
+ * 답변에서 첫 뜻 있는 문장: `⏱ 예상 …` 줄·빈 줄·제목·코드 블록·표·구분선은 건너뛰고, 마크다운 기호를 벗겨
+ * max자에서 자른다. 모델을 부르지 않는다. bin/herdr-panes.mjs에 같은 규칙이 있다 (고치면 둘 다)
+ */
+export function answerGist(text: string, max = 60): string {
+  const body = text.replace(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)/g, '\n')
+  for (const raw of body.split('\n')) {
+    const line = raw.trim()
+    if (line === '' || /^#{1,6}(\s|$)/.test(line) || /^\|/.test(line) || /^([-*_=]\s*){3,}$/.test(line)) continue
+    const plain = line
+      .replace(/^(?:>\s*)+/, '')
+      .replace(/^(?:[-*+]|\d+[.)])\s+/, '')
+      .replace(/^\[[ xX]\]\s+/, '')
+      .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
+      .replace(/`([^`]*)`/g, '$1')
+      .replace(/(\*\*|__|~~)(.+?)\1/g, '$2')
+      .replace(/(^|[^\w*])\*(?!\s)([^*\n]+?)\*(?!\w)/g, '$1$2')
+      .replace(/<[^>]+>/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+    if (plain.startsWith('⏱') || !/[\p{L}\p{N}]/u.test(plain)) continue
+    const sentence = /^.*?[.!?。](?=\s|$)/.exec(plain)?.[0] ?? plain
+    return [...sentence].slice(0, max).join('')
+  }
+  return ''
+}
+
+/** 배너 제목·본문과 읽을 말. 끝남은 "세션 이름. 요약", 부름은 "세션 이름. 확인이 필요해요" */
 export function alertLines(kind: 'done' | 'ask', where: string, what: string, durationMs?: number) {
   const head = kind === 'done' ? '끝났어요' : '확인을 기다려요'
   const title = where !== '' ? `${where} · ${head}` : `Claude · ${head}`
   const took = durationMs === undefined ? '' : spokenKo(durationMs)
   const body = [what, took].filter(Boolean).join(' · ')
-  // 읽을 때는 짧게: 세션 이름, 없으면 요청 앞부분
-  const who = where !== '' ? where : what.slice(0, 20)
-  const spoken = kind === 'done'
-    ? `${who ? `${who}, ` : ''}끝났어요.${took ? ` ${took} 걸렸어요.` : ''}`
-    : `${who ? `${who}, ` : ''}확인이 필요해요.`
+  const said = kind === 'done' ? what.trim() || '끝났어요' : '확인이 필요해요'
+  const spoken = where !== '' ? `${where}. ${said}` : said
   return { title, body, spoken }
 }
 
-async function alertDone($: EngineInterface, durationMs: number, turnId?: string) {
-  const mode = await read($, alertAtom)
+/** 메인 턴이 끝났을 때 (백그라운드 일이 남았으면 부르지 않는다) */
+async function alertTurnDone($: EngineInterface, durationMs: number, turnId: string | undefined, answer: string) {
+  const mode = await alertModeOf($)
   if (mode === 'off') return
+  if (mode === 'sound') return alertWhenAllDone($, durationMs, turnId)
+  // 이 세션이 끝나면 바로: 다른 세션이 일하는지는 보지 않는다
+  playSound($, 'done')
+  const what = answerGist(answer) || (await alertWhat($, turnId))
+  const lines = alertLines('done', await alertWhere($), what, durationMs)
+  notifyKo($, lines.title, lines.body)
+  if (durationMs >= SPEAK_AFTER_MS) speakKo($, lines.spoken)
+}
+
+/** 전부 끝나면 소리(sound): 소리와 배너만 (읽지 않는다) */
+async function alertDone($: EngineInterface, durationMs: number, turnId?: string) {
+  if ((await alertModeOf($)) !== 'sound') return
   playSound($, 'done')
   const lines = alertLines('done', await alertWhere($), await alertWhat($, turnId), durationMs)
   notifyKo($, lines.title, lines.body)
-  if (mode === 'voice' && durationMs >= SPEAK_AFTER_MS) speakKo($, lines.spoken)
 }
 
 /** 다른 세션이 다 끝났는지 다시 볼 때까지 (두 세션이 거의 같이 끝나면 서로 "아직 일하는 중"으로 볼 수 있다) */
@@ -3146,12 +2963,11 @@ async function busyPeers($: EngineInterface): Promise<string[]> {
  * 거의 같이 끝난 세션끼리 서로 기다리다 아무도 안 우는 일을 막으려고, 잠시 뒤 한 번 더 본다.
  */
 async function alertWhenAllDone($: EngineInterface, durationMs: number, turnId?: string) {
-  if ((await read($, alertAtom)) === 'off') return
   const busy = await busyPeers($).catch(() => [] as string[])
   if (busy.length === 0) return alertDone($, durationMs, turnId)
   $.clock.after(ALL_DONE_RECHECK_MS, () => void (async () => {
     // 그 사이 이 세션이 다시 일을 시작했으면 이번 끝남은 지난 일이다
-    if ((await read($, agentsAtom))[MAIN]?.phase === 'running') return
+    if (isMainBusy) return
     if ((await backgroundBusy($)) > 0) return
     if ((await busyPeers($)).length > 0) return
     await alertDone($, durationMs, turnId)
@@ -3159,7 +2975,7 @@ async function alertWhenAllDone($: EngineInterface, durationMs: number, turnId?:
 }
 
 async function alertAsk($: EngineInterface) {
-  const mode = await read($, alertAtom)
+  const mode = await alertModeOf($)
   if (mode === 'off') return
   const now = Date.now()
   if (now - lastAskSoundAt < ASK_GAP_MS) return
@@ -3170,13 +2986,16 @@ async function alertAsk($: EngineInterface) {
   if (mode === 'voice') speakKo($, lines.spoken)
 }
 
-/** 버튼(d): 소리 → 소리+읽기 → 끔 → 소리. 바꾸면 바로 들려 준다 */
+/** 버튼(d): 이름·요약 읽기 → 전부 끝나면 소리 → 끔 → 이름·요약 읽기. 바꾸면 바로 들려 준다 */
 async function cycleAlert($: EngineInterface) {
-  const next = ALERT_NEXT[await read($, alertAtom)]
+  const next = ALERT_NEXT[await alertModeOf($)]
   await update($, alertAtom, () => next)
   await $.store.set(ALERT_KEY, next).catch(() => undefined)
   if (next === 'sound') playSound($, 'done')
-  if (next === 'voice') speakKo($, alertLines('done', await alertWhere($), '', 135_000).spoken)
+  if (next === 'voice') {
+    playSound($, 'done')
+    speakKo($, alertLines('done', await alertWhere($), '이렇게 끝난 일을 읽어 드려요').spoken)
+  }
 }
 
 // ════════════════ 턴 시계 ════════════════
@@ -3214,7 +3033,7 @@ async function pauseClock($: EngineInterface, ms: number) {
 // ════════════════ 예상 소요시간 ════════════════
 // 사람이 보낸 요청마다 에이전트가 첫 줄에 "⏱ 예상 N분"을 적게 한다.
 // 1) 요청을 보낼 때 그렇게 하라는 안내를 모델만 읽는 context로 붙이고
-// 2) 메인 응답 글(turn.step의 text 조각)에서 예상을 읽어 보드와 요청 기록에 띄우고
+// 2) 메인 응답 글(turn.step의 text 조각)에서 예상을 읽어 IDE 창 머리와 요청 기록에 띄우고
 // 3) 안 적고 도구부터 부르면 그 도구 결과 뒤에 다시 적으라고 붙이고
 // 4) 예상을 넘기면 남은 일과 새 예상을 적으라고 붙인다 (새로 적으면 그 값으로 바뀐다)
 type EstimateRun = { minutes?: number; reminded: number; overFor?: number }
@@ -3274,7 +3093,7 @@ async function estimateNote($: EngineInterface): Promise<string | undefined> {
   return `[예상 소요시간 · ide-mod] 예상 ${est.minutes}분을 넘겼어요(지금 ${minutesText(used)} 지남). 다음 글에서 남은 일이 무엇인지와 새 예상을 \`⏱ 예상 N분\`으로 적으세요.`
 }
 
-/** 보드 머리: "예상 15분 · 7분째" (넘기면 노랑) */
+/** IDE 창 머리: "예상 15분 · 7분째" (넘기면 노랑) */
 async function estimateBadge($: EngineInterface): Promise<{ text: string; color?: Color } | undefined> {
   if (!(await read($, estimateOnAtom))) return undefined
   const est = await read($, estimateRunAtom)
@@ -3283,6 +3102,149 @@ async function estimateBadge($: EngineInterface): Promise<{ text: string; color?
   const used = Math.max(0, await clockUsed($, clock))
   if (est.minutes === undefined) return { text: `예상 묻는 중 · ${Math.floor(used / 60_000)}분째`, color: 'subtle' }
   return { text: `예상 ${est.minutes}분 · ${Math.floor(used / 60_000)}분째`, color: used >= est.minutes * 60_000 ? 'warning' : undefined }
+}
+
+// ════════════════ 허더 세션 한 번에 보고 닫기 (/panes) ════════════════
+// bin/herdr-panes.mjs(에이전트용 스킬 herdr-panes도 같은 스크립트를 쓴다)로 탭의 패인 목록을 받아 IDE 창에 그린다.
+// 닫기는 고른 것만, 두 번 눌러야. 스크립트가 닫기 직전에 목록을 다시 받아 나(이 세션)·일하는 중인 패인은 거절한다.
+
+const panesAtom = atom({ plugin: 'ide-mod', key: 'panes' } as const, { list: [], isAll: false, at: 0 } as { list: HerdrPane[]; isAll: boolean; at: number; error?: string; isLoading?: boolean })
+const panesPickedAtom = atom({ plugin: 'ide-mod', key: 'panesPicked' } as const, [] as string[])
+const panesArmedAtom = atom({ plugin: 'ide-mod', key: 'panesArmedAt' } as const, null as number | null)
+const panesResultAtom = atom({ plugin: 'ide-mod', key: 'panesResult' } as const, [] as string[])
+/** [고른 것 닫기] 첫 누름이 풀리기까지 */
+const PANES_ARM_MS = 5_000
+const PANE_DOT: Record<string, { icon: string; color?: Color; isDim?: boolean }> = {
+  working: { icon: '●', color: 'warning' },
+  done: { icon: '✓', color: 'success' },
+  idle: { icon: '○', isDim: true },
+}
+
+/** 이 세션이 도는 허더 패인 ID (허더 밖이면 빈 문자열) */
+const herdrPaneId = async ($: EngineInterface) => (await $.env.get('HERDR_PANE_ID').catch(() => undefined)) ?? ''
+
+async function runHerdrPanes($: EngineInterface, args: string[]) {
+  const dir = $.plugin.root.replace(/\/\.claude-plugin\/?$/, '')
+  return $.process.run(['node', `${dir}/bin/herdr-panes.mjs`, ...args], { timeoutMs: 30_000 }).catch(error => ({ exitCode: 127, stdout: '', stderr: String(error) }))
+}
+
+/** 끝난 것 고르기: done·idle만 (일하는 중·나는 빼고) */
+export const donePaneIds = (list: HerdrPane[]) => list.filter(p => !p.self && (p.status === 'done' || p.status === 'idle')).map(p => p.pane_id)
+
+async function loadPanes($: EngineInterface, isAll?: boolean) {
+  const all = isAll ?? (await read($, panesAtom)).isAll
+  await update($, panesAtom, p => ({ ...p, isAll: all, isLoading: true }))
+  const ran = await runHerdrPanes($, ['list', '--json', ...(all ? ['--all'] : [])])
+  let list: HerdrPane[] | undefined
+  try { list = (JSON.parse(ran.stdout) as { panes?: HerdrPane[] }).panes } catch { list = undefined }
+  const at = await nowOf($)
+  if (ran.exitCode !== 0 || list === undefined) {
+    await update($, panesAtom, p => ({ ...p, isLoading: false, at, error: oneLine(ran.stderr || ran.stdout || `exit ${ran.exitCode}`, 120) }))
+    return
+  }
+  const ids = new Set(list.map(p => p.pane_id))
+  await update($, panesAtom, () => ({ list: list ?? [], isAll: all, at }))
+  await update($, panesPickedAtom, picked => picked.filter(id => ids.has(id)))
+}
+
+/** /panes [all]: IDE 창을 허더 세션 화면으로 */
+async function openPanes($: EngineInterface, isAll: boolean): Promise<string> {
+  if ((await herdrPaneId($)) === '') return '허더 안에서만 써요.'
+  await update($, leftModeAtom, () => 'panes')
+  await update($, panesArmedAtom, () => null)
+  await update($, panesResultAtom, () => [])
+  await $.ui.open({ id: PANE, title: 'IDE', focus: true, rows: 36, columns: 150 }).catch(() => undefined)
+  await loadPanes($, isAll)
+  const p = await read($, panesAtom)
+  return p.error !== undefined ? `허더 세션 목록을 받지 못했어요: ${p.error}` : `허더 세션 ${p.list.length}개를 IDE 창에 띄웠어요 (${isAll ? '모든 탭' : '이 탭'}).`
+}
+
+async function togglePanes($: EngineInterface) {
+  const isPanes = (await read($, leftModeAtom)) === 'panes'
+  await update($, leftModeAtom, () => (isPanes ? 'files' : 'panes'))
+  if (!isPanes) await loadPanes($)
+}
+
+/** [고른 것 닫기]: 첫 누름은 확인만, 5초 안에 한 번 더 누르면 닫는다 */
+async function closePickedPanes($: EngineInterface) {
+  const picked = await read($, panesPickedAtom)
+  if (picked.length === 0) {
+    $.ui.toast('닫을 패인을 먼저 고르세요')
+    return
+  }
+  const now = await nowOf($)
+  const armedAt = await read($, panesArmedAtom)
+  if (armedAt === null || now - armedAt > PANES_ARM_MS) {
+    await update($, panesArmedAtom, () => now)
+    $.ui.toast(`한 번 더 누르면 ${picked.length}개를 닫아요`)
+    $.clock.after(PANES_ARM_MS, () => void update($, panesArmedAtom, at => (at === now ? null : at)).catch(() => undefined))
+    return
+  }
+  await update($, panesArmedAtom, () => null)
+  const ran = await runHerdrPanes($, ['close', ...picked])
+  const lines = (ran.stdout || ran.stderr).split('\n').map(l => l.trim()).filter(Boolean)
+  await update($, panesResultAtom, () => lines.slice(0, 8))
+  await update($, panesPickedAtom, () => [])
+  const closed = lines.filter(l => l.startsWith('닫음')).length
+  $.ui.toast(`${closed}개를 닫았어요${closed < picked.length ? ` · ${picked.length - closed}개는 못 닫음` : ''}`)
+  await loadPanes($)
+}
+
+/** IDE 창의 허더 세션 화면: 툴바 · 상태 줄 · 패인마다 한 줄 */
+async function drawPanes($: EngineInterface, e: RenderInput<'Pane'>, width: number, rows: number): Promise<RenderElement[]> {
+  const { Box, Text, Button } = $.ui.resolve(e)
+  const panes = await read($, panesAtom)
+  const picked = new Set(await read($, panesPickedAtom))
+  const armedAt = await read($, panesArmedAtom)
+  const result = await read($, panesResultAtom)
+  const isArmed = armedAt !== null
+  const toolbar = (
+    <Box key="panes-toolbar" {...barRow(e.surface)}>
+      <Button key="panes-refresh" plain hotkey="r" label="새로 고침" onPress={() => void loadPanes($)} />
+      <Button key="panes-pick-done" plain hotkey="a" label="끝난 것 고르기" onPress={() => void update($, panesPickedAtom, () => donePaneIds(panes.list))} />
+      <Button
+        key="panes-close"
+        plain
+        hotkey="x"
+        label={isArmed ? `한 번 더 누르면 ${picked.size}개를 닫아요` : `고른 것 닫기 (${picked.size})`}
+        onPress={() => void closePickedPanes($)}
+      />
+      <Button key="panes-scope" plain hotkey="l" label={panes.isAll ? '이 탭만' : '모든 탭'} onPress={() => void loadPanes($, !panes.isAll)} />
+      <Button key="panes-back" plain hotkey="s" label="파일 트리" onPress={() => void togglePanes($)} />
+    </Box>
+  )
+  const counts = { working: 0, done: 0, idle: 0 }
+  for (const p of panes.list) if (p.status in counts) counts[p.status as keyof typeof counts] += 1
+  const head = panes.error !== undefined
+    ? <Text key="panes-status" color="error" wrap="truncate-end">목록을 받지 못했어요: {panes.error}</Text>
+    : <Text key="panes-status" dimColor wrap="truncate-end">
+        허더 {panes.isAll ? '모든 탭' : '이 탭'} · 패인 {panes.list.length}개 · 일하는 중 {counts.working} · 끝남 {counts.done} · 쉼 {counts.idle}{panes.isLoading ? ' · 받는 중…' : ''}
+      </Text>
+  const out: RenderElement[] = [toolbar, head, ...result.map((line, i) => <Text key={`panes-result:${i}`} color={line.startsWith('닫음') ? 'success' : 'warning'} wrap="truncate-end">{line}</Text>)]
+  const room = Math.max(1, rows - out.length)
+  const shown = panes.list.length > room ? panes.list.slice(0, Math.max(1, room - 1)) : panes.list
+  for (const p of shown) {
+    const dot = PANE_DOT[p.status] ?? { icon: '·', isDim: true }
+    const tail = [p.lastAsk, p.lastAnswer].filter(Boolean).join(' / ')
+    out.push(
+      <Box key={`pane-row:${p.pane_id}`} flexDirection="row" columnGap={1} height={1} overflow="hidden" width={width}>
+        <Box flexShrink={0}>
+          {p.self
+            ? <Text dimColor> 나 </Text>
+            : <Button key={`pane:${p.pane_id}`} plain label={picked.has(p.pane_id) ? '[x]' : '[ ]'} onPress={() => void update($, panesPickedAtom, list => (list.includes(p.pane_id) ? list.filter(id => id !== p.pane_id) : [...list, p.pane_id]))} />}
+        </Box>
+        <Text wrap="truncate-end">
+          <Text color={dot.color} dimColor={dot.isDim}>{dot.icon} </Text>
+          <Text bold>{p.name || p.pane_id}</Text>
+          <Text dimColor>  {p.agent || '셸'} · {p.pane_id}</Text>
+          {tail !== '' && <Text dimColor={p.status !== 'working'}>  {tail}</Text>}
+        </Text>
+      </Box>,
+    )
+  }
+  if (shown.length < panes.list.length) out.push(<Text key="panes-more" dimColor>… {panes.list.length - shown.length}개 더 (창을 키우면 보여요)</Text>)
+  if (panes.list.length === 0 && panes.error === undefined && !panes.isLoading) out.push(<Text key="panes-empty" dimColor>패인이 없어요.</Text>)
+  return out
 }
 
 // ════════════════ 세션 시작 때 IDE 창 열기 ════════════════
@@ -3309,8 +3271,8 @@ export const register: Register = (on, options) => {
   autoOpenDefault = options?.auto_open !== false
   on('session.start', async ($, e, next) => {
     // 이름이 다른 플러그인과 겹쳐 하나가 거절돼도 나머지는 등록되게 따로 부른다
-    await $.command.register({ name: 'ide', description: 'IDE 창: 에이전트 보드 + 파일 트리 + 탭 에디터 (auto on|off: 세션 시작 때 자동으로 열기)', argumentHint: '[경로|auto on|auto off]' }).catch(() => undefined)
-    startAgents($, e.isInteractive)
+    await $.command.register({ name: 'ide', description: 'IDE 창: 파일 트리 + 탭 에디터 (auto on|off 자동으로 열기 · links auto|app|ide 답변 속 경로 열 곳 · addr on|off 띠의 핸드오프 줄)', argumentHint: '[경로|auto on|off|links auto|app|ide|addr on|off]' }).catch(() => undefined)
+    if (e.isInteractive) startTimers($)
     await $.command.register({ name: 'open', description: 'IDE 창에서 폴더나 파일을 엽니다', argumentHint: '[경로]' }).catch(() => undefined)
     await $.command.register({ name: 'lecture', description: '강의 모드: Claude가 하는 일을 입력창 위에 쉬운 한국어 자막으로', argumentHint: '[on|off]' }).catch(() => undefined)
     await $.command.register({ name: 'handoff', description: '이 세션을 다른 세션에 넘기거나(세션 이름), 다른 사람에게 Artifact로 넘기고 받습니다 (share·publish·receive)', argumentHint: '[세션 이름 [메모] | share [메모] | publish | receive <링크>]' }).catch(() => undefined)
@@ -3319,7 +3281,9 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'style-gate', description: '한국어 문체 게이트: 원고의 AI티 지표를 검사 (자동 검사 on/off)', argumentHint: '[파일|on|off]' }).catch(() => undefined)
     await loadRequests($).catch(() => undefined)
     await loadAlert($).catch(() => undefined)
+    await loadHandoffLine($).catch(() => undefined)
     await loadEstimate($).catch(() => undefined)
+    await $.command.register({ name: 'panes', description: '허더 탭의 세션(패인)을 한 번에 보고, 끝난 것을 골라 닫습니다 (all: 모든 탭)', argumentHint: '[all]' }).catch(() => undefined)
     await $.command.register({ name: 'estimate', description: '예상 소요시간: 요청마다 에이전트가 첫 줄에 "⏱ 예상 N분"을 적게 합니다 (기본 켜짐)', argumentHint: '[on|off]' }).catch(() => undefined)
     const started = await next(e)
     if (e.isInteractive) await autoOpenIde($).catch(() => undefined)
@@ -3334,9 +3298,27 @@ export const register: Register = (on, options) => {
       const isOn = await isAutoOpenOn($)
       return { text: `세션을 시작할 때 IDE 창 자동 열기: ${isOn ? '켜짐' : '꺼짐'} (/ide auto ${isOn ? 'off' : 'on'}로 바꾸기)` }
     }
+    const links = (e.args ?? '').trim().match(/^links(?:\s+(\S+))?$/)
+    if (links !== null) {
+      if (links[1] !== undefined && !isLinkOpen(links[1])) return { text: '쓰는 법: /ide links auto | app | ide' }
+      if (links[1] !== undefined) await $.store.set(LINK_OPEN_KEY, links[1])
+      const { saved, actual } = await linkOpenOf($)
+      const where = actual === 'app' ? '기본 앱(폴더는 Finder)' : 'IDE 창'
+      return { text: `답변 속 경로를 누르면: ${where}에서 열어요 (설정 ${saved}${saved === 'auto' ? ' · 허더 안이면 앱, 밖이면 IDE 창' : ''}). 바로 뒤 📂는 늘 Finder에서 보여 줘요. /ide links auto|app|ide` }
+    }
+    const addr = (e.args ?? '').trim().match(/^addr(?:\s+(on|off))?$/)
+    if (addr !== null) {
+      if (addr[1] !== undefined) {
+        await update($, handoffLineAtom, () => addr[1] === 'on')
+        await $.store.set(HANDOFF_LINE_KEY, addr[1] === 'on')
+      }
+      const isOn = await read($, handoffLineAtom)
+      return { text: `입력창 위 띠의 핸드오프 줄(대화 기록 주소 + 복사): ${isOn ? '켜짐' : '꺼짐'} (/ide addr ${isOn ? 'off' : 'on'}로 바꾸기)` }
+    }
     return { text: await openIde($, e.args ?? '') }
   })
   on('command.run', { command: 'open' }, async ($, e) => ({ text: await openIde($, e.args ?? '.') }))
+  on('command.run', { command: 'panes' }, async ($, e) => ({ text: await openPanes($, /^all$/i.test((e.args ?? '').trim())) }))
 
   on('command.run', { command: 'lecture' }, async ($, e) => {
     const arg = (e.args ?? '').trim()
@@ -3492,7 +3474,7 @@ export const register: Register = (on, options) => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  registerAgents(on)
+  registerTurns(on)
   registerExplorerScroll(on)
 
   // 판정이 ask여도 자동 모드 분류기나 권한 건너뛰기가 사람 없이 답할 수 있다: 여기서는 적어 두기만 한다
@@ -3519,10 +3501,10 @@ export const register: Register = (on, options) => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  // 도구 호출 하나를 보드에는 "지금 하는 일"로, 탐색기에는 "고친 파일"로 남긴다
+  // 도구 호출 하나를 탐색기에는 "고친 파일"로, 강의 자막에는 쉬운 말로 남긴다
   on('tool.call', async ($, e, next) => {
     const tool = String(e.tool)
-    // 핸드오프 화면이 세션 목록을 받으려고 부른 ListAgents는 보드·자막에 올리지 않는다
+    // 핸드오프 화면이 세션 목록을 받으려고 부른 ListAgents는 자막에 올리지 않는다
     if (tool === 'ListAgents' && e.agentId === undefined) return next(e)
     // 사람이 권한 창에 답하던 시간은 턴 시계에서 뺀다
     const callAt = await nowOf($)
@@ -3533,8 +3515,7 @@ export const register: Register = (on, options) => {
     }
     if (askAt !== undefined && !PERSON_TOOLS.includes(tool)) await pauseClock($, callAt - askAt).catch(() => undefined)
     const input = e as unknown as Record<string, unknown>
-    await recordToolCall($, e.agentId, tool, input).catch(() => undefined)
-    const role = e.agentId === undefined ? undefined : (await read($, agentsAtom))[e.agentId]?.role
+    const role = e.agentId === undefined ? undefined : agentRoles.get(e.agentId)
     await setCaption($, `${role === undefined ? '' : `[${role}] `}${captionFor(tool, input)}`).catch(() => undefined)
     const ran = await next(e)
     const outcome = ran as { deny?: string; isError?: true }
@@ -3591,12 +3572,13 @@ export const register: Register = (on, options) => {
     const showGate = gate !== null && gate.verdict !== 'pass'
     const width = Math.max(10, e.props.bodyColumns)
     const limits = await drawLimits($, e, width).catch(() => [] as RenderElement[])
-    if (!isLecture && !showGate && limits.length === 0) return next(e)
+    const handoffLine = await drawHandoffLine($, e, width).catch(() => [] as RenderElement[])
+    if (!isLecture && !showGate && limits.length === 0 && handoffLine.length === 0) return next(e)
     const { Box, Text, Button } = $.ui.resolve(e)
     await read($, tickAtom)
     const below = await next(e)
     const caption = isLecture ? await read($, captionAtom) : undefined
-    const running = isLecture ? Object.values(await read($, agentsAtom)).filter(r => r.id !== MAIN && r.phase === 'running').length : 0
+    const running = isLecture ? (await $.agent.list().catch(() => [])).filter(a => a.status === 'running').length : 0
 
     return (
       <Box flexDirection="column">
@@ -3620,6 +3602,7 @@ export const register: Register = (on, options) => {
         )}
         {below}
         {limits}
+        {handoffLine}
       </Box>
     )
   })
@@ -3629,7 +3612,20 @@ export const register: Register = (on, options) => {
     const width = Math.max(10, e.props.bodyColumns)
     const bodyRows = Math.max(4, e.props.scroll.bodyRows)
     Object.assign(layout, { engineOffset: e.props.scroll.offset, surface: e.surface, placement: e.props.placement })
-    const board = await drawBoard($, e, width, clamp(Math.round(bodyRows * 0.35), 2, 12))
+    const isPanes = (await read($, leftModeAtom)) === 'panes'
+    const board = await drawBoard($, e, !isPanes)
+    // 허더 세션 화면: 탐색기 대신 패인 목록
+    if (isPanes) {
+      layout.leftMode = 'panes'
+      const list = await drawPanes($, e, width, bodyRows - board.length - 1)
+      return (
+        <Box flexDirection="column" width={width}>
+          {board}
+          <Text key="board-rule" dimColor>{'─'.repeat(width)}</Text>
+          {list}
+        </Box>
+      )
+    }
     // 맨 아래 작업 진행: 탐색기가 10행은 남게
     const tasks = await drawTasks($, e, Math.max(0, bodyRows - board.length - 1 - 10 - 1)).catch(() => [] as RenderElement[])
     // 데스크톱은 버튼 줄이 감싸져 행이 늘어난다: 그만큼 탐색기를 줄여 창 밖으로 밀리지 않게
