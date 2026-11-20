@@ -1415,6 +1415,35 @@ export function linkifyPaths(text: string, cwd: string, home: string): string {
   return out
 }
 
+/** 링크로 바꾼 글에서 경로 링크만 뽑는다 (📂 짝이 붙은 것, 같은 파일은 한 번, 많아도 6개) */
+export function pathsIn(linked: string): { label: string; href: string }[] {
+  const out: { label: string; href: string }[] = []
+  for (const m of linked.matchAll(/\[((?:\\.|[^\]\\])*)\]\((file:\/\/[^)\s]*)\) \[📂\]/g)) {
+    const href = (m[2] ?? '').replace(/#.*$/, '')
+    if (out.length < 6 && !out.some(o => o.href === href)) out.push({ label: (m[1] ?? '').replace(/\\(.)/g, '$1'), href })
+  }
+  return out
+}
+
+/**
+ * 터미널이 링크(OSC 8)를 그리는가. 못 그리면 엔진이 "글 (file:///…)"로 풀어 그리고 주소 쪽만 눌리므로,
+ * 그런 터미널(허더·Terminal.app 등)에서는 답변을 그대로 두고 밑에 단추를 단다. 확실한 터미널만 믿는다
+ */
+export function drawsLinks(env: { force?: string; termProgram?: string; term?: string }): boolean {
+  const force = (env.force ?? '').trim().toLowerCase()
+  if (force !== '') return force !== '0' && force !== 'false'
+  if (['iTerm.app', 'WezTerm', 'ghostty', 'vscode', 'kitty'].includes(env.termProgram ?? '')) return true
+  return /kitty|ghostty/.test(env.term ?? '')
+}
+
+/** 그리는 중에는 상태를 못 써서 그릴 때마다 환경 변수를 읽는다 */
+async function drawsLinksHere($: EngineInterface): Promise<boolean> {
+  const force = await $.env.get('FORCE_HYPERLINK').catch(() => undefined)
+  const termProgram = await $.env.get('TERM_PROGRAM').catch(() => undefined)
+  const term = await $.env.get('TERM').catch(() => undefined)
+  return drawsLinks({ force, termProgram, term })
+}
+
 type LinkOpen = 'auto' | 'app' | 'ide'
 const LINK_OPEN_KEY = 'linkOpen'
 const isLinkOpen = (v: unknown): v is LinkOpen => v === 'auto' || v === 'app' || v === 'ide'
@@ -3577,7 +3606,25 @@ export const register: Register = (on, options) => {
     const linked = linkifyPaths(text, cwd, home)
     if (linked === text && !/https?:\/\//.test(text)) return drawn
     // 엔진이 그린 답변은 속을 고칠 수 없는 한 덩어리라, 링크가 있는 답변은 글머리 점까지 직접 그린다
-    const { Box, Text, Markdown } = $.ui.resolve(e)
+    const { Box, Text, Markdown, Button } = $.ui.resolve(e)
+    if (!(await drawsLinksHere($))) {
+      // 링크를 못 그리는 터미널: 엔진 그림은 그대로 두고, 경로마다 누를 단추를 밑에 단다
+      const paths = pathsIn(linked)
+      if (paths.length === 0) return drawn
+      return (
+        <Box flexDirection="column">
+          {drawn}
+          <Box flexDirection="row" flexWrap="wrap" columnGap={2} paddingLeft={2}>
+            {paths.map((p, i) => (
+              <Box key={`path:${i}`} flexDirection="row" columnGap={1} flexShrink={0}>
+                <Button key={`go:${e.requestId}:${i}`} plain label={`↗ ${oneLine(baseName(pathOfHref(p.href) ?? p.label) || p.label, 32)}`} onPress={() => void openPressedLink($, p.href)} />
+                <Button key={`rv:${e.requestId}:${i}`} plain label="📂 폴더" onPress={() => void openPressedLink($, `${p.href}${REVEAL}`)} />
+              </Box>
+            ))}
+          </Box>
+        </Box>
+      )
+    }
     return (
       <Box flexDirection="row">
         <Box minWidth={2} flexShrink={0}><Text>{e.props.isFirstOfReply ? '⏺' : ' '}</Text></Box>

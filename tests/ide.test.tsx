@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { answerGist, donePaneIds, isRevealHref, middleCut, tildePath, baseName, isInside, isWinPath, joinPath, openCommands, parentOf, alertLines, herdrNameOf, fileHref, linkifyPaths, pathOfHref, backgroundTaskId, endedTaskIds, parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
+import { answerGist, drawsLinks, pathsIn, donePaneIds, isRevealHref, middleCut, tildePath, baseName, isInside, isWinPath, joinPath, openCommands, parentOf, alertLines, herdrNameOf, fileHref, linkifyPaths, pathOfHref, backgroundTaskId, endedTaskIds, parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
 import { artifactUrlOf, gitInfoFrom, gitNotes, handoffFromText, handoffPage, receivePrompt, redactSecrets, savedPathOf, shareDoc, webUrlOf } from '../hooks/share'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
@@ -33,7 +33,7 @@ const real = (p: string) => {
   return abs
 }
 
-type World = { herdrPane?: string; noTranscript?: boolean; opened: number; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined; taskSeq?: number; contexts: string[]; listing?: string; bgBash?: string; store: Map<string, unknown>; written: Map<string, string> }
+type World = { herdrPane?: string; env?: Record<string, string | undefined>; noTranscript?: boolean; opened: number; rhwpCalls: string[]; scripts: string[]; saved?: unknown; sent: { to: string; text: string }[]; copied: string[]; extraRuns?: (argv: string[]) => string | undefined; taskSeq?: number; contexts: string[]; listing?: string; bgBash?: string; store: Map<string, unknown>; written: Map<string, string> }
 
 const LISTING = `This session is 모드에 대해 [634505] — the name other sessions use to message it.
 
@@ -46,7 +46,7 @@ const IDLE_LISTING = LISTING.replace('·  busy  ·', '·  idle  ·')
 function fakeWorld(on: On): World {
   const world: World = { opened: 0, rhwpCalls: [], scripts: [], sent: [], copied: [], contexts: [], store: new Map(), written: new Map() }
   on('session.cwd', () => ({ value: ROOT }))
-  on('env.get', ($, e) => ({ value: e.name === 'HERDR_PANE_ID' ? world.herdrPane : '/home/me' }))
+  on('env.get', ($, e) => ({ value: e.name === 'HERDR_PANE_ID' ? world.herdrPane : world.env !== undefined && e.name in world.env ? world.env[e.name] : '/home/me' }))
   on('fs.stat', ($, e) => {
     const abs = norm(e.path)
     const target = real(e.path)
@@ -1230,6 +1230,29 @@ describe('작업 진행', () => {
     await ui.press({ key: 'links:m1', link: { href: 'file:///work/src/app.ts' } })
     const pane = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
     expect((await pane.find({ type: 'Code' }))?.props.source).toBe('export const answer = 42')
+  })
+
+  test('링크를 못 그리는 터미널(허더)에서는 답변을 그대로 두고 밑에 열기·폴더 단추를 단다', async ($, on) => {
+    expect(drawsLinks({ termProgram: 'herdr', term: 'xterm-256color' })).toBe(false)
+    expect(drawsLinks({ termProgram: 'herdr', force: '1' })).toBe(true)
+    expect(drawsLinks({ termProgram: 'ghostty', force: '0' })).toBe(false)
+    expect(drawsLinks({ termProgram: 'ghostty' })).toBe(true)
+    expect(pathsIn(linkifyPaths('`src/app.ts` 와 `/Users/me/docs/a.md`, 다시 `src/app.ts:3`', '/work', '/Users/me'))).toEqual([
+      { label: 'src/app.ts', href: 'file:///work/src/app.ts' },
+      { label: '/Users/me/docs/a.md', href: 'file:///Users/me/docs/a.md' },
+    ])
+    const world = fakeWorld(on)
+    world.herdrPane = 'w2:p3'
+    world.env = { FORCE_HYPERLINK: undefined, TERM_PROGRAM: 'herdr', TERM: 'xterm-256color' }
+    const opened: string[] = []
+    world.extraRuns = argv => (argv[0] === 'open' ? (opened.push(argv.slice(1).join(' ')), '') : undefined)
+    const ui = await $.ui.mount({ plugin: 'ide-mod', component: 'AssistantMessage', requestId: 'm3', surface: 'terminal', props: { text: '`src/app.ts` 를 고쳤어요', isFirstOfReply: true } as never })
+    expect(await ui.find({ key: 'links:m3' })).toBeUndefined()
+    expect((await ui.find({ key: 'go:m3:0' }))?.props.label).toBe('↗ app.ts')
+    await ui.press({ key: 'go:m3:0' })
+    await ui.press({ key: 'rv:m3:0' })
+    expect(opened).toEqual(['/work/src/app.ts', '-R /work/src/app.ts'])
+    await ui.unmount()
   })
 
   test('허더 안에서는 경로를 누르면 기본 앱으로, 📂는 늘 Finder에서 골라 보인다 (/ide links로 바꾼다)', async ($, on) => {
