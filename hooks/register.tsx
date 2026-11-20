@@ -2797,7 +2797,8 @@ let isAlertLoaded = false
 async function loadAlert($: EngineInterface) {
   isAlertLoaded = true
   const saved = await $.store.get(ALERT_KEY).catch(() => undefined)
-  if (isAlertMode(saved)) await update($, alertAtom, () => saved)
+  // 저장값이 없으면 기본값으로 되돌린다: /reload-plugins 뒤에도 예전 키('alert')에서 읽어 둔 값이 상태에 남기 때문
+  await update($, alertAtom, () => (isAlertMode(saved) ? saved : 'voice'))
 }
 /** 저장한 알림 모드 (session.start 전에 불려도 저장값을 읽는다) */
 async function alertModeOf($: EngineInterface): Promise<AlertMode> {
@@ -3165,6 +3166,19 @@ async function togglePanes($: EngineInterface) {
   if (!isPanes) await loadPanes($)
 }
 
+/** 줄 이름을 누르면 그 패인으로 간다. 에이전트 패인은 `herdr agent focus`, 셸 패인은 받아 주지 않아 탭까지만 */
+async function focusPane($: EngineInterface, paneId: string, tabId: string, name: string) {
+  const bin = (await $.env.get('HERDR_BIN_PATH').catch(() => undefined)) || 'herdr'
+  const run = (args: string[]) => $.process.run([bin, ...args], { timeoutMs: 5_000 }).catch(error => ({ exitCode: 127, stdout: '', stderr: String(error) }))
+  const went = await run(['agent', 'focus', paneId])
+  if (went.exitCode === 0) {
+    $.ui.toast(`옮겨요: ${name}`)
+    return
+  }
+  const tab = tabId === '' ? went : await run(['tab', 'focus', tabId])
+  $.ui.toast(tab.exitCode === 0 && tabId !== '' ? `탭까지만 옮겼어요: ${name}` : `못 옮겼어요: ${oneLine(went.stderr || went.stdout || `exit ${went.exitCode}`, 80)}`)
+}
+
 /** [고른 것 닫기]: 첫 누름은 확인만, 5초 안에 한 번 더 누르면 닫는다 */
 async function closePickedPanes($: EngineInterface) {
   const picked = await read($, panesPickedAtom)
@@ -3218,14 +3232,18 @@ async function drawPanes($: EngineInterface, e: RenderInput<'Pane'>, width: numb
   const head = panes.error !== undefined
     ? <Text key="panes-status" color="error" wrap="truncate-end">목록을 받지 못했어요: {panes.error}</Text>
     : <Text key="panes-status" dimColor wrap="truncate-end">
-        허더 {panes.isAll ? '모든 탭' : '이 탭'} · 패인 {panes.list.length}개 · 일하는 중 {counts.working} · 끝남 {counts.done} · 쉼 {counts.idle}{panes.isLoading ? ' · 받는 중…' : ''}
+        허더 {panes.isAll ? '모든 탭' : '이 탭'} · 패인 {panes.list.length}개 · 일하는 중 {counts.working} · 끝남 {counts.done} · 쉼 {counts.idle}{panes.isLoading ? ' · 받는 중…' : ''} · 이름을 누르면 그 패인으로 가요
       </Text>
   const out: RenderElement[] = [toolbar, head, ...result.map((line, i) => <Text key={`panes-result:${i}`} color={line.startsWith('닫음') ? 'success' : 'warning'} wrap="truncate-end">{line}</Text>)]
   const room = Math.max(1, rows - out.length)
   const shown = panes.list.length > room ? panes.list.slice(0, Math.max(1, room - 1)) : panes.list
+  let goKey = 0
   for (const p of shown) {
     const dot = PANE_DOT[p.status] ?? { icon: '·', isDim: true }
     const tail = [p.lastAsk, p.lastAnswer].filter(Boolean).join(' / ')
+    const name = oneLine(p.name || p.pane_id, 40)
+    // 나 아닌 줄 앞 아홉 개는 숫자 키로도 간다
+    const hotkey = !p.self && goKey < 9 ? String((goKey += 1)) : undefined
     out.push(
       <Box key={`pane-row:${p.pane_id}`} flexDirection="row" columnGap={1} height={1} overflow="hidden" width={width}>
         <Box flexShrink={0}>
@@ -3233,10 +3251,16 @@ async function drawPanes($: EngineInterface, e: RenderInput<'Pane'>, width: numb
             ? <Text dimColor> 나 </Text>
             : <Button key={`pane:${p.pane_id}`} plain label={picked.has(p.pane_id) ? '[x]' : '[ ]'} onPress={() => void update($, panesPickedAtom, list => (list.includes(p.pane_id) ? list.filter(id => id !== p.pane_id) : [...list, p.pane_id]))} />}
         </Box>
+        <Box flexShrink={0}>
+          <Text color={dot.color} dimColor={dot.isDim}>{dot.icon}</Text>
+        </Box>
+        <Box flexShrink={0}>
+          {p.self
+            ? <Text bold>{name}</Text>
+            : <Button key={`pane-go:${p.pane_id}`} plain hotkey={hotkey} label={name} onPress={() => void focusPane($, p.pane_id, p.tab_id ?? '', name)} />}
+        </Box>
         <Text wrap="truncate-end">
-          <Text color={dot.color} dimColor={dot.isDim}>{dot.icon} </Text>
-          <Text bold>{p.name || p.pane_id}</Text>
-          <Text dimColor>  {p.agent || '셸'} · {p.pane_id}</Text>
+          <Text dimColor>{p.agent || '셸'} · {p.pane_id}</Text>
           {tail !== '' && <Text dimColor={p.status !== 'working'}>  {tail}</Text>}
         </Text>
       </Box>,

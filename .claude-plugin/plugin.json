@@ -1,6 +1,6 @@
 {
   "name": "ide-mod",
-  "version": "0.25.0",
+  "version": "0.25.1",
   "description": "Claude Code 안의 IDE 창: 파일 트리·탭 에디터 + HWP·HWPX·PDF 뷰어(rhwp·pdf.js) + 요청 기록 + 허더 세션 한눈에 보고 닫기, 세션 이름·답 요약 읽기 알림, 강의 자막과 한국어 문체 게이트",
   "author": {
     "name": "jkf87"

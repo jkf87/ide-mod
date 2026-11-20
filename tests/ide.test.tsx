@@ -1431,7 +1431,9 @@ describe('허더 세션 (/panes)', () => {
     world.herdrPane = 'w2:p4'
     let list = [...PANES]
     const calls: string[] = []
+    const goes: string[] = []
     world.extraRuns = argv => {
+      if (argv[1] === 'agent' && argv[2] === 'focus') { goes.push(argv.slice(1).join(' ')); return '{}' }
       if (!String(argv[1]).endsWith('herdr-panes.mjs')) return undefined
       calls.push(argv.slice(2).join(' '))
       if (argv[2] === 'list') return JSON.stringify({ panes: list })
@@ -1442,8 +1444,13 @@ describe('허더 세션 (/panes)', () => {
     expect(calls).toEqual(['list --json'])
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
     const text = textOf(await ui.findAll({ type: 'Text' }))
-    expect(text).toContain('보고서')
     expect(text).toContain('초안 써 줘 / 초안을 다 썼어요.')
+    // 이름을 누르면(또는 숫자 키) 그 패인으로 간다. 나는 단추가 아니다
+    expect((await ui.find({ key: 'pane-go:w2:p1' }))?.props.label).toBe('보고서')
+    expect((await ui.find({ key: 'pane-go:w2:p1' }))?.props.hotkey).toBe('1')
+    expect(await ui.find({ key: 'pane-go:w2:p4' })).toBeUndefined()
+    await ui.press({ key: 'pane-go:w2:p1' })
+    expect(goes).toEqual(['agent focus w2:p1'])
     expect(text).toContain('일하는 중 2 · 끝남 1 · 쉼 1')
     // 나는 고를 수 없다
     expect(await ui.find({ key: 'pane:w2:p4' })).toBeUndefined()
