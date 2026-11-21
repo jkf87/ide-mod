@@ -1476,7 +1476,11 @@ describe('허더 세션 (/panes)', () => {
     expect(calls).toEqual(['list --json'])
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
     const text = textOf(await ui.findAll({ type: 'Text' }))
-    expect(text).toContain('초안 써 줘 / 초안을 다 썼어요.')
+    // 패인마다 하는 일 줄: 쉬는 Claude는 마지막 답, 일하는 Claude는 받은 요청
+    expect(text).toContain('↳ 답: 초안을 다 썼어요.')
+    expect(text).toContain('↳ 요청: 빌드해 줘')
+    // 이 탭 목록에는 가져오기 단추가 없다
+    expect(await ui.find({ key: 'pane-bring:w2:p1' })).toBeUndefined()
     // 이름을 누르면(또는 숫자 키) 그 패인으로 간다. 나는 단추가 아니다
     expect((await ui.find({ key: 'pane-go:w2:p1' }))?.props.label).toBe('보고서')
     expect((await ui.find({ key: 'pane-go:w2:p1' }))?.props.hotkey).toBe('1')
@@ -1514,6 +1518,28 @@ describe('허더 세션 (/panes)', () => {
     await ui.press({ key: 'panes-back' })
     expect(await ui.find({ key: 'panes' })).toBeDefined()
     expect(await ui.find({ key: 'panes-close' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('모든 탭: 탭마다 머리 줄, 다른 탭 세션은 ← 여기로 로 이 패인 옆에 가져온다', async ($, on) => {
+    const world = fakeWorld(on)
+    world.herdrPane = 'w2:p4'
+    const moves: string[] = []
+    const other = { pane_id: 'w5:p9', tab_id: 'w5:t2', tab_name: '22 페북광고', name: '광고 영상', agent: 'claude', status: 'working', cwd: '/work', self: false, lastAsk: '카메라 더 역동적으로', lastAnswer: '' }
+    world.extraRuns = argv => {
+      if (argv[1] === 'pane' && argv[2] === 'move') { moves.push(argv.slice(1).join(' ')); return '{}' }
+      if (!String(argv[1]).endsWith('herdr-panes.mjs')) return undefined
+      return JSON.stringify({ panes: [...PANES.map(p => ({ ...p, tab_name: '30 허더' })), other] })
+    }
+    await $.command.run(typed('panes', 'all'))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: props(140) })
+    const text = textOf(await ui.findAll({ type: 'Text' }))
+    expect(text).toContain('▸ 탭 30 허더 (여기)')
+    expect(text).toContain('▸ 탭 22 페북광고')
+    expect(text).toContain('↳ 요청: 카메라 더 역동적으로')
+    expect(await ui.find({ key: 'pane-bring:w2:p1' })).toBeUndefined()
+    await ui.press({ key: 'pane-bring:w5:p9' })
+    expect(moves).toEqual(['pane move w5:p9 --target-pane w2:p4 --split right'])
     await ui.unmount()
   })
 

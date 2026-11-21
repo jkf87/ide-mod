@@ -60,6 +60,8 @@ export type SessionPerf = {
 export type HerdrPane = {
   pane_id: string
   tab_id: string
+  /** 탭 번호와 이름 ("30 허더") */
+  tab_name?: string
   name: string
   agent: string
   /** idle | working | done | unknown */

@@ -38,7 +38,13 @@ export function answerGist(text, max = 60) {
 export const personText = text => String(text ?? '')
   .replace(/<(system-reminder|local-command-caveat|local-command-stdout|local-command-stderr|command-message|command-name|command-args)\b[^>]*>[\s\S]*?<\/\1>/gi, '')
   .trim()
-export const isMachine = text => text === '' || /^\s*(<(task-notification|teammate-message|peer-message|cross-session-message)\b|\[SYSTEM NOTIFICATION|Caveat:)/i.test(text)
+export const isMachine = text => text === '' || /^\s*(<(task-notification|teammate-message|peer-message|cross-session-message)\b|\[SYSTEM NOTIFICATION|Caveat:|This session is being continued from a previous conversation)/i.test(text)
+
+/** 화면에서 읽은 줄 중 일과 상관없는 껍데기: 에이전트 TUI 상태줄·단축키 안내·권한 모드·셸 프롬프트 */
+export const isChromeLine = line => /(\bfor (agents|shortcuts)\b|^Worked for \d|Auto-update failed|bypass permissions|New activity|Earlier messages|esc to interrupt|\? for shortcuts)/i.test(line)
+  || /^\s*[❯⏵›>]/.test(line)
+  || /^[\w.-]+@[\w.-]+ .*[%$#]\s*$/.test(line)
+  || /^(GPT|gpt|o\d|Claude|claude|Opus|Sonnet|Haiku|gemini|Gemini)[\w.-]*( \w+)? · /.test(line)
 
 /** 패인 이름: label → terminal_title_stripped → cwd 마지막 폴더 이름 (빈 글은 건너뜀) */
 export function nameOf(pane) {
@@ -134,6 +140,22 @@ function fetchPanes() {
   return Array.isArray(panes) ? panes : []
 }
 
+/** 탭 ID → 탭 이름 (번호 붙여서). 실패하면 빈 표 */
+let tabNamesCache = null
+function fetchTabNames() {
+  if (tabNamesCache !== null) return tabNamesCache
+  tabNamesCache = {}
+  const r = runHerdr(['tab', 'list'])
+  if (!r.ok) return tabNamesCache
+  try {
+    for (const t of JSON.parse(r.out)?.result?.tabs ?? []) {
+      const label = String(t.label ?? '').trim()
+      tabNamesCache[t.tab_id] = [t.number !== undefined ? `${t.number}` : '', label].filter(Boolean).join(' ')
+    }
+  } catch { /* 이름 없이 */ }
+  return tabNamesCache
+}
+
 /** 화면 줄 다듬기: 테두리(│╭─ 등)를 걷고, 글자·숫자가 없는 줄(구분선·빈 입력창)은 버린다 */
 export const screenLine = line => {
   const t = String(line ?? '').replace(/[\u2500-\u257f\u2580-\u259f]+/g, ' ').replace(/\s+/g, ' ').trim()
@@ -144,7 +166,7 @@ export const screenLine = line => {
 function readPaneTail(id) {
   const r = runHerdr(['pane', 'read', id, '--source', 'recent', '--lines', String(PANE_READ_LINES)])
   if (!r.ok) return { lastAsk: '', lastAnswer: '' }
-  const last = r.out.split('\n').map(screenLine).filter(l => l !== '').slice(-2).map(l => clip(l))
+  const last = r.out.split('\n').map(screenLine).filter(l => l !== '' && !isChromeLine(l)).slice(-2).map(l => clip(l))
   if (last.length === 2) return { lastAsk: last[0], lastAnswer: last[1] }
   return { lastAsk: '', lastAnswer: last[0] ?? '' }
 }
@@ -205,12 +227,13 @@ function claudeTail(p) {
 }
 
 /** 허더 패인 한 개 → 출력용 객체 */
-function describePane(p, selfId) {
+function describePane(p, selfId, tabNames = {}) {
   const agent = p.agent ?? ''
   const tail = (agent === 'claude' ? claudeTail(p) : null) ?? readPaneTail(p.pane_id)
   return {
     pane_id: p.pane_id,
     tab_id: p.tab_id,
+    tab_name: tabNames[p.tab_id] ?? '',
     name: nameOf(p),
     agent,
     status: p.agent_status ?? 'unknown',
@@ -297,7 +320,7 @@ function cmdList(argv) {
     scope = panes.filter(p => p.tab_id === me.tab_id)
   }
 
-  const rows = scope.map(p => describePane(p, selfId))
+  const rows = scope.map(p => describePane(p, selfId, fetchTabNames()))
   if (json) say(JSON.stringify({ panes: rows }) + '\n')
   else say([...rows.map(formatPane), footer(rows)].join('\n') + '\n')
   return 0

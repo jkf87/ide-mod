@@ -3450,6 +3450,28 @@ async function focusPane($: EngineInterface, paneId: string, tabId: string, name
   $.ui.toast(tab.exitCode === 0 && tabId !== '' ? `탭까지만 옮겼어요: ${name}` : `못 옮겼어요: ${oneLine(went.stderr || went.stdout || `exit ${went.exitCode}`, 80)}`)
 }
 
+/** 이 줄이 하는 일 한 줄: 일하는 중이면 받은 요청, 아니면 마지막 답 (Claude가 아니면 화면 마지막 줄) */
+export function paneDoing(p: Pick<HerdrPane, 'agent' | 'status' | 'lastAsk' | 'lastAnswer'>): string {
+  if (p.agent !== 'claude') return p.lastAnswer || p.lastAsk
+  if (p.status === 'working') return p.lastAsk ? `요청: ${p.lastAsk}` : p.lastAnswer
+  return p.lastAnswer ? `답: ${p.lastAnswer}` : p.lastAsk ? `요청: ${p.lastAsk}` : ''
+}
+
+/** [← 여기로]: 다른 탭의 패인을 이 패인 오른쪽으로 옮겨 온다 (그 안의 세션은 끊기지 않는다) */
+async function bringPane($: EngineInterface, paneId: string, name: string) {
+  const me = await herdrPaneId($)
+  if (me === '') return
+  const bin = (await $.env.get('HERDR_BIN_PATH').catch(() => undefined)) || 'herdr'
+  const run = (args: string[]) => $.process.run([bin, ...args], { timeoutMs: 5_000 }).catch(error => ({ exitCode: 127, stdout: '', stderr: String(error) }))
+  let moved = await run(['pane', 'move', paneId, '--target-pane', me, '--split', 'right'])
+  if (moved.exitCode !== 0) {
+    const tab = (await $.env.get('HERDR_TAB_ID').catch(() => undefined)) ?? ''
+    if (tab !== '') moved = await run(['pane', 'move', paneId, '--tab', tab, '--split', 'right'])
+  }
+  $.ui.toast(moved.exitCode === 0 ? `이 탭으로 가져왔어요: ${name}` : `못 가져왔어요: ${oneLine(moved.stderr || moved.stdout || `exit ${moved.exitCode}`, 80)}`)
+  await loadPanes($)
+}
+
 /** [고른 것 닫기]: 첫 누름은 확인만, 5초 안에 한 번 더 누르면 닫는다 */
 async function closePickedPanes($: EngineInterface) {
   const picked = await read($, panesPickedAtom)
@@ -3503,15 +3525,31 @@ async function drawPanes($: EngineInterface, e: RenderInput<'Pane'>, width: numb
   const head = panes.error !== undefined
     ? <Text key="panes-status" color="error" wrap="truncate-end">목록을 받지 못했어요: {panes.error}</Text>
     : <Text key="panes-status" dimColor wrap="truncate-end">
-        허더 {panes.isAll ? '모든 탭' : '이 탭'} · 패인 {panes.list.length}개 · 일하는 중 {counts.working} · 끝남 {counts.done} · 쉼 {counts.idle}{panes.isLoading ? ' · 받는 중…' : ''} · 이름을 누르면 그 패인으로 가요
+        허더 {panes.isAll ? '모든 탭' : '이 탭'} · 패인 {panes.list.length}개 · 일하는 중 {counts.working} · 끝남 {counts.done} · 쉼 {counts.idle}{panes.isLoading ? ' · 받는 중…' : ''} · 이름: 그 패인으로 가기{panes.isAll ? ' · ← 여기로: 이 탭으로 가져오기' : ''}
       </Text>
   const out: RenderElement[] = [toolbar, head, ...result.map((line, i) => <Text key={`panes-result:${i}`} color={line.startsWith('닫음') ? 'success' : 'warning'} wrap="truncate-end">{line}</Text>)]
-  const room = Math.max(1, rows - out.length)
-  const shown = panes.list.length > room ? panes.list.slice(0, Math.max(1, room - 1)) : panes.list
+  // 패인마다 두 줄(이름 줄 + 하는 일 줄), 모든 탭이면 탭마다 머리 줄 하나
+  const myTab = panes.list.find(p => p.self)?.tab_id ?? ''
+  const room = Math.max(2, rows - out.length)
+  const shown: HerdrPane[] = []
+  let used = 0
+  let lastTab = ''
+  for (const p of panes.list) {
+    const need = 2 + (panes.isAll && p.tab_id !== lastTab ? 1 : 0)
+    if (used + need > room - (shown.length < panes.list.length - 1 ? 1 : 0)) break
+    used += need
+    lastTab = p.tab_id
+    shown.push(p)
+  }
   let goKey = 0
+  lastTab = ''
   for (const p of shown) {
+    if (panes.isAll && p.tab_id !== lastTab) {
+      lastTab = p.tab_id
+      out.push(<Text key={`pane-tab:${p.tab_id}`} bold color={p.tab_id === myTab ? 'claude' : undefined} wrap="truncate-end">▸ 탭 {p.tab_name || p.tab_id}{p.tab_id === myTab ? ' (여기)' : ''}</Text>)
+    }
+    const doing = paneDoing(p)
     const dot = PANE_DOT[p.status] ?? { icon: '·', isDim: true }
-    const tail = [p.lastAsk, p.lastAnswer].filter(Boolean).join(' / ')
     const name = oneLine(p.name || p.pane_id, 40)
     // 나 아닌 줄 앞 아홉 개는 숫자 키로도 간다
     const hotkey = !p.self && goKey < 9 ? String((goKey += 1)) : undefined
@@ -3530,10 +3568,15 @@ async function drawPanes($: EngineInterface, e: RenderInput<'Pane'>, width: numb
             ? <Text bold>{name}</Text>
             : <Button key={`pane-go:${p.pane_id}`} plain hotkey={hotkey} label={name} onPress={() => void focusPane($, p.pane_id, p.tab_id ?? '', name)} />}
         </Box>
-        <Text wrap="truncate-end">
-          <Text dimColor>{p.agent || '셸'} · {p.pane_id}</Text>
-          {tail !== '' && <Text dimColor={p.status !== 'working'}>  {tail}</Text>}
-        </Text>
+        {!p.self && p.tab_id !== myTab && (
+          <Box flexShrink={0}>
+            <Button key={`pane-bring:${p.pane_id}`} plain label="← 여기로" onPress={() => void bringPane($, p.pane_id, name)} />
+          </Box>
+        )}
+        <Text dimColor wrap="truncate-end">{p.agent || '셸'} · {p.pane_id}</Text>
+      </Box>,
+      <Box key={`pane-doing:${p.pane_id}`} height={1} overflow="hidden" width={width} paddingLeft={6}>
+        <Text wrap="truncate-end" dimColor={p.status !== 'working'} color={p.status === 'working' ? 'warning' : undefined}>{doing !== '' ? `↳ ${doing}` : '↳ (아직 한 일이 없어요)'}</Text>
       </Box>,
     )
   }
