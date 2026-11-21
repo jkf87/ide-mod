@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { answerGist, drawsLinks, pathsIn, donePaneIds, isRevealHref, middleCut, tildePath, baseName, isInside, isWinPath, joinPath, openCommands, parentOf, alertLines, herdrNameOf, fileHref, linkifyPaths, pathOfHref, backgroundTaskId, endedTaskIds, parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
+import { answerGist, drawsLinks, pathsIn, donePaneIds, isRevealHref, middleCut, tildePath, baseName, isInside, isWinPath, joinPath, openCommands, parentOf, alertLines, herdrNameOf, herdrSendTargets, workerSummary, workerBundleLines, workerReason, takesWorkerTurn, workerFileName, type WorkerRec, fileHref, linkifyPaths, pathOfHref, backgroundTaskId, endedTaskIds, parseEstimate, blockStarts, cacheHitOf, cacheNote, shouldKeepWarm, parseAgyHistory, parseCodexPrompts, captionFor, dotGauge, fitLine, lineGroups, normLayout, type GaugeKind, fit, handoffNote, isMachineText, parseAgyUsage, parseClaudeUsage, parseCodexLimits, parsePeers, parseSysStat, personText, pickPeer, requestsAsText, shortTokens, styleGate, tokPerSecOf, untilReset } from '../hooks/register'
 import { artifactUrlOf, gitInfoFrom, gitNotes, handoffFromText, handoffPage, receivePrompt, redactSecrets, savedPathOf, shareDoc, webUrlOf } from '../hooks/share'
 
 // ── 가짜 작업 폴더 (테스트 엔진은 상대 경로를 플러그인 폴더 기준으로 풀어서 절대 경로만 쓴다) ──
@@ -58,6 +58,9 @@ function fakeWorld(on: On): World {
     return { value: { kind: 'file' as const, size: text.length, mtimeMs: 1791255799123.456, isLink, realPath: target } }
   })
   on('fs.list', ($, e) => {
+    if (e.path.startsWith('/home/me/.claude/ide-mod/')) {
+      return { value: [...world.written.keys()].filter(k => k.startsWith(`${e.path}/`)).map(k => ({ name: k.slice(e.path.length + 1), kind: 'file' as const, size: 0, mtimeMs: 0, isLink: false })) }
+    }
     const dir = real(e.path)
     return {
       value: (DIRS[dir] ?? []).map(name => {
@@ -69,6 +72,12 @@ function fakeWorld(on: On): World {
     }
   })
   on('fs.read', ($, e) => {
+    // 워커 소식 파일: 이 테스트 엔진에 쓴 것을 그대로 읽는다
+    if (e.path.startsWith('/home/me/.claude/ide-mod/')) {
+      const saved = world.written.get(e.path)
+      if (saved === undefined) throw new Error('ENOENT')
+      return { value: saved }
+    }
     if (e.as === 'bytes') return { value: { base64: TINY_PNG } }
     const text = FILES[real(e.path)]
     if (text === undefined) throw new Error('ENOENT')
@@ -1533,5 +1542,113 @@ describe('IDE 창 머리', () => {
     expect(await ui.find({ key: 'board-fold' })).toBeUndefined()
     expect(await ui.find({ key: 'board-handoff' })).toBeDefined()
     await ui.unmount()
+  })
+})
+
+// ── 작업반장·워커 알림 묶기 ──
+const WDIR = '/home/me/.claude/ide-mod/workers'
+function alertSpy(on: On) {
+  const got = { played: [] as string[], spoken: [] as string[], banners: [] as { text: string; title?: string }[] }
+  on('audio.play', ($, e) => {
+    got.played.push(String((e as unknown as { clip: { asset?: string } }).clip.asset))
+    return { value: undefined } as never
+  })
+  on('audio.speak', ($, e) => {
+    got.spoken.push(String((e as unknown as { text: string }).text))
+    return { value: { via: 'system' } } as never
+  })
+  on('ui.notify', ($, e) => {
+    got.banners.push({ text: e.text, title: e.title })
+    return { value: { isSent: true, channel: 'iterm2' } } as never
+  })
+  return got
+}
+
+describe('작업반장·워커 알림', () => {
+  test('워커 판별: 허더로 넘긴 패인, 비대화형, 환경 변수', () => {
+    expect(herdrSendTargets('herdr pane send-text w1:pB "일해" && herdr pane send-keys w1:pB Enter')).toEqual(['w1:pB'])
+    expect(herdrSendTargets('"$HERDR_BIN_PATH" pane run 33 "npm test"; /opt/bin/herdr pane send-text w2:p4 hi')).toEqual(['33', 'w2:p4'])
+    expect(herdrSendTargets('herdr pane read w1:pB && herdr pane send-text "$ID" hi')).toEqual([])
+    expect(workerFileName('w1:pB')).toBe('w1_pB.json')
+    const rec: WorkerRec = { pane: 'w1:pB', boss: 'w1:pA', bossName: '작업반장', sentAt: 1_000, state: 'sent' }
+    expect(takesWorkerTurn(rec, 'w1:pB', 30_000)).toBe(true)
+    // 2분 넘게 지나 시작한 턴, 이미 맡은 글, 자기 자신에게 보낸 글은 워커 턴이 아니다
+    expect(takesWorkerTurn(rec, 'w1:pB', 200_000)).toBe(false)
+    expect(takesWorkerTurn({ ...rec, takenAt: 2_000 }, 'w1:pB', 30_000)).toBe(false)
+    expect(takesWorkerTurn({ ...rec, boss: 'w1:pB' }, 'w1:pB', 30_000)).toBe(false)
+    expect(workerReason({ isHeadless: true, envWorker: undefined, isHerdrWorker: false })).toBe('headless')
+    expect(workerReason({ isHeadless: false, envWorker: '1', isHerdrWorker: false })).toBe('env')
+    expect(workerReason({ isHeadless: false, envWorker: '0', isHerdrWorker: true })).toBe('herdr')
+    expect(workerReason({ isHeadless: false, envWorker: undefined, isHerdrWorker: false })).toBe(undefined)
+    const recs: WorkerRec[] = [
+      { ...rec, state: 'done', doneAt: 5_000, name: '번역', gist: '1장 번역했어요.' },
+      { ...rec, pane: 'w1:pC', state: 'busy', name: '검수' },
+      { ...rec, pane: 'w1:pD', boss: 'w9:pZ', state: 'done', doneAt: 5_000 },
+    ]
+    expect(workerSummary(recs, 'w1:pA', 10_000, new Set()).busy).toBe(1)
+    expect(workerSummary(recs, 'w1:pA', 10_000, new Set()).done.map(r => r.pane)).toEqual(['w1:pB'])
+    expect(workerSummary(recs, 'w1:pA', 10_000, new Set(['w1:pB@5000'])).done).toEqual([])
+    expect(workerBundleLines('done', '작업반장', [recs[0]!, { ...recs[1]!, gist: '검수 끝' }])).toEqual({ title: '작업반장 · 워커 2개 끝났어요', body: '번역: 1장 번역했어요. · 검수: 검수 끝', spoken: '작업반장. 워커 2개 끝났어요' })
+    expect(workerBundleLines('ask', '', [recs[1]!]).title).toBe('Claude · 워커 검수 확인을 기다려요')
+  })
+
+  test('작업반장: 워커가 일하는 동안 턴이 끝나도 조용하고, 워커가 다 끝나면 한 번에 묶어 알린다', async ($, on) => {
+    const world = fakeWorld(on)
+    world.herdrPane = 'w1:pA'
+    world.listing = IDLE_LISTING
+    const clock = mock.clock(on)
+    const got = alertSpy(on)
+    await ask($, '워커 둘에게 나눠 맡겨', 't1')
+    await $.tool.call({ tool: 'Bash', command: 'herdr pane send-text w1:pB "1장 번역해" && herdr pane send-keys w1:pB Enter && herdr pane run w1:pC "검수해"' } as never)
+    const sent = JSON.parse(world.written.get(`${WDIR}/w1_pB.json`) ?? '{}') as WorkerRec
+    expect(sent).toMatchObject({ pane: 'w1:pB', boss: 'w1:pA', state: 'sent' })
+    await $.turn.complete({ answer: '두 워커에게 맡겼어요', durationMs: 40_000, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+    expect(got.played).toEqual([])
+    // 워커 하나만 끝남: 아직 조용하다
+    const now = clock.now()
+    world.written.set(`${WDIR}/w1_pB.json`, JSON.stringify({ ...sent, state: 'done', takenAt: now, doneAt: now, name: '번역', gist: '1장 번역했어요.' }))
+    world.written.set(`${WDIR}/w1_pC.json`, JSON.stringify({ ...sent, pane: 'w1:pC', state: 'busy', takenAt: now, name: '검수' }))
+    await clock.advance(5_000)
+    expect(got.played).toEqual([])
+    // 워커가 권한 창에 걸리면 작업반장이 한 번 부른다
+    world.written.set(`${WDIR}/w1_pC.json`, JSON.stringify({ ...sent, pane: 'w1:pC', state: 'ask', askAt: now + 5_000, name: '검수' }))
+    await clock.advance(5_000)
+    await clock.advance(5_000)
+    expect(got.played).toEqual(['sounds/ask.wav'])
+    expect(got.banners.at(-1)?.title).toBe('모드에 대해 · 워커 검수 확인을 기다려요')
+    // 둘 다 끝나면 묶어서 딱 한 번
+    world.written.set(`${WDIR}/w1_pC.json`, JSON.stringify({ ...sent, pane: 'w1:pC', state: 'done', doneAt: now + 20_000, name: '검수', gist: '오탈자 3개 고쳤어요.' }))
+    await clock.advance(5_000)
+    await clock.advance(5_000)
+    expect(got.played).toEqual(['sounds/ask.wav', 'sounds/done.wav'])
+    expect(got.banners.at(-1)).toEqual({ title: '모드에 대해 · 워커 2개 끝났어요', text: '번역: 1장 번역했어요. · 검수: 오탈자 3개 고쳤어요.' })
+    expect(got.spoken.at(-1)).toBe('모드에 대해. 워커 2개 끝났어요')
+  })
+
+  test('워커: 작업반장이 넘긴 일은 울지 않고 끝남을 적는다, 사람이 직접 친 요청은 평소처럼 운다', async ($, on) => {
+    const world = fakeWorld(on)
+    world.herdrPane = 'w1:pB'
+    world.listing = IDLE_LISTING
+    const clock = mock.clock(on)
+    const got = alertSpy(on)
+    on('tool.check', ($, e) => ({ decision: String(e.tool) === 'Bash' ? 'ask' : 'allow' }) as never)
+    on('classic.PermissionRequest', () => ({}) as never)
+    const file = `${WDIR}/w1_pB.json`
+    world.written.set(file, JSON.stringify({ pane: 'w1:pB', boss: 'w1:pA', bossName: '작업반장', sentAt: clock.now(), state: 'sent' } satisfies WorkerRec))
+    await ask($, '1장 번역해', 't1')
+    expect(JSON.parse(world.written.get(file)!)).toMatchObject({ state: 'busy', name: '모드에 대해' })
+    // 권한 창: 소리 대신 작업반장에게 확인 대기를 적는다
+    await $.classic.PermissionRequest({ hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: {}, session_id: 's', transcript_path: '', cwd: '/work' } as never)
+    expect(JSON.parse(world.written.get(file)!).state).toBe('ask')
+    await $.turn.complete({ answer: '**1장을 번역했어요.** 용어집도 맞췄어요.', durationMs: 90_000, isAborted: false, turnId: 't1', reason: 'answer' } as never)
+    expect(got.played).toEqual([])
+    expect(got.banners).toEqual([])
+    expect(JSON.parse(world.written.get(file)!)).toMatchObject({ state: 'done', gist: '1장을 번역했어요.' })
+    // 2분 뒤 사람이 이 패인에 직접 친 요청: 워커 일이 아니니 평소처럼 운다
+    await clock.advance(150_000)
+    await ask($, '이건 내가 직접 물어봄', 't2')
+    await $.turn.complete({ answer: '답했어요.', durationMs: 3_000, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+    expect(got.played).toEqual(['sounds/done.wav'])
+    expect(got.banners.at(-1)?.title).toBe('모드에 대해 · 끝났어요')
   })
 })

@@ -54,6 +54,7 @@ function registerTurns(on: On) {
       await startTurnClock($, e.turnId).catch(() => undefined)
       await setCaption($, '요청을 읽고 계획을 세우는 중이에요', true).catch(() => undefined)
     }
+    await workerTurnStarted($, own !== '').catch(() => undefined)
     return next(e)
   }).catch(($, e, next) => next(e))
 
@@ -97,7 +98,13 @@ function registerTurns(on: On) {
     await update($, estimateRunAtom, () => null).catch(() => undefined)
     // 끝까지 답한 턴만 "끝남" 소리 (멈춤·오류는 끝남처럼 들리면 안 된다).
     // 백그라운드 에이전트·명령이 아직 돌면 기다리는 중일 뿐이다: 마지막 일이 끝나고 그 알림을 받은 턴이 끝날 때 운다
-    if (!e.isAborted && e.reason === 'answer' && (await backgroundBusy($).catch(() => 0)) === 0) await alertTurnDone($, e.durationMs, e.turnId, e.answer).catch(() => undefined)
+    // 워커는 울지 않는다: 허더 워커는 작업반장에게 끝남을 적고, 작업반장은 맡긴 워커가 다 끝난 뒤 한 번에 운다
+    const quiet = await quietWorker($).catch(() => undefined)
+    if (quiet === 'herdr') await workerTurnEnded($, e.answer, e.isAborted || e.reason !== 'answer').catch(() => undefined)
+    if (quiet === undefined && !e.isAborted && e.reason === 'answer' && (await backgroundBusy($).catch(() => 0)) === 0 && (await workersBusy($).catch(() => 0)) === 0) {
+      await alertTurnDone($, e.durationMs, e.turnId, e.answer).catch(() => undefined)
+      await absorbWorkerDone($).catch(() => undefined)
+    }
     await setCaption($, e.isAborted ? '작업을 멈췄어요' : '답을 다 썼어요. 다음 요청을 기다려요').catch(() => undefined)
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -3005,6 +3012,9 @@ async function alertWhenAllDone($: EngineInterface, durationMs: number, turnId?:
 }
 
 async function alertAsk($: EngineInterface) {
+  const quiet = await quietWorker($).catch(() => undefined)
+  if (quiet === 'herdr') return workerAsked($)
+  if (quiet !== undefined) return
   const mode = await alertModeOf($)
   if (mode === 'off') return
   const now = Date.now()
@@ -3026,6 +3036,238 @@ async function cycleAlert($: EngineInterface) {
     playSound($, 'done')
     speakKo($, alertLines('done', await alertWhere($), '이렇게 끝난 일을 읽어 드려요').spoken)
   }
+}
+
+// ════════════════ 작업반장·워커 알림 묶기 ════════════════
+// 작업반장(오케스트레이터) 세션이 워커에게 일을 넘겼으면 워커는 조용하고, 작업반장이 한 번에 알린다 (사람 주의력 아끼기).
+// 워커로 보는 기준:
+//  1) 비대화형 실행 (claude -p, SDK 헤드리스: 화면이 없고 사람도 없다) — gjc·codex-worker가 부르는 Claude 워커도 여기
+//  2) 환경 변수 IDE_MOD_WORKER=1 로 띄운 세션
+//  3) 허더 패인: 다른 패인의 Claude가 `herdr pane send-text|run <이 패인>` 으로 넘긴 글로 시작한 턴.
+//     그 패인에 사람이 직접 친 요청은 워커 일이 아니다 (보통 알림 그대로)
+// 3)의 소식은 ~/.claude/ide-mod/workers/<패인>.json 으로 주고받는다: 작업반장이 보낸 시각을 적고, 워커가 맡음·끝남·확인 대기를 적는다
+type WorkerState = 'sent' | 'busy' | 'done' | 'ask'
+export type WorkerRec = { pane: string; boss: string; bossName: string; sentAt: number; state: WorkerState; takenAt?: number; name?: string; gist?: string; doneAt?: number; askAt?: number; durationMs?: number }
+/** 보낸 글을 워커 턴으로 맡을 수 있는 시간 (그 뒤에 시작한 턴은 사람이 친 것으로 본다) */
+const WORKER_CLAIM_MS = 120_000
+/** 이보다 오래된 워커 기록은 없는 것으로 본다 (끝남을 놓친 워커가 작업반장 알림을 영영 막지 않게) */
+const WORKER_TTL_MS = 6 * 60 * 60_000
+const WORKER_EVERY_MS = 5_000
+
+/** 셸 명령에서 일을 넘긴 허더 패인 ID: `herdr pane send-text <id> …`, `herdr pane run <id> …` (변수로 적은 ID는 모른다) */
+export function herdrSendTargets(command: string): string[] {
+  const ids: string[] = []
+  const re = /(?:^|[\s;&|(`'"])(?:\S*\/)?(?:herdr|\$\{?HERDR_BIN_PATH\}?)["']?\s+pane\s+(?:send-text|run)\s+(?:--?[a-z-]+\s+)*["']?([^\s"';&|)]+)/g
+  for (const m of command.matchAll(re)) {
+    const id = m[1] ?? ''
+    if (id !== '' && !id.startsWith('$') && !id.startsWith('-') && !ids.includes(id)) ids.push(id)
+  }
+  return ids
+}
+
+export const workerFileName = (pane: string) => `${pane.replace(/[^A-Za-z0-9_-]/g, '_')}.json`
+
+/** 이 턴이 작업반장이 넘긴 일인가: 아직 맡지 않은 새 글이 방금 왔다 */
+export function takesWorkerTurn(rec: WorkerRec | undefined, myPane: string, now: number): boolean {
+  if (rec === undefined || rec.boss === '' || rec.boss === myPane) return false
+  return (rec.takenAt === undefined || rec.sentAt > rec.takenAt) && now - rec.sentAt < WORKER_CLAIM_MS
+}
+
+/** 작업반장이 볼 워커 상황: 아직 일하는 수, 알릴 끝남·확인 대기 (이미 알린 것은 key로 뺀다) */
+export function workerSummary(recs: readonly WorkerRec[], boss: string, now: number, reported: ReadonlySet<string>) {
+  const mine = recs.filter(r => r.boss === boss && now - r.sentAt < WORKER_TTL_MS)
+  const busy = mine.filter(r => r.state === 'busy' || r.state === 'ask' || (r.state === 'sent' && now - r.sentAt < WORKER_CLAIM_MS))
+  const done = mine.filter(r => r.state === 'done' && !reported.has(doneKey(r)))
+  const asks = mine.filter(r => r.state === 'ask' && !reported.has(askKey(r)))
+  return { busy: busy.length, done, asks }
+}
+export const doneKey = (r: WorkerRec) => `${r.pane}@${r.doneAt ?? 0}`
+export const askKey = (r: WorkerRec) => `${r.pane}?${r.askAt ?? 0}`
+
+/** 묶음 알림 문구: "작업반장 · 워커 2개 끝났어요" / 본문 "이름: 요약 · 이름: 요약" */
+export function workerBundleLines(kind: 'done' | 'ask', boss: string, recs: readonly WorkerRec[]) {
+  const who = (r: WorkerRec) => r.name?.trim() || r.pane
+  const head = kind === 'done'
+    ? recs.length === 1 ? `워커 ${who(recs[0]!)} 끝났어요` : `워커 ${recs.length}개 끝났어요`
+    : recs.length === 1 ? `워커 ${who(recs[0]!)} 확인을 기다려요` : `워커 ${recs.length}개가 확인을 기다려요`
+  const title = `${boss || 'Claude'} · ${head}`
+  const body = kind === 'done'
+    ? recs.map(r => (r.gist ? `${who(r)}: ${r.gist}` : who(r))).join(' · ')
+    : recs.map(who).join(' · ')
+  const spoken = boss !== '' ? `${boss}. ${head}` : head
+  return { title, body, spoken }
+}
+
+/** 이 세션이 지금 조용해야 하는 워커인가: 비대화형·환경 변수는 늘, 허더 워커는 맡은 일을 하는 동안만 */
+export function workerReason(o: { isHeadless: boolean; envWorker: string | undefined; isHerdrWorker: boolean }): 'headless' | 'env' | 'herdr' | undefined {
+  if (o.isHeadless) return 'headless'
+  if (o.envWorker !== undefined && /^(1|true|yes|on)$/i.test(o.envWorker.trim())) return 'env'
+  return o.isHerdrWorker ? 'herdr' : undefined
+}
+
+/** session.start에서 정한다: 화면도 사람도 없는 실행 (claude -p) */
+let isHeadless = false
+/** 작업반장이 넘긴 일을 하는 중 (허더 워커). 사람이 이 패인에 직접 요청하면 풀린다 */
+let isHerdrWorker = false
+let workerTurnStartAt = 0
+const reportedWorkers = new Set<string>()
+let workerWatchStarted = false
+
+async function quietWorker($: EngineInterface) {
+  const envWorker = await $.env.get('IDE_MOD_WORKER').catch(() => undefined)
+  return workerReason({ isHeadless, envWorker: envWorker ?? undefined, isHerdrWorker })
+}
+
+async function workersDir($: EngineInterface) {
+  const home = trimSeps((await homeDir($)) ?? '')
+  return home === '' ? undefined : `${home}/.claude/ide-mod/workers`
+}
+async function readWorker($: EngineInterface, dir: string, pane: string): Promise<WorkerRec | undefined> {
+  try { return JSON.parse(await $.fs.read(`${dir}/${workerFileName(pane)}`)) as WorkerRec } catch { return undefined }
+}
+let isWorkersDirMade = false
+async function writeWorker($: EngineInterface, dir: string, rec: WorkerRec) {
+  if (!isWorkersDirMade) {
+    await $.process.run(['mkdir', '-p', dir], { timeoutMs: 3_000 }).catch(() => undefined)
+    isWorkersDirMade = true
+  }
+  await $.fs.write(`${dir}/${workerFileName(rec.pane)}`, JSON.stringify(rec))
+}
+async function myPaneId($: EngineInterface) {
+  return (await $.env.get('HERDR_PANE_ID').catch(() => undefined)) ?? ''
+}
+
+/** 허더가 받는 패인 이름(번호 등)을 정식 ID(w1:pX)로: 못 받으면 적힌 그대로 */
+async function canonicalPane($: EngineInterface, id: string) {
+  if (/^w\d+:p/.test(id)) return id
+  const bin = (await $.env.get('HERDR_BIN_PATH').catch(() => undefined)) || 'herdr'
+  const ran = await $.process.run([bin, 'pane', 'get', id], { timeoutMs: 3_000 }).catch(() => undefined)
+  if (ran === undefined || ran.exitCode !== 0) return id
+  try { return (JSON.parse(ran.stdout) as { result?: { pane?: { pane_id?: string } } }).result?.pane?.pane_id || id } catch { return id }
+}
+
+/** 작업반장: Bash로 다른 패인에 일을 넘겼으면 그 패인을 워커로 적고, 워커 소식을 지켜본다 */
+async function noteWorkerSends($: EngineInterface, command: string) {
+  const targets = herdrSendTargets(command)
+  if (targets.length === 0) return
+  const boss = await myPaneId($)
+  const dir = await workersDir($)
+  if (boss === '' || dir === undefined) return
+  const now = await nowOf($)
+  const bossName = await alertWhere($).catch(() => '')
+  for (const raw of targets) {
+    const pane = await canonicalPane($, raw)
+    if (pane === boss) continue
+    const old = await readWorker($, dir, pane)
+    // 일하는 중에 덧붙여 보낸 글이면 '일하는 중'을 지키고, 다음 턴이 맡을 수 있게 보낸 시각만 새로 적는다
+    const keepBusy = old !== undefined && old.boss === boss && (old.state === 'busy' || old.state === 'ask') && now - old.sentAt < WORKER_TTL_MS
+    const rec: WorkerRec = keepBusy ? { ...old, bossName, sentAt: now } : { pane, boss, bossName, sentAt: now, state: 'sent' }
+    await writeWorker($, dir, rec).catch(() => undefined)
+  }
+  startWorkerWatch($)
+}
+
+function startWorkerWatch($: EngineInterface) {
+  if (workerWatchStarted) return
+  workerWatchStarted = true
+  $.clock.every(WORKER_EVERY_MS, () => void checkWorkers($).catch(() => undefined))
+}
+
+async function myWorkers($: EngineInterface): Promise<WorkerRec[]> {
+  const dir = await workersDir($)
+  if (dir === undefined) return []
+  const entries = await $.fs.list(dir).catch(() => [])
+  const recs: WorkerRec[] = []
+  for (const entry of entries) {
+    if (!entry.name.endsWith('.json')) continue
+    try { recs.push(JSON.parse(await $.fs.read(`${dir}/${entry.name}`)) as WorkerRec) } catch { /* 쓰는 중인 파일 */ }
+  }
+  return recs
+}
+
+/** 작업반장: 아직 일하는 워커 수 (이게 남아 있으면 작업반장 턴이 끝나도 "끝남"이 아니다) */
+async function workersBusy($: EngineInterface): Promise<number> {
+  if (!workerWatchStarted) return 0
+  const boss = await myPaneId($)
+  if (boss === '') return 0
+  return workerSummary(await myWorkers($), boss, await nowOf($), reportedWorkers).busy
+}
+/** 작업반장 턴 알림이 이미 울렸으면 그때까지 끝난 워커 소식은 그 알림에 묻혀 간다 */
+async function absorbWorkerDone($: EngineInterface) {
+  if (!workerWatchStarted) return
+  const boss = await myPaneId($)
+  const s = workerSummary(await myWorkers($), boss, await nowOf($), reportedWorkers)
+  for (const r of s.done) reportedWorkers.add(doneKey(r))
+}
+
+/** 작업반장: 워커가 확인을 기다리면 한 번, 워커가 다 끝나고 작업반장도 쉬고 있으면 묶어서 한 번 */
+async function checkWorkers($: EngineInterface) {
+  const boss = await myPaneId($)
+  if (boss === '') return
+  const s = workerSummary(await myWorkers($), boss, await nowOf($), reportedWorkers)
+  const mode = await alertModeOf($)
+  const where = await alertWhere($).catch(() => '')
+  if (s.asks.length > 0) {
+    for (const r of s.asks) reportedWorkers.add(askKey(r))
+    if (mode !== 'off') {
+      playSound($, 'ask')
+      const lines = workerBundleLines('ask', where, s.asks)
+      notifyKo($, lines.title, lines.body)
+      if (mode === 'voice') speakKo($, lines.spoken)
+    }
+  }
+  if (s.done.length === 0 || s.busy > 0 || isMainBusy) return
+  if (mode === 'sound' && (await busyPeers($).catch(() => [] as string[])).length > 0) return
+  if (mode !== 'sound' && (await backgroundBusy($).catch(() => 0)) > 0) return
+  for (const r of s.done) reportedWorkers.add(doneKey(r))
+  if (mode === 'off') return
+  playSound($, 'done')
+  const lines = workerBundleLines('done', where, s.done)
+  notifyKo($, lines.title, lines.body)
+  if (mode === 'voice') speakKo($, lines.spoken)
+}
+
+/** 워커: 턴이 시작될 때 작업반장이 방금 넘긴 글이면 맡았다고 적는다. 사람이 직접 친 요청이면 워커에서 풀린다 */
+async function workerTurnStarted($: EngineInterface, isPersonTurn: boolean) {
+  if (isHeadless) return
+  const pane = await myPaneId($)
+  const dir = await workersDir($)
+  if (pane === '' || dir === undefined) return
+  const rec = await readWorker($, dir, pane)
+  const now = await nowOf($)
+  if (takesWorkerTurn(rec, pane, now)) {
+    isHerdrWorker = true
+    workerTurnStartAt = now
+    const name = await alertWhere($).catch(() => '')
+    await writeWorker($, dir, { ...rec!, state: 'busy', takenAt: now, name: name || rec!.name }).catch(() => undefined)
+  } else if (isPersonTurn) {
+    isHerdrWorker = false
+  }
+}
+
+/** 워커: 맡은 일이 끝나면(백그라운드 일까지) 작업반장에게 끝남을 적는다 */
+async function workerTurnEnded($: EngineInterface, answer: string, isAborted: boolean) {
+  if (!isHerdrWorker) return
+  if (!isAborted && (await backgroundBusy($).catch(() => 0)) > 0) return
+  const pane = await myPaneId($)
+  const dir = await workersDir($)
+  if (dir === undefined) return
+  const rec = await readWorker($, dir, pane)
+  if (rec === undefined) return
+  const now = await nowOf($)
+  const gist = isAborted ? '중간에 멈췄어요' : answerGist(answer, 40)
+  await writeWorker($, dir, { ...rec, state: 'done', doneAt: now, gist, durationMs: now - workerTurnStartAt }).catch(() => undefined)
+  isHerdrWorker = false
+}
+
+/** 워커: 권한 창이 뜨면 내 소리 대신 작업반장에게 확인 대기를 적는다 */
+async function workerAsked($: EngineInterface) {
+  const pane = await myPaneId($)
+  const dir = await workersDir($)
+  if (pane === '' || dir === undefined) return
+  const rec = await readWorker($, dir, pane)
+  if (rec === undefined) return
+  await writeWorker($, dir, { ...rec, state: 'ask', askAt: await nowOf($) }).catch(() => undefined)
 }
 
 // ════════════════ 턴 시계 ════════════════
@@ -3326,6 +3568,7 @@ export const register: Register = (on, options) => {
     // 이름이 다른 플러그인과 겹쳐 하나가 거절돼도 나머지는 등록되게 따로 부른다
     await $.command.register({ name: 'ide', description: 'IDE 창: 파일 트리 + 탭 에디터 (auto on|off 자동으로 열기 · links auto|app|ide 답변 속 경로 열 곳 · addr on|off 띠의 핸드오프 줄)', argumentHint: '[경로|auto on|off|links auto|app|ide|addr on|off]' }).catch(() => undefined)
     if (e.isInteractive) startTimers($)
+    isHeadless = !e.isInteractive && e.surface === null
     await $.command.register({ name: 'open', description: 'IDE 창에서 폴더나 파일을 엽니다', argumentHint: '[경로]' }).catch(() => undefined)
     await $.command.register({ name: 'lecture', description: '강의 모드: Claude가 하는 일을 입력창 위에 쉬운 한국어 자막으로', argumentHint: '[on|off]' }).catch(() => undefined)
     await $.command.register({ name: 'handoff', description: '이 세션을 다른 세션에 넘기거나(세션 이름), 다른 사람에게 Artifact로 넘기고 받습니다 (share·publish·receive)', argumentHint: '[세션 이름 [메모] | share [메모] | publish | receive <링크>]' }).catch(() => undefined)
@@ -3577,6 +3820,7 @@ export const register: Register = (on, options) => {
     if (e.agentId === undefined) {
       const bgId = backgroundTaskId(tool, input, ran)
       if (bgId !== undefined) await noteBgStart($, bgId)
+      if (tool === 'Bash' && outcome.deny === undefined && typeof input.command === 'string') await noteWorkerSends($, input.command).catch(() => undefined)
       if (tool === 'TaskStop' && outcome.deny === undefined) await noteBgEnd($, [String(input.task_id ?? input.shell_id ?? '')])
     }
     if (PERSON_TOOLS.includes(tool)) await pauseClock($, (await nowOf($)) - (askAt ?? callAt)).catch(() => undefined)
